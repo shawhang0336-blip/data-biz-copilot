@@ -14,7 +14,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.infra.contracts import ExtractedLogicEvidence
 from app.ingestion.ast_extractor import (
+    enrich_script_evidences_with_llm,
     extract_sql_ast_skeleton,
+    plan_and_extract_script_evidences,
     synthesize_generic_business_semantics,
     translate_evidence_with_llm,
 )
@@ -669,6 +671,10 @@ def parse_code_logic(
     banner = _extract_procedure_banner(text)
     raw_chunks = split_sql_chunks(text)
     evidences: List[ExtractedLogicEvidence] = []
+    comments_pool: List[str] = []
+    any_sac = False
+    single_generic_info: Optional[Tuple[Dict[str, Any], List[str], Dict[str, Any]]] = None
+
     for idx, (start_line, stmt) in enumerate(raw_chunks):
         upper = stmt.upper()
         if not any(kw in upper for kw in ("INSERT", "MERGE", "UPDATE", "SELECT", "CREATE", "DELETE")):
@@ -677,10 +683,13 @@ def parse_code_logic(
         if _is_housekeeping_chunk(stmt, targets):
             continue
         comments = _extract_comments(stmt)
+        comments_pool.extend(comments)
         skeleton = extract_sql_ast_skeleton(stmt)
         merged_targets = list(dict.fromkeys(targets + (skeleton.get("target_tables") or []) + (skeleton.get("source_tables") or [])))
 
-        if _is_known_sac_logic(filename, banner, comments, merged_targets, stmt):
+        is_sac = _is_known_sac_logic(filename, banner, comments, merged_targets, stmt)
+        if is_sac:
+            any_sac = True
             domain, concept = _infer_domain_and_concept(filename, stmt, comments, merged_targets, banner=banner)
             inclusions, exclusions = _translate_predicates(domain, stmt, comments)
             branches = _translate_branches(domain, stmt, comments)
@@ -694,8 +703,8 @@ def parse_code_logic(
             source_summary = re.sub(r"^(?:程序描述|业务说明|任务描述|程序名称)[：:\s]*", "", source_summary).strip()
         else:
             generic = synthesize_generic_business_semantics(skeleton, comments, filename)
-            if llm is not None and bus is not None:
-                generic = translate_evidence_with_llm(skeleton, comments, generic, llm=llm, bus=bus)
+            if not evidences:
+                single_generic_info = (skeleton, comments, generic)
             domain = generic["business_domain_hint"]
             concept = generic["target_concept_hint"]
             inclusions = generic["inclusions"]
@@ -707,29 +716,65 @@ def parse_code_logic(
             source_summary = generic["source_summary"]
 
         fingerprint = hashlib.sha256(f"{filename}:{idx}:{stmt}".encode("utf-8")).hexdigest()
-        evidences.append(
-            ExtractedLogicEvidence(
-                logic_fingerprint=fingerprint,
-                business_domain_hint=domain,
-                target_concept_hint=concept,
-                source_summary=source_summary,
-                inclusion_predicates=inclusions,
-                exclusion_predicates=exclusions,
-                branch_cases=branches,
-                calculation_kind=calc_kind,
-                calculation_summary=calc_summary,
-                dedup_grain_hint=dedup_hint,
-                internal_locator={
-                    "script": filename,
-                    "chunk_index": idx,
-                    "start_line": start_line,
-                    "physical_objects": merged_targets,
-                    "target_tables": skeleton.get("target_tables") or [],
-                    "source_tables": skeleton.get("source_tables") or [],
-                    "ast_parsed": bool(skeleton.get("ast_parsed")),
-                    "statement_kind": skeleton.get("statement_kind", "UNKNOWN"),
-                    "join_count": skeleton.get("join_count", 0),
-                },
-            )
+        ev = ExtractedLogicEvidence(
+            logic_fingerprint=fingerprint,
+            business_domain_hint=domain,
+            target_concept_hint=concept,
+            source_summary=source_summary,
+            inclusion_predicates=inclusions,
+            exclusion_predicates=exclusions,
+            branch_cases=branches,
+            calculation_kind=calc_kind,
+            calculation_summary=calc_summary,
+            dedup_grain_hint=dedup_hint,
+            internal_locator={
+                "script": filename,
+                "chunk_index": idx,
+                "start_line": start_line,
+                "physical_objects": merged_targets,
+                "target_tables": skeleton.get("target_tables") or [],
+                "source_tables": skeleton.get("source_tables") or [],
+                "ast_parsed": bool(skeleton.get("ast_parsed")),
+                "statement_kind": skeleton.get("statement_kind", "UNKNOWN"),
+                "join_count": skeleton.get("join_count", 0),
+                "ai_refined": False,
+            },
         )
+        evidences.append(ev)
+
+    if llm is not None and bus is not None and evidences:
+        if len(evidences) >= 2:
+            evidences = plan_and_extract_script_evidences(
+                filename,
+                banner,
+                evidences,
+                comments_pool,
+                is_sac_script=any_sac,
+                llm=llm,
+                bus=bus,
+            )
+        elif not any_sac and single_generic_info is not None:
+            sk, cm, gen = single_generic_info
+            translated = translate_evidence_with_llm(sk, cm, gen, llm=llm, bus=bus)
+            ev0 = evidences[0]
+            ev0.business_domain_hint = translated["business_domain_hint"]
+            ev0.target_concept_hint = translated["target_concept_hint"]
+            ev0.source_summary = translated["source_summary"]
+            ev0.inclusion_predicates = translated["inclusions"]
+            ev0.exclusion_predicates = translated["exclusions"]
+            ev0.branch_cases = translated["branches"]
+            ev0.calculation_kind = translated["calculation_kind"]
+            ev0.calculation_summary = translated["calculation_summary"]
+            ev0.dedup_grain_hint = translated["dedup_grain_hint"]
+            ev0.internal_locator["plan_stage"] = "SINGLE_STEP"
+            ev0.internal_locator["ai_refined"] = True
+        else:
+            enrich_script_evidences_with_llm(
+                filename,
+                banner,
+                evidences,
+                comments_pool,
+                llm=llm,
+                bus=bus,
+            )
     return evidences

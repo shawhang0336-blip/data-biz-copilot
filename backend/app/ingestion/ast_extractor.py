@@ -11,12 +11,14 @@
 import hashlib
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import sqlglot
 from sqlglot import exp
 
+from app.infra.errors import WorkflowError
 from app.infra.llm import call_llm_validated
+from app.kernel.run import BudgetExceededError
 from app.policy.dc_bus import detect_technical_jargon, sanitize_business_text
 
 logging.getLogger("sqlglot").setLevel(logging.ERROR)
@@ -369,3 +371,462 @@ def translate_evidence_with_llm(
             if cleaned_list:
                 merged[list_key] = cleaned_list
     return merged
+
+
+def _compute_upstream_step_map(evidences: List[Any]) -> Dict[int, List[int]]:
+    """纯索引层步骤血缘：仅依据读写交叉计算步骤编号间的上下游引用，严禁输出任何物理表名。"""
+    upstream_map: Dict[int, List[int]] = {}
+    targets_by_idx: List[set] = [
+        set((ev.internal_locator or {}).get("target_tables") or [])
+        for ev in evidences
+    ]
+    for idx, ev in enumerate(evidences):
+        src_tables = set((ev.internal_locator or {}).get("source_tables") or [])
+        deps = [
+            prev_idx
+            for prev_idx in range(idx)
+            if src_tables and (src_tables & targets_by_idx[prev_idx])
+        ]
+        upstream_map[idx] = deps
+    return upstream_map
+
+
+def survey_code_script(
+    filename: str,
+    banner: str,
+    evidences: List[Any],
+    comments_pool: List[str],
+) -> Dict[str, Any]:
+    """生成底层多步代码的纯业务全局骨架总览（含纯编号步间依赖 DAG，无物理表/字段名）。"""
+    upstream_map = _compute_upstream_step_map(evidences)
+    clean_comments = [
+        sanitize_business_text(c)
+        for c in dict.fromkeys(comments_pool)
+        if c and not detect_technical_jargon(sanitize_business_text(c))
+    ][:10]
+    canonical_hints = list(
+        dict.fromkeys(ev.business_domain_hint for ev in evidences if ev.business_domain_hint)
+    )
+    return {
+        "step_count": len(evidences),
+        "procedure_banner": sanitize_business_text(banner),
+        "canonical_domain_hints": canonical_hints,
+        "business_comments": clean_comments,
+        "steps": [
+            {
+                "step_index": idx,
+                "statement_kind": str((ev.internal_locator or {}).get("statement_kind") or "SELECT"),
+                "join_count": int((ev.internal_locator or {}).get("join_count") or 0),
+                "upstream_steps": upstream_map[idx],
+                "draft_domain": ev.business_domain_hint,
+                "draft_concept": ev.target_concept_hint,
+                "calculation_kind": ev.calculation_kind,
+                "draft_summary": sanitize_business_text(ev.source_summary)[:160],
+            }
+            for idx, ev in enumerate(evidences)
+        ],
+    }
+
+
+def _default_code_groups(evidences: List[Any]) -> List[Dict[str, Any]]:
+    domain_order: List[str] = []
+    by_domain: Dict[str, List[int]] = {}
+    for idx, ev in enumerate(evidences):
+        d = ev.business_domain_hint or "核心业务规则与逻辑加工"
+        if d not in by_domain:
+            domain_order.append(d)
+            by_domain[d] = []
+        by_domain[d].append(idx)
+    groups: List[Dict[str, Any]] = []
+    for gid, domain in enumerate(domain_order):
+        idxs = by_domain[domain]
+        has_calc = any(evidences[i].calculation_kind in {"AGGREGATE", "CONFLICT"} for i in idxs)
+        groups.append(
+            {
+                "group_id": gid,
+                "stage_title": f"{domain}逻辑加工阶段",
+                "business_domain": domain,
+                "stage_role": "CALCULATION" if has_calc else "SCOPE_FILTER",
+                "step_indices": idxs,
+                "stage_purpose": f"围绕「{domain}」执行条件圈定、口径加工与核验输出。",
+            }
+        )
+    return groups
+
+
+def _plan_code_structure_with_llm(
+    filename: str,
+    banner: str,
+    evidences: List[Any],
+    comments_pool: List[str],
+    *,
+    is_sac_script: bool,
+    llm: Any,
+    bus: Any,
+) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Plan 阶段：先让 AI 审视整份代码步骤 DAG 与业务注释，总结业务主线并将步骤划分为 1-4 个逻辑阶段。"""
+    default_groups = _default_code_groups(evidences)
+    if llm is None or len(evidences) < 2:
+        return None, default_groups
+
+    survey = survey_code_script(filename, banner, evidences, comments_pool)
+    canonical_hints = survey["canonical_domain_hints"]
+    try:
+        args, _trace = call_llm_validated(
+            llm,
+            "plan_code_structure",
+            (
+                "在逐阶段精细翻译逻辑前，先根据 step_count、procedure_banner、steps（含步骤编号间上下游 upstream_steps 依赖）与 business_comments 审视整套逻辑全局："
+                "1. 用纯中文概述整套处理流程的 business_overview 及主归属业务域 canonical_domain；"
+                "2. 将 0 到 step_count-1 所有步骤不重不漏地归并划分为 1 至 4 个连续且职能清晰的逻辑阶段 chunk_groups"
+                "（stage_role 取 SCOPE_FILTER/BRANCH_LOGIC/CALCULATION/DEDUP_MERGE/OUTPUT_REPORT；仅纯技术准备工作标 IGNORE）；"
+                "3. 若存在多个 canonical_domain_hints，business_domain 应尽量收敛至其中标准业务域，严禁出现表名、字段名、SQL 或脚本名。"
+            ),
+            survey,
+            backoff=(0.2, 0.5),
+            bus=bus,
+            validation_attempts=2,
+        )
+    except BudgetExceededError:
+        raise
+    except WorkflowError:
+        return None, default_groups
+
+    valid_roles = {"SCOPE_FILTER", "BRANCH_LOGIC", "CALCULATION", "DEDUP_MERGE", "OUTPUT_REPORT", "IGNORE"}
+    raw_groups = args.get("chunk_groups") if isinstance(args, dict) else []
+    total_steps = len(evidences)
+    used_steps = set()
+    validated_groups: List[Dict[str, Any]] = []
+
+    for g in raw_groups or []:
+        if not isinstance(g, dict):
+            continue
+        cleaned_indices: List[int] = []
+        for raw_idx in g.get("step_indices") or []:
+            try:
+                idx = int(raw_idx)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < total_steps and idx not in used_steps:
+                used_steps.add(idx)
+                cleaned_indices.append(idx)
+        if not cleaned_indices:
+            continue
+
+        role = str(g.get("stage_role") or "").upper()
+        if role not in valid_roles:
+            role = "SCOPE_FILTER"
+
+        group_hints = [evidences[i].business_domain_hint for i in cleaned_indices if evidences[i].business_domain_hint]
+        dominant_hint = group_hints[0] if group_hints else (canonical_hints[0] if canonical_hints else "核心业务规则")
+        proposed_domain = sanitize_business_text(str(g.get("business_domain") or "")).strip()
+        if is_sac_script and canonical_hints:
+            resolved_domain = proposed_domain if proposed_domain in canonical_hints else dominant_hint
+        else:
+            resolved_domain = proposed_domain or dominant_hint
+
+        validated_groups.append(
+            {
+                "group_id": len(validated_groups),
+                "stage_title": sanitize_business_text(str(g.get("stage_title") or f"{resolved_domain}逻辑阶段")).strip()
+                or f"{resolved_domain}逻辑阶段",
+                "business_domain": resolved_domain,
+                "stage_role": role,
+                "step_indices": cleaned_indices,
+                "stage_purpose": sanitize_business_text(
+                    str(g.get("stage_purpose") or f"围绕「{resolved_domain}」执行业务筛选与口径处理。")
+                ).strip(),
+            }
+        )
+
+    # 兜底补齐未被模型覆盖的步骤，确保 100% 确定性全覆盖（对齐 dq_agent _validate_plan）
+    missing = [i for i in range(total_steps) if i not in used_steps]
+    if missing:
+        missing_evs = [evidences[i] for i in missing]
+        for extra in _default_code_groups(missing_evs):
+            remapped = [missing[k] for k in extra["step_indices"]]
+            extra["group_id"] = len(validated_groups)
+            extra["step_indices"] = remapped
+            validated_groups.append(extra)
+
+    if not validated_groups:
+        return None, default_groups
+
+    if all(g["stage_role"] == "IGNORE" for g in validated_groups):
+        for g in validated_groups:
+            g["stage_role"] = "SCOPE_FILTER"
+
+    raw_canonical = sanitize_business_text(str(args.get("canonical_domain") or "")).strip()
+    if is_sac_script and canonical_hints:
+        canonical_domain = raw_canonical if raw_canonical in canonical_hints else canonical_hints[0]
+    else:
+        canonical_domain = raw_canonical or (canonical_hints[0] if canonical_hints else "核心业务规则")
+
+    step_to_stage: Dict[int, str] = {}
+    for g in validated_groups:
+        for idx in g["step_indices"]:
+            step_to_stage[idx] = g["stage_title"]
+
+    code_plan = {
+        "business_overview": sanitize_business_text(str(args.get("business_overview") or "")).strip()[:240]
+        or sanitize_business_text(banner),
+        "canonical_domain": canonical_domain,
+        "step_to_stage": step_to_stage,
+    }
+    return code_plan, validated_groups
+
+
+def _merge_rule_list(existing: List[Dict[str, Any]], incoming: Any, prefix: str) -> List[Dict[str, Any]]:
+    if not isinstance(incoming, list) or not incoming:
+        return existing
+    by_code = {x.get("rule_code"): dict(x) for x in existing if x.get("rule_code")}
+    for item in incoming:
+        if not isinstance(item, dict):
+            continue
+        clean_item = {
+            k: sanitize_business_text(str(v)) if (isinstance(v, str) and k != "rule_code") else v
+            for k, v in item.items()
+        }
+        raw_rc = str(clean_item.get("rule_code") or "").strip()
+        if raw_rc in by_code:
+            by_code[raw_rc].update({k: v for k, v in clean_item.items() if k != "rule_code" and v})
+        elif clean_item.get("title") and clean_item.get("condition"):
+            # 新增AI提炼规则统一生成短哈希编号，禁止把LLM随手造的英文/SQL词写进资产编码
+            hashed_rc = f"{prefix}_{hashlib.md5(str(clean_item.get('title') or clean_item).encode('utf-8')).hexdigest()[:8]}"
+            clean_item["rule_code"] = hashed_rc
+            by_code[hashed_rc] = clean_item
+    return list(by_code.values())
+
+
+def _extract_group_with_llm(
+    banner: str,
+    group_evs: List[Any],
+    clean_comments: List[str],
+    *,
+    domain: str,
+    code_plan: Optional[Dict[str, Any]],
+    stage_meta: Optional[Dict[str, Any]],
+    llm: Any,
+    bus: Any,
+) -> None:
+    """按规划好的逻辑阶段带着全局上下文调用受控 LLM 提炼纯业务解释，并回填主实证与元数据。"""
+    agg_stmt_kinds = sorted(
+        {
+            str((ev.internal_locator or {}).get("statement_kind") or "SELECT")
+            for ev in group_evs
+        }
+    )
+    total_joins = sum(int((ev.internal_locator or {}).get("join_count") or 0) for ev in group_evs)
+    draft_inc: List[Dict[str, Any]] = []
+    draft_exc: List[Dict[str, Any]] = []
+    draft_br: List[Dict[str, Any]] = []
+    seen_rc = set()
+    for ev in group_evs:
+        for item in ev.inclusion_predicates:
+            rc = item.get("rule_code") or item.get("title")
+            if rc not in seen_rc:
+                seen_rc.add(rc)
+                draft_inc.append(item)
+        for item in ev.exclusion_predicates:
+            rc = item.get("rule_code") or item.get("title")
+            if rc not in seen_rc:
+                seen_rc.add(rc)
+                draft_exc.append(item)
+        for item in ev.branch_cases:
+            t = item.get("title")
+            if t not in seen_rc:
+                seen_rc.add(t)
+                draft_br.append(item)
+
+    payload: Dict[str, Any] = {
+        "business_domain_hint": domain,
+        "target_concept_hint": group_evs[0].target_concept_hint,
+        "procedure_banner": sanitize_business_text(banner),
+        "ast_digest": {
+            "step_count": len(group_evs),
+            "statement_kinds": agg_stmt_kinds,
+            "total_joins": total_joins,
+        },
+        "business_comments": clean_comments,
+        "deterministic_draft": {
+            "source_summary": group_evs[0].source_summary,
+            "inclusions": draft_inc[:6],
+            "exclusions": draft_exc[:6],
+            "branches": draft_br[:6],
+            "calculation_summary": group_evs[0].calculation_summary,
+            "dedup_grain_hint": next((e.dedup_grain_hint for e in group_evs if e.dedup_grain_hint), ""),
+        },
+    }
+    if stage_meta is not None:
+        payload["code_plan"] = {
+            "business_overview": (code_plan or {}).get("business_overview") or sanitize_business_text(banner),
+            "canonical_domain": (code_plan or {}).get("canonical_domain") or domain,
+            "stage_title": stage_meta["stage_title"],
+            "stage_role": stage_meta["stage_role"],
+            "stage_purpose": stage_meta["stage_purpose"],
+            "upstream_stages": stage_meta.get("upstream_stages") or [],
+        }
+
+    plan_locator_fields = {
+        "plan_stage": "PLAN_THEN_EXTRACT" if stage_meta is not None else "SINGLE_STAGE",
+        "plan_applied": code_plan is not None,
+    }
+    if stage_meta is not None:
+        plan_locator_fields["stage_title"] = stage_meta["stage_title"]
+        plan_locator_fields["stage_role"] = stage_meta["stage_role"]
+    if code_plan and code_plan.get("business_overview"):
+        plan_locator_fields["business_overview"] = code_plan["business_overview"][:160]
+
+    try:
+        args, _trace = call_llm_validated(
+            llm,
+            "translate_logic_evidence",
+            (
+                "结合 code_plan 中的整套逻辑业务主线、本阶段职能分工及上游衔接关系，以及 AST 结构摘要与业务注释，"
+                "用通俗纯中文还原当前逻辑阶段实际做了什么、包含哪些业务规则与口径解释。"
+                "保持 deterministic_draft 已有规则准确度，严禁出现物理表名、字段名、SQL 或脚本名。"
+            ),
+            payload,
+            backoff=(0.2, 0.5),
+            bus=bus,
+        )
+    except BudgetExceededError:
+        raise
+    except WorkflowError:
+        for ev in group_evs:
+            ev.internal_locator.update(plan_locator_fields)
+        return
+
+    lead = group_evs[0]
+    if isinstance(args.get("source_summary"), str) and args["source_summary"].strip():
+        lead.source_summary = sanitize_business_text(args["source_summary"])
+    if isinstance(args.get("calculation_summary"), str) and args["calculation_summary"].strip():
+        if (
+            lead.calculation_kind != "CONFLICT"
+            or "两种" in args["calculation_summary"]
+            or "分歧" in args["calculation_summary"]
+            or "并行" in args["calculation_summary"]
+        ):
+            lead.calculation_summary = sanitize_business_text(args["calculation_summary"])
+    if isinstance(args.get("dedup_grain_hint"), str) and args["dedup_grain_hint"].strip() and not lead.dedup_grain_hint:
+        lead.dedup_grain_hint = sanitize_business_text(args["dedup_grain_hint"])
+
+    lead.inclusion_predicates = _merge_rule_list(lead.inclusion_predicates, args.get("inclusions"), "LLM_INC")
+    lead.exclusion_predicates = _merge_rule_list(lead.exclusion_predicates, args.get("exclusions"), "LLM_EXC")
+    if isinstance(args.get("branches"), list) and args["branches"]:
+        br_by_title = {b.get("title"): dict(b) for b in lead.branch_cases if b.get("title")}
+        for item in args["branches"]:
+            if not isinstance(item, dict) or not item.get("title"):
+                continue
+            clean_b = {k: sanitize_business_text(str(v)) if isinstance(v, str) else v for k, v in item.items()}
+            br_by_title[clean_b["title"]] = clean_b
+        lead.branch_cases = list(br_by_title.values())
+
+    for ev in group_evs:
+        ev.internal_locator.update(plan_locator_fields)
+        ev.internal_locator["ai_refined"] = True
+
+
+def plan_and_extract_script_evidences(
+    filename: str,
+    banner: str,
+    evidences: List[Any],
+    comments_pool: List[str],
+    *,
+    is_sac_script: bool,
+    llm: Any,
+    bus: Any,
+) -> List[Any]:
+    """多步 SQL Plan-then-Extract：先由 AI 看全局步骤 DAG 分阶段规划，再带阶段上下文逐段提取纯业务实证。"""
+    if llm is None or not evidences:
+        return evidences
+
+    clean_comments = [
+        sanitize_business_text(c)
+        for c in dict.fromkeys(comments_pool)
+        if c and not detect_technical_jargon(sanitize_business_text(c))
+    ][:10]
+
+    upstream_map = _compute_upstream_step_map(evidences)
+    code_plan, groups = _plan_code_structure_with_llm(
+        filename,
+        banner,
+        evidences,
+        comments_pool,
+        is_sac_script=is_sac_script,
+        llm=llm,
+        bus=bus,
+    )
+
+    step_to_stage = (code_plan or {}).get("step_to_stage") or {}
+    if not step_to_stage:
+        step_to_stage = {idx: g["stage_title"] for g in groups for idx in g["step_indices"]}
+
+    active_indices: List[int] = []
+    for g in groups:
+        if g["stage_role"] == "IGNORE":
+            continue
+        group_indices = g["step_indices"]
+        group_set = set(group_indices)
+        upstream_stages = list(
+            dict.fromkeys(
+                step_to_stage[u]
+                for i in group_indices
+                for u in upstream_map.get(i, [])
+                if u not in group_set and u in step_to_stage
+            )
+        )
+        group_evs = [evidences[i] for i in group_indices]
+        for ev in group_evs:
+            ev.business_domain_hint = g["business_domain"]
+        _extract_group_with_llm(
+            banner,
+            group_evs,
+            clean_comments,
+            domain=g["business_domain"],
+            code_plan=code_plan,
+            stage_meta={**g, "upstream_stages": upstream_stages},
+            llm=llm,
+            bus=bus,
+        )
+        active_indices.extend(group_indices)
+
+    active_set = set(active_indices)
+    return [evidences[i] for i in range(len(evidences)) if i in active_set]
+
+
+def enrich_script_evidences_with_llm(
+    filename: str,
+    banner: str,
+    evidences: List[Any],
+    comments_pool: List[str],
+    *,
+    llm: Any,
+    bus: Any,
+) -> None:
+    """单步或按域粒度调用受控大模型深度翻译并润色实证规则与业务解释。"""
+    if llm is None or not evidences:
+        return
+
+    grouped: Dict[str, List[Any]] = {}
+    for ev in evidences:
+        grouped.setdefault(ev.business_domain_hint, []).append(ev)
+
+    clean_comments = [
+        sanitize_business_text(c)
+        for c in dict.fromkeys(comments_pool)
+        if c and not detect_technical_jargon(sanitize_business_text(c))
+    ][:10]
+
+    for domain, group in grouped.items():
+        _extract_group_with_llm(
+            banner,
+            group,
+            clean_comments,
+            domain=domain,
+            code_plan=None,
+            stage_meta=None,
+            llm=llm,
+            bus=bus,
+        )
+

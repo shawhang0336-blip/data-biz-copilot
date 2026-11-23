@@ -52,7 +52,9 @@ export default function SettingsPage() {
                 onChange={(e) => setLlmCfg({ ...llmCfg, llm_provider: e.target.value })}
               >
                 <option value="scripted">离线确定性引擎（无需模型密钥）</option>
-                <option value="openai_compatible">外部大模型（OpenAI / 智谱 / DeepSeek 兼容接口）</option>
+                <option value="deepseek">DeepSeek（deepseek-chat / deepseek-flash）</option>
+                <option value="zhipu">智谱清言（GLM 系列）</option>
+                <option value="openai_compatible">其他 OpenAI 兼容模型</option>
               </select>
             </div>
             <div>

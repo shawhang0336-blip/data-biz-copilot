@@ -1,15 +1,16 @@
 """双源接入落库与「代码 × 监管材料」纯业务资产融合合成引擎（资产层 Layer 4）。"""
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.infra.blob_store import LocalBlobStore
-from app.infra.config import Settings, get_effective_settings, get_settings
+from app.infra.config import Settings, get_budget, get_effective_settings, get_settings
 from app.infra.db_tables import (
     BusinessCaliberAssetModel,
     BusinessCapabilityModel,
@@ -19,7 +20,14 @@ from app.infra.db_tables import (
     RunModel,
     SourceMaterialModel,
 )
-from app.infra.llm import RealDesignLlm, call_llm_validated
+from app.infra.errors import WorkflowError
+from app.infra.llm import (
+    RealDesignLlm,
+    call_llm_validated,
+    configure_llm_concurrency,
+    llm_execution_scope,
+    submit_with_context,
+)
 from app.kernel.event_log import append_event
 from app.kernel.run import create_run as kernel_create_run
 from app.ingestion.builtin_pack import (
@@ -29,7 +37,7 @@ from app.ingestion.builtin_pack import (
 )
 from app.ingestion.code_parser import parse_code_logic
 from app.ingestion.doc_parser import parse_regulatory_document
-from app.policy.dc_bus import default_bus, detect_technical_jargon, sanitize_business_text
+from app.policy.dc_bus import build_run_bus, default_bus, detect_technical_jargon, sanitize_business_text
 
 
 def _ensure_business_clean(bus, tool_name: str, payload: Dict[str, Any], allowed_evidence_ids: List[str]) -> Dict[str, Any]:
@@ -77,52 +85,49 @@ def _match_relevant_clauses(
     return [c.id for c in candidates[:2]]
 
 
-def ingest_material(
-    session: Session,
-    *,
+def _resolve_llm_model_name(active_llm: Any, settings: Settings) -> str:
+    if active_llm is None:
+        return "scripted"
+    nested = getattr(active_llm, "settings", None)
+    return str(
+        getattr(active_llm, "model", None)
+        or getattr(nested, "llm_model", None)
+        or settings.llm_model
+        or "configured"
+    )
+
+
+def _parse_material_payload(
     title: str,
     material_kind: str,
-    file_type: str,
     content: bytes,
-    settings: Optional[Settings] = None,
-    llm: Any = None,
-) -> SourceMaterialModel:
-    """并发安全地摄入监管制度文档或代码逻辑源，并提取条款或隐身底层实证。"""
-    if material_kind not in {"REGULATORY_DOC", "CODE_LOGIC"}:
-        raise ValueError(f"Unsupported material_kind: {material_kind}")
-    active_settings = settings or get_settings()
-    digest = hashlib.sha256(content).hexdigest()
-    blob_uri = LocalBlobStore(active_settings.blob_dir).put(content)
-
-    existing = session.query(SourceMaterialModel).filter(SourceMaterialModel.sha256 == digest).first()
-    if existing is None:
-        candidate = SourceMaterialModel(
-            id=str(uuid.uuid4()),
-            title=title,
-            material_kind=material_kind,
-            file_type=file_type,
-            sha256=digest,
-            blob_uri=blob_uri,
-            status="PARSED",
-            summary="",
-            item_count=0,
-        )
-        try:
-            with session.begin_nested():
-                session.add(candidate)
-                session.flush()
-            material = candidate
-        except IntegrityError:
-            material = session.query(SourceMaterialModel).filter(SourceMaterialModel.sha256 == digest).first()
-            if material is None:
-                raise
-            return material
-    else:
-        return existing
-
+    *,
+    active_llm: Any,
+    bus: Any,
+) -> List[Any]:
     if material_kind == "REGULATORY_DOC":
-        clauses = parse_regulatory_document(title, content)
-        for c in clauses:
+        return parse_regulatory_document(
+            title,
+            content,
+            llm=active_llm,
+            bus=bus,
+        )
+    return parse_code_logic(
+        title,
+        content,
+        llm=active_llm,
+        bus=bus,
+    )
+
+
+def _persist_material_items(
+    session: Session,
+    material: SourceMaterialModel,
+    material_kind: str,
+    parsed_items: List[Any],
+) -> None:
+    if material_kind == "REGULATORY_DOC":
+        for c in parsed_items:
             session.add(
                 RegulatoryClauseModel(
                     id=str(uuid.uuid4()),
@@ -137,18 +142,14 @@ def ingest_material(
                     source_locator_json=c.source_locator,
                 )
             )
-        material.item_count = len(clauses)
-        material.summary = f"已从制度文档提取 {len(clauses)} 条业务规范与口径条款。"
+        material.item_count = len(parsed_items)
+        if any((getattr(c, "source_locator", None) or {}).get("plan_applied") for c in parsed_items):
+            material.summary = f"已完成 AI 结构规划与分块精炼，提取 {len(parsed_items)} 条纯业务规范与口径条款。"
+        else:
+            material.summary = f"已从制度文档提取 {len(parsed_items)} 条业务规范与口径条款。"
     else:
-        active_llm = _resolve_optional_llm(session, active_settings, llm)
-        evidences = parse_code_logic(
-            title,
-            content,
-            llm=active_llm,
-            bus=default_bus() if active_llm is not None else None,
-        )
         stored = 0
-        for ev in evidences:
+        for ev in parsed_items:
             if (
                 session.query(LogicEvidenceModel)
                 .filter(LogicEvidenceModel.logic_fingerprint == ev.logic_fingerprint)
@@ -178,8 +179,170 @@ def ingest_material(
             except IntegrityError:
                 pass
         material.item_count = stored
-        material.summary = f"已静默提取 {stored} 组底层逻辑实证（物理对象已隔离封存，不对外展示）。"
+        if any((getattr(ev, "internal_locator", None) or {}).get("plan_applied") for ev in parsed_items):
+            material.summary = (
+                f"已完成 AI 逻辑骨架规划与分阶段提取，静默沉淀 {stored} 组底层逻辑实证（物理对象已隔离封存，不对外展示）。"
+            )
+        else:
+            material.summary = f"已静默提取 {stored} 组底层逻辑实证（物理对象已隔离封存，不对外展示）。"
 
+
+def _ingest_materials_batch(
+    session: Session,
+    items: List[Tuple[str, str, str, bytes]],
+    *,
+    settings: Settings,
+    llm: Any = None,
+) -> List[SourceMaterialModel]:
+    """并发解析一批双源材料，并在主线程中顺序落库（兼顾多核 AI 提速与 SQLite 线程安全）。"""
+    active_llm = _resolve_optional_llm(session, settings, llm)
+    blob_store = LocalBlobStore(settings.blob_dir)
+    seen_digests = set()
+    pending: List[Tuple[str, str, str, bytes, str, str]] = []
+    materials: List[SourceMaterialModel] = []
+
+    for title, material_kind, file_type, raw in items:
+        raw_bytes = raw if isinstance(raw, bytes) else str(raw).encode("utf-8")
+        digest = hashlib.sha256(raw_bytes).hexdigest()
+        if digest in seen_digests:
+            continue
+        seen_digests.add(digest)
+        existing = session.query(SourceMaterialModel).filter(SourceMaterialModel.sha256 == digest).first()
+        if existing is not None:
+            materials.append(existing)
+            continue
+        blob_uri = blob_store.put(raw_bytes)
+        pending.append((title, material_kind, file_type, raw_bytes, digest, blob_uri))
+
+    if not pending:
+        return materials
+
+    parsed_by_idx: List[List[Any]] = [[] for _ in pending]
+    if active_llm is not None:
+        budget = get_budget(session)
+        workers = max(1, min(6, int(budget.get("max_llm_concurrency", 4))))
+        configure_llm_concurrency(int(budget.get("max_llm_concurrency", 4)))
+        bus = build_run_bus(budget)
+        with llm_execution_scope(bus=bus):
+            if len(pending) == 1:
+                title, kind, _, raw_bytes, _, _ = pending[0]
+                parsed_by_idx[0] = _parse_material_payload(title, kind, raw_bytes, active_llm=active_llm, bus=bus)
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = [
+                        (
+                            idx,
+                            submit_with_context(
+                                pool,
+                                _parse_material_payload,
+                                title,
+                                kind,
+                                raw_bytes,
+                                active_llm=active_llm,
+                                bus=bus,
+                            ),
+                        )
+                        for idx, (title, kind, _, raw_bytes, _, _) in enumerate(pending)
+                    ]
+                    for idx, fut in futures:
+                        parsed_by_idx[idx] = fut.result()
+    else:
+        for idx, (title, kind, _, raw_bytes, _, _) in enumerate(pending):
+            parsed_by_idx[idx] = _parse_material_payload(title, kind, raw_bytes, active_llm=None, bus=None)
+
+    for (title, kind, file_type, _, digest, blob_uri), parsed_items in zip(pending, parsed_by_idx):
+        candidate = SourceMaterialModel(
+            id=str(uuid.uuid4()),
+            title=title,
+            material_kind=kind,
+            file_type=file_type,
+            sha256=digest,
+            blob_uri=blob_uri,
+            status="PARSED",
+            summary="",
+            item_count=0,
+        )
+        try:
+            with session.begin_nested():
+                session.add(candidate)
+                session.flush()
+            material = candidate
+        except IntegrityError:
+            existing = session.query(SourceMaterialModel).filter(SourceMaterialModel.sha256 == digest).first()
+            if existing is None:
+                raise
+            materials.append(existing)
+            continue
+        _persist_material_items(session, material, kind, parsed_items)
+        session.flush()
+        materials.append(material)
+
+    return materials
+
+
+def ingest_material(
+    session: Session,
+    *,
+    title: str,
+    material_kind: str,
+    file_type: str,
+    content: bytes,
+    settings: Optional[Settings] = None,
+    llm: Any = None,
+    bus: Any = None,
+) -> SourceMaterialModel:
+    """并发安全地摄入监管制度文档或代码逻辑源，并提取条款或隐身底层实证。"""
+    if material_kind not in {"REGULATORY_DOC", "CODE_LOGIC"}:
+        raise ValueError(f"Unsupported material_kind: {material_kind}")
+    active_settings = settings or get_settings()
+    raw_bytes = content if isinstance(content, bytes) else str(content).encode("utf-8")
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    blob_uri = LocalBlobStore(active_settings.blob_dir).put(raw_bytes)
+
+    existing = session.query(SourceMaterialModel).filter(SourceMaterialModel.sha256 == digest).first()
+    if existing is None:
+        candidate = SourceMaterialModel(
+            id=str(uuid.uuid4()),
+            title=title,
+            material_kind=material_kind,
+            file_type=file_type,
+            sha256=digest,
+            blob_uri=blob_uri,
+            status="PARSED",
+            summary="",
+            item_count=0,
+        )
+        try:
+            with session.begin_nested():
+                session.add(candidate)
+                session.flush()
+            material = candidate
+        except IntegrityError:
+            material = session.query(SourceMaterialModel).filter(SourceMaterialModel.sha256 == digest).first()
+            if material is None:
+                raise
+            return material
+    else:
+        return existing
+
+    active_llm = _resolve_optional_llm(session, active_settings, llm)
+    if active_llm is not None:
+        budget = get_budget(session)
+        configure_llm_concurrency(int(budget.get("max_llm_concurrency", 4)))
+        active_bus = bus or build_run_bus(budget)
+        if bus is None:
+            with llm_execution_scope(bus=active_bus):
+                parsed_items = _parse_material_payload(
+                    title, material_kind, raw_bytes, active_llm=active_llm, bus=active_bus
+                )
+        else:
+            parsed_items = _parse_material_payload(
+                title, material_kind, raw_bytes, active_llm=active_llm, bus=active_bus
+            )
+    else:
+        parsed_items = _parse_material_payload(title, material_kind, raw_bytes, active_llm=None, bus=None)
+
+    _persist_material_items(session, material, material_kind, parsed_items)
     session.flush()
     return material
 
@@ -387,25 +550,414 @@ def _upsert_caliber(
     return row
 
 
-def _polish_with_optional_llm(
-    tool_name: str,
-    raw_payload: Dict[str, Any],
-    allowed_evidence_ids: List[str],
+def _safe_rule_slug(raw_code: str, prefix: str) -> str:
+    """将规则编号归一化为短标识；若超长或命中技术黑话词（如 exists/number），改写为安全哈希编号。"""
+    slug = re.sub(r"[^a-z0-9-]+", "-", str(raw_code or "").lower().replace("_", "-")).strip("-")
+    if not slug or len(slug) > 32 or detect_technical_jargon(slug):
+        digest_src = str(raw_code or prefix).encode("utf-8")
+        return f"{prefix}-{hashlib.md5(digest_src).hexdigest()[:8]}"
+    return slug
+
+
+def _build_domain_draft(
+    domain_name: str,
+    d_clauses: List[RegulatoryClauseModel],
+    d_evs: List[LogicEvidenceModel],
+) -> Dict[str, Any]:
+    """根据单一业务域的监管条款与底层代码实证，构建纯业务确定性资产草案。"""
+    ev_ids = [e.id for e in d_evs]
+    cl_ids = [c.id for c in d_clauses]
+    has_conflict = any(e.calculation_kind == "CONFLICT" for e in d_evs)
+
+    if not d_evs:
+        coverage_status = "UNREALIZED"
+    elif has_conflict:
+        coverage_status = "PARTIAL"
+    else:
+        coverage_status = "COVERED"
+
+    cap_code = f"cap-{hashlib.md5(domain_name.encode('utf-8')).hexdigest()[:8]}"
+    scope_parts = [sanitize_business_text(e.source_summary) for e in d_evs if e.source_summary]
+    if not scope_parts:
+        scope_parts = [sanitize_business_text(c.business_requirement) for c in d_clauses[:2]]
+    scope_summary = "；".join(dict.fromkeys(p for p in scope_parts if p))[:600]
+    if d_clauses:
+        joined_req = " ".join(line.strip() for line in d_clauses[0].business_requirement.splitlines() if line.strip())
+        first_sentence = re.split(r"(?<=[。！？])", joined_req, maxsplit=1)[0].strip()
+        description = (first_sentence or joined_req)[:200]
+    else:
+        description = f"系统当前已落地支撑「{domain_name}」相关业务处理逻辑。"
+    audience = d_clauses[0].audience if d_clauses else "业务 / 监管报送"
+
+    rule_drafts: List[Dict[str, Any]] = []
+    seen_rule_codes = set()
+    # 1) 从底层实证提炼已实现/冲突规则
+    for ev in d_evs:
+        for item in ev.inclusion_predicates_json or []:
+            rc_slug = _safe_rule_slug(item.get("rule_code", ""), "inc")
+            rc = f"rule-{cap_code[4:]}-{rc_slug}"
+            if rc in seen_rule_codes:
+                continue
+            seen_rule_codes.add(rc)
+            matched_clauses = _match_relevant_clauses(
+                f"{item['title']} {item['condition']}", d_clauses, {"INCLUSION", "CAPABILITY"}
+            )
+            rule_drafts.append(
+                {
+                    "code": rc,
+                    "title": item["title"],
+                    "rule_category": "INCLUSION",
+                    "business_condition": item["condition"],
+                    "business_action": "满足该条件则纳入当期正式业务处理与报送范围",
+                    "business_rationale": item["rationale"],
+                    "reconcile_status": "VERIFIED" if matched_clauses else "CONSISTENT",
+                    "evidence_ids": [ev.id],
+                    "clause_ids": matched_clauses,
+                    "audience": audience,
+                }
+            )
+
+        for item in ev.exclusion_predicates_json or []:
+            rc_slug = _safe_rule_slug(item.get("rule_code", ""), "exc")
+            rc = f"rule-{cap_code[4:]}-{rc_slug}"
+            if rc in seen_rule_codes:
+                continue
+            seen_rule_codes.add(rc)
+            matched_clauses = _match_relevant_clauses(
+                f"{item['title']} {item['condition']}", d_clauses, {"EXCLUSION"}
+            )
+            rule_drafts.append(
+                {
+                    "code": rc,
+                    "title": item["title"],
+                    "rule_category": "EXCLUSION",
+                    "business_condition": item["condition"],
+                    "business_action": "自动剔除出当期常规报送结果（必要时单列进入风险待办清单）",
+                    "business_rationale": item["rationale"],
+                    "reconcile_status": "VERIFIED" if matched_clauses else "CONSISTENT",
+                    "evidence_ids": [ev.id],
+                    "clause_ids": matched_clauses,
+                    "audience": "业务 / 监管报送 / 合规",
+                }
+            )
+
+        for item in ev.branch_cases_json or []:
+            rc = f"rule-{cap_code[4:]}-branch-{hashlib.md5(item['title'].encode('utf-8')).hexdigest()[:6]}"
+            if rc in seen_rule_codes:
+                continue
+            seen_rule_codes.add(rc)
+            is_div = "分歧" in item["title"] or ev.calculation_kind == "CONFLICT"
+            matched_clauses = _match_relevant_clauses(
+                f"{item['title']} {item['condition']}", d_clauses, {"BRANCH", "CALIBER"}
+            )
+            rule_drafts.append(
+                {
+                    "code": rc,
+                    "title": item["title"],
+                    "rule_category": "BRANCH",
+                    "business_condition": item["condition"],
+                    "business_action": item["action"],
+                    "business_rationale": "按业务主体类别或账户属性自动进入差异化处理分支。",
+                    "reconcile_status": "DIVERGENT" if is_div else ("VERIFIED" if matched_clauses else "CONSISTENT"),
+                    "evidence_ids": [ev.id],
+                    "clause_ids": matched_clauses,
+                    "audience": audience,
+                }
+            )
+
+        if ev.dedup_grain_hint:
+            rc = f"rule-{cap_code[4:]}-dedup-{hashlib.md5(ev.dedup_grain_hint.encode('utf-8')).hexdigest()[:6]}"
+            if rc not in seen_rule_codes:
+                seen_rule_codes.add(rc)
+                matched_clauses = _match_relevant_clauses(
+                    ev.dedup_grain_hint, d_clauses, {"INCLUSION", "CAPABILITY"}
+                )
+                rule_drafts.append(
+                    {
+                        "code": rc,
+                        "title": "唯一记录防重保留规则",
+                        "rule_category": "DEDUP",
+                        "business_condition": "同一客户、账户或交易在系统加工过程中出现多条状态记录时",
+                        "business_action": ev.dedup_grain_hint,
+                        "business_rationale": "保障报送金额与交易笔数准确唯一，防止同一业务被重复计数。",
+                        "reconcile_status": "VERIFIED" if matched_clauses else "CONSISTENT",
+                        "evidence_ids": [ev.id],
+                        "clause_ids": matched_clauses,
+                        "audience": audience,
+                    }
+                )
+
+    # 2) 制度里有要求但当前代码尚未包含的领域：落 UNREALIZED 规则提示差距
+    if not d_evs:
+        for cl in d_clauses:
+            rc = f"rule-{cap_code[4:]}-unreal-{hashlib.md5(cl.clause_title.encode('utf-8')).hexdigest()[:6]}"
+            if rc in seen_rule_codes:
+                continue
+            seen_rule_codes.add(rc)
+            rule_drafts.append(
+                {
+                    "code": rc,
+                    "title": cl.clause_title,
+                    "rule_category": cl.clause_kind if cl.clause_kind in {"INCLUSION", "EXCLUSION", "BRANCH", "DEDUP"} else "INCLUSION",
+                    "business_condition": sanitize_business_text(cl.business_requirement),
+                    "business_action": "当前系统处理逻辑中尚未检索到该项规则的实际落地实现",
+                    "business_rationale": "制度规范已明确要求，但目前仅停留在制度文件阶段，建议纳入后续开发排期。",
+                    "reconcile_status": "UNREALIZED",
+                    "evidence_ids": [],
+                    "clause_ids": [cl.id],
+                    "audience": cl.audience,
+                }
+            )
+
+    # 3) 合成业务指标口径卡（从 CALIBER 条款 + 底层计算实证对齐）
+    caliber_clauses = [c for c in d_clauses if c.clause_kind == "CALIBER"]
+    caliber_drafts: List[Dict[str, Any]] = []
+    seen_cal_codes = set()
+    for cl in caliber_clauses:
+        raw_title = cl.clause_title
+        if "——" in raw_title:
+            raw_title = raw_title.split("——", 1)[1]
+        metric_name = re.sub(
+            r"(公式与口径细则|公式与计算口径|口径管理|专项核验|的官方取数口径|字段的|报送映射要求|监管要求)$",
+            "",
+            raw_title,
+        ).strip()
+        for known in ("交易金额", "交易后余额", "跨境联名账户折算余额", "综合授信额度", "大额结售汇"):
+            if known in cl.clause_title:
+                metric_name = known
+                break
+        metric_name = sanitize_business_text(metric_name).strip('“”"\' ：:') or sanitize_business_text(cl.clause_title)
+        if len(metric_name) > 28:
+            metric_name = metric_name[:26].rstrip("，；： ") + "…"
+        cal_code = f"cal-{hashlib.md5(metric_name.encode('utf-8')).hexdigest()[:8]}"
+        if cal_code in seen_cal_codes:
+            continue
+        seen_cal_codes.add(cal_code)
+        matching_evs = [
+            e
+            for e in d_evs
+            if metric_name in e.target_concept_hint
+            or metric_name in e.calculation_summary
+            or (metric_name in {"交易金额", "交易后余额"} and e.calculation_kind == "DIRECT")
+            or (e.calculation_kind == "CONFLICT" and ("联名" in metric_name or "对手" in cl.clause_title or "大额结售汇" in metric_name))
+        ]
+        if not matching_evs and d_evs:
+            matching_evs = [d_evs[0]]
+        ev_for_cal = [e.id for e in matching_evs]
+        is_conflict = any(e.calculation_kind == "CONFLICT" for e in matching_evs) and (
+            "联名" in metric_name or "对手" in cl.clause_title or "对手" in cl.business_requirement
+        )
+        if not ev_for_cal:
+            r_status = "UNREALIZED"
+            formula_summary = "当前系统逻辑尚未包含该项指标的具体计算实现（仅制度材料提及）。"
+            conflict_notes = ""
+        elif is_conflict:
+            r_status = "DIVERGENT"
+            conflict_ev = next(e for e in matching_evs if e.calculation_kind == "CONFLICT")
+            formula_summary = conflict_ev.calculation_summary
+            conflict_notes = conflict_ev.calculation_summary
+        else:
+            r_status = "VERIFIED"
+            if "交易后余额" in metric_name:
+                formula_summary = "按交易发生完成瞬间的账户静态余额原值直接传出，不进行跨日累计或日均折算。"
+            elif "交易金额" in metric_name:
+                formula_summary = "按单笔实际发生金额原值直接传出，不做跨日汇总或四舍五入截断。"
+            else:
+                formula_summary = matching_evs[0].calculation_summary
+            conflict_notes = ""
+
+        caliber_drafts.append(
+            {
+                "code": cal_code,
+                "metric_name": metric_name,
+                "business_definition": sanitize_business_text(cl.business_requirement),
+                "formula_summary": formula_summary,
+                "inclusion_scope": f"适用业务范围：{domain_name}（随当期主体圈定与有效状态规则一并生效）",
+                "exclusion_notes": "若属于应报未报待补报账户或已撤回/已报送记录，不计入当期常规报送结果。",
+                "distinction_notes": (
+                    "重要区分：交易后余额是交易时点静态快照，严禁与日均余额混用。"
+                    if "余额" in metric_name
+                    else "请勿将该口径与跨业务阶段汇总指标混用。"
+                ),
+                "triggers": [metric_name, sanitize_business_text(cl.clause_title)],
+                "reconcile_status": r_status,
+                "conflict_notes": conflict_notes,
+                "evidence_ids": ev_for_cal,
+                "clause_ids": [cl.id],
+                "audience": cl.audience,
+            }
+        )
+
+    # 如果某领域属于尚未落地的专项监测，且没有 CALIBER 条款，则补充一条 UNREALIZED 口径核验卡以便对账总览清晰呈现
+    if not d_evs and not caliber_clauses and d_clauses:
+        metric_name = sanitize_business_text(d_clauses[0].clause_title)
+        if len(metric_name) > 28:
+            metric_name = metric_name[:26].rstrip("，；： ") + "…"
+        cal_code = f"cal-{hashlib.md5(metric_name.encode('utf-8')).hexdigest()[:8]}"
+        caliber_drafts.append(
+            {
+                "code": cal_code,
+                "metric_name": metric_name,
+                "business_definition": sanitize_business_text(d_clauses[0].business_requirement),
+                "formula_summary": "制度材料明确提出了此专项核验要求，但当前已接入的系统逻辑尚未实现。",
+                "inclusion_scope": domain_name,
+                "exclusion_notes": "尚待业务与研发确认纳入排期后补齐实现。",
+                "distinction_notes": "请勿对外宣传系统已具备该专项自动核验能力。",
+                "triggers": [metric_name, domain_name],
+                "reconcile_status": "UNREALIZED",
+                "conflict_notes": "系统底层暂无对应实现支撑。",
+                "evidence_ids": [],
+                "clause_ids": [c.id for c in d_clauses],
+                "audience": d_clauses[0].audience,
+            }
+        )
+
+    brief_clauses = [
+        {
+            "title": sanitize_business_text(c.clause_title),
+            "kind": c.clause_kind,
+            "requirement": sanitize_business_text(c.business_requirement)[:300],
+        }
+        for c in d_clauses[:12]
+    ]
+    brief_evidences = [
+        {
+            "evidence_id": e.id,
+            "target_concept": sanitize_business_text(e.target_concept_hint),
+            "source_summary": sanitize_business_text(e.source_summary)[:240],
+            "calculation_kind": e.calculation_kind,
+            "calculation_summary": sanitize_business_text(e.calculation_summary)[:200],
+        }
+        for e in d_evs[:15]
+    ]
+
+    return {
+        "domain_name": domain_name,
+        "cap_code": cap_code,
+        "coverage_status": coverage_status,
+        "ev_ids": ev_ids,
+        "cl_ids": cl_ids,
+        "audience": audience,
+        "capability": {
+            "code": cap_code,
+            "name": domain_name,
+            "description": sanitize_business_text(description),
+            "scope_summary": scope_summary or f"覆盖「{domain_name}」全部核心业务处理环节。",
+            "audience": audience,
+        },
+        "rules": rule_drafts,
+        "calibers": caliber_drafts,
+        "brief_clauses": brief_clauses,
+        "brief_evidences": brief_evidences,
+    }
+
+
+def _refine_domain_with_llm(
+    draft: Dict[str, Any],
     *,
     llm: Any,
-    bus,
-) -> Dict[str, Any]:
+    bus: Any,
+) -> Tuple[Dict[str, Any], bool]:
+    """利用受控大模型对单一业务域进行代码实证 × 监管制度深度业务融合提炼。"""
     if llm is None:
-        return raw_payload
-    args, _trace = call_llm_validated(
-        llm,
-        tool_name,
-        "把输入业务内容提炼为更加凝练自然的中文业务表达，严禁出现任何代码、表名、字段名或 SQL 关键词。",
-        {**raw_payload, "allowed_evidence_ids": allowed_evidence_ids},
-        backoff=(0.1, 0.2),
-        bus=bus,
-    )
-    return {**raw_payload, **args}
+        return draft, False
+    from app.kernel.run import BudgetExceededError
+
+    payload = {
+        "domain_name": draft["domain_name"],
+        "coverage_status": draft["coverage_status"],
+        "allowed_evidence_ids": draft["ev_ids"],
+        "regulatory_clauses": draft["brief_clauses"],
+        "logic_evidences": draft["brief_evidences"],
+        "draft_capability": draft["capability"],
+        "draft_rules": [
+            {
+                "code": r["code"],
+                "title": r["title"],
+                "rule_category": r["rule_category"],
+                "business_condition": r["business_condition"],
+                "business_action": r["business_action"],
+                "business_rationale": r["business_rationale"],
+                "evidence_ids": r["evidence_ids"],
+            }
+            for r in draft["rules"][:12]
+        ],
+        "draft_calibers": [
+            {
+                "code": c["code"],
+                "metric_name": c["metric_name"],
+                "business_definition": c["business_definition"],
+                "formula_summary": c["formula_summary"],
+                "distinction_notes": c["distinction_notes"],
+                "conflict_notes": c["conflict_notes"],
+                "evidence_ids": c["evidence_ids"],
+            }
+            for c in draft["calibers"][:8]
+        ],
+    }
+    try:
+        args, _trace = call_llm_validated(
+            llm,
+            "synthesize_domain_assets",
+            (
+                "结合监管制度条款与系统底层实证，在不编造未实证规则、不丢失原规则 code、"
+                "且严禁出现任何物理表名、字段名、文件名或 SQL 关键词的前提下，将本业务域的概述、"
+                "适用边界、核心规则条件/结果/业务原因及指标口径提炼融合为清晰自然的中文业务表述。"
+                "如底层存在多口径分歧或制度未落地缺口，必须如实点明。"
+            ),
+            payload,
+            backoff=(0.1, 0.2),
+            bus=bus,
+        )
+    except BudgetExceededError:
+        raise
+    except (WorkflowError, RuntimeError):
+        return draft, False
+
+    cap = draft["capability"]
+    if str(args.get("description") or "").strip():
+        cap["description"] = sanitize_business_text(str(args["description"]).strip()) or cap["description"]
+    if str(args.get("scope_summary") or "").strip():
+        cap["scope_summary"] = sanitize_business_text(str(args["scope_summary"]).strip()) or cap["scope_summary"]
+
+    allowed_ev_set = set(draft["ev_ids"])
+    ai_rules = {
+        str(item.get("code")): item
+        for item in (args.get("rules") or [])
+        if isinstance(item, dict) and item.get("code")
+    }
+    for rule in draft["rules"]:
+        refined = ai_rules.get(rule["code"])
+        if not refined:
+            continue
+        for field in ("title", "business_condition", "business_action", "business_rationale"):
+            val = sanitize_business_text(str(refined.get(field) or "").strip())
+            if val:
+                rule[field] = val
+        if isinstance(refined.get("evidence_ids"), list) and rule["evidence_ids"]:
+            filtered = [eid for eid in refined["evidence_ids"] if eid in allowed_ev_set]
+            if filtered:
+                rule["evidence_ids"] = filtered
+
+    ai_calibers = {
+        str(item.get("code")): item
+        for item in (args.get("calibers") or [])
+        if isinstance(item, dict) and item.get("code")
+    }
+    for cal in draft["calibers"]:
+        refined = ai_calibers.get(cal["code"])
+        if not refined:
+            continue
+        for field in ("metric_name", "business_definition", "formula_summary", "distinction_notes", "conflict_notes"):
+            val = sanitize_business_text(str(refined.get(field) or "").strip())
+            if val:
+                cal[field] = val
+        if isinstance(refined.get("evidence_ids"), list) and cal["evidence_ids"]:
+            filtered = [eid for eid in refined["evidence_ids"] if eid in allowed_ev_set]
+            if filtered:
+                cal["evidence_ids"] = filtered
+
+    return draft, True
 
 
 def synthesize_business_assets(
@@ -415,7 +967,12 @@ def synthesize_business_assets(
     llm: Any = None,
 ) -> Dict[str, Any]:
     """将底层代码实证与监管制度条款自动碰撞对齐，生成纯业务语言四大资产层并落哈希链账本。"""
-    bus = default_bus()
+    active_settings = get_effective_settings(session, settings or get_settings())
+    active_llm = _resolve_optional_llm(session, active_settings, llm)
+    budget = get_budget(session)
+    configure_llm_concurrency(int(budget.get("max_llm_concurrency", 4)))
+    bus = build_run_bus(budget)
+
     run: RunModel = kernel_create_run(session, "dc_asset_synthesis", initial_node="created", bus=bus)
     clauses = session.query(RegulatoryClauseModel).all()
     evidences = session.query(LogicEvidenceModel).all()
@@ -457,60 +1014,46 @@ def synthesize_business_assets(
         bus=bus,
     )
 
+    drafts = [
+        _build_domain_draft(domain_name, domain_clauses[domain_name], domain_evidences[domain_name])
+        for domain_name in domains_order
+    ]
+
+    ai_enriched_domains = 0
+    if active_llm is not None and drafts:
+        workers = max(1, min(6, int(budget.get("max_llm_concurrency", 4))))
+        with llm_execution_scope(bus=bus):
+            if len(drafts) == 1:
+                drafts[0], ok = _refine_domain_with_llm(drafts[0], llm=active_llm, bus=bus)
+                if ok:
+                    ai_enriched_domains = 1
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = [
+                        (idx, submit_with_context(pool, _refine_domain_with_llm, d, llm=active_llm, bus=bus))
+                        for idx, d in enumerate(drafts)
+                    ]
+                    for idx, fut in futures:
+                        drafts[idx], ok = fut.result()
+                        if ok:
+                            ai_enriched_domains += 1
+
     cap_total = 0
     rule_total = 0
     caliber_total = 0
 
-    for idx, domain_name in enumerate(domains_order):
-        d_clauses = domain_clauses[domain_name]
-        d_evs = domain_evidences[domain_name]
-        ev_ids = [e.id for e in d_evs]
-        cl_ids = [c.id for c in d_clauses]
-        has_conflict = any(e.calculation_kind == "CONFLICT" for e in d_evs)
-
-        if not d_evs:
-            coverage_status = "UNREALIZED"
-        elif has_conflict:
-            coverage_status = "PARTIAL"
-        else:
-            coverage_status = "COVERED"
-
-        cap_code = f"cap-{hashlib.md5(domain_name.encode('utf-8')).hexdigest()[:8]}"
-        scope_parts = [sanitize_business_text(e.source_summary) for e in d_evs if e.source_summary]
-        if not scope_parts:
-            scope_parts = [sanitize_business_text(c.business_requirement) for c in d_clauses[:2]]
-        scope_summary = "；".join(dict.fromkeys(p for p in scope_parts if p))[:600]
-        if d_clauses:
-            joined_req = " ".join(line.strip() for line in d_clauses[0].business_requirement.splitlines() if line.strip())
-            first_sentence = re.split(r"(?<=[。！？])", joined_req, maxsplit=1)[0].strip()
-            description = (first_sentence or joined_req)[:200]
-        else:
-            description = f"系统当前已落地支撑「{domain_name}」相关业务处理逻辑。"
-        audience = d_clauses[0].audience if d_clauses else "业务 / 监管报送"
-
-        cap_payload = _polish_with_optional_llm(
-            "synthesize_business_capability",
-            {
-                "code": cap_code,
-                "name": domain_name,
-                "description": sanitize_business_text(description),
-                "scope_summary": scope_summary or f"覆盖「{domain_name}」全部核心业务处理环节。",
-                "audience": audience,
-            },
-            ev_ids,
-            llm=llm,
-            bus=bus,
-        )
+    for draft in drafts:
+        cap_payload = draft["capability"]
         cap_row = _upsert_capability(
             session,
-            code=cap_code,
+            code=draft["cap_code"],
             name=cap_payload["name"],
             description=cap_payload["description"],
             scope_summary=cap_payload["scope_summary"],
-            audience=cap_payload.get("audience", audience),
-            coverage_status=coverage_status,
-            evidence_ids=ev_ids,
-            clause_ids=cl_ids,
+            audience=cap_payload.get("audience", draft["audience"]),
+            coverage_status=draft["coverage_status"],
+            evidence_ids=draft["ev_ids"],
+            clause_ids=draft["cl_ids"],
             rule_count=0,
             caliber_count=0,
             confirmed_count=0,
@@ -520,244 +1063,22 @@ def synthesize_business_assets(
         cap_rule_count = 0
         cap_caliber_count = 0
 
-        seen_rule_codes = set()
-        # 1) 从底层实证提炼已实现/冲突规则
-        for ev in d_evs:
-            for item in ev.inclusion_predicates_json or []:
-                rc_slug = item["rule_code"].lower().replace("_", "-")
-                rc = f"rule-{cap_code[4:]}-{rc_slug}"
-                if rc in seen_rule_codes:
-                    continue
-                seen_rule_codes.add(rc)
-                matched_clauses = _match_relevant_clauses(
-                    f"{item['title']} {item['condition']}", d_clauses, {"INCLUSION", "CAPABILITY"}
-                )
-                _upsert_rule(
-                    session,
-                    capability_id=cap_row.id,
-                    code=rc,
-                    title=item["title"],
-                    rule_category="INCLUSION",
-                    business_condition=item["condition"],
-                    business_action="满足该条件则纳入当期正式业务处理与报送范围",
-                    business_rationale=item["rationale"],
-                    reconcile_status="VERIFIED" if matched_clauses else "CONSISTENT",
-                    evidence_ids=[ev.id],
-                    clause_ids=matched_clauses,
-                    audience=audience,
-                    bus=bus,
-                )
-                cap_rule_count += 1
-                rule_total += 1
-
-            for item in ev.exclusion_predicates_json or []:
-                rc_slug = item["rule_code"].lower().replace("_", "-")
-                rc = f"rule-{cap_code[4:]}-{rc_slug}"
-                if rc in seen_rule_codes:
-                    continue
-                seen_rule_codes.add(rc)
-                matched_clauses = _match_relevant_clauses(
-                    f"{item['title']} {item['condition']}", d_clauses, {"EXCLUSION"}
-                )
-                _upsert_rule(
-                    session,
-                    capability_id=cap_row.id,
-                    code=rc,
-                    title=item["title"],
-                    rule_category="EXCLUSION",
-                    business_condition=item["condition"],
-                    business_action="自动剔除出当期常规报送结果（必要时单列进入风险待办清单）",
-                    business_rationale=item["rationale"],
-                    reconcile_status="VERIFIED" if matched_clauses else "CONSISTENT",
-                    evidence_ids=[ev.id],
-                    clause_ids=matched_clauses,
-                    audience="业务 / 监管报送 / 合规",
-                    bus=bus,
-                )
-                cap_rule_count += 1
-                rule_total += 1
-
-            for b_idx, item in enumerate(ev.branch_cases_json or []):
-                rc = f"rule-{cap_code[4:]}-branch-{hashlib.md5(item['title'].encode('utf-8')).hexdigest()[:6]}"
-                if rc in seen_rule_codes:
-                    continue
-                seen_rule_codes.add(rc)
-                is_div = "分歧" in item["title"] or ev.calculation_kind == "CONFLICT"
-                matched_clauses = _match_relevant_clauses(
-                    f"{item['title']} {item['condition']}", d_clauses, {"BRANCH", "CALIBER"}
-                )
-                _upsert_rule(
-                    session,
-                    capability_id=cap_row.id,
-                    code=rc,
-                    title=item["title"],
-                    rule_category="BRANCH",
-                    business_condition=item["condition"],
-                    business_action=item["action"],
-                    business_rationale="按业务主体类别或账户属性自动进入差异化处理分支。",
-                    reconcile_status="DIVERGENT" if is_div else ("VERIFIED" if matched_clauses else "CONSISTENT"),
-                    evidence_ids=[ev.id],
-                    clause_ids=matched_clauses,
-                    audience=audience,
-                    bus=bus,
-                )
-                cap_rule_count += 1
-                rule_total += 1
-
-            if ev.dedup_grain_hint:
-                rc = f"rule-{cap_code[4:]}-dedup-{hashlib.md5(ev.dedup_grain_hint.encode('utf-8')).hexdigest()[:6]}"
-                if rc not in seen_rule_codes:
-                    seen_rule_codes.add(rc)
-                    matched_clauses = _match_relevant_clauses(
-                        ev.dedup_grain_hint, d_clauses, {"INCLUSION", "CAPABILITY"}
-                    )
-                    _upsert_rule(
-                        session,
-                        capability_id=cap_row.id,
-                        code=rc,
-                        title="唯一记录防重保留规则",
-                        rule_category="DEDUP",
-                        business_condition="同一客户、账户或交易在系统加工过程中出现多条状态记录时",
-                        business_action=ev.dedup_grain_hint,
-                        business_rationale="保障报送金额与交易笔数准确唯一，防止同一业务被重复计数。",
-                        reconcile_status="VERIFIED" if matched_clauses else "CONSISTENT",
-                        evidence_ids=[ev.id],
-                        clause_ids=matched_clauses,
-                        audience=audience,
-                        bus=bus,
-                    )
-                    cap_rule_count += 1
-                    rule_total += 1
-
-        # 2) 制度里有要求但当前代码尚未包含的领域：落 UNREALIZED 规则提示差距
-        if not d_evs:
-            for cl in d_clauses:
-                rc = f"rule-{cap_code[4:]}-unreal-{hashlib.md5(cl.clause_title.encode('utf-8')).hexdigest()[:6]}"
-                if rc in seen_rule_codes:
-                    continue
-                seen_rule_codes.add(rc)
-                _upsert_rule(
-                    session,
-                    capability_id=cap_row.id,
-                    code=rc,
-                    title=cl.clause_title,
-                    rule_category=cl.clause_kind if cl.clause_kind in {"INCLUSION", "EXCLUSION", "BRANCH", "DEDUP"} else "INCLUSION",
-                    business_condition=sanitize_business_text(cl.business_requirement),
-                    business_action="当前系统处理逻辑中尚未检索到该项规则的实际落地实现",
-                    business_rationale="制度规范已明确要求，但目前仅停留在制度文件阶段，建议纳入后续开发排期。",
-                    reconcile_status="UNREALIZED",
-                    evidence_ids=[],
-                    clause_ids=[cl.id],
-                    audience=cl.audience,
-                    bus=bus,
-                )
-                cap_rule_count += 1
-                rule_total += 1
-
-        # 3) 合成业务指标口径卡（从 CALIBER 条款 + 底层计算实证对齐）
-        caliber_clauses = [c for c in d_clauses if c.clause_kind == "CALIBER"]
-        seen_cal_codes = set()
-        for cl in caliber_clauses:
-            raw_title = cl.clause_title
-            if "——" in raw_title:
-                raw_title = raw_title.split("——", 1)[1]
-            metric_name = re.sub(
-                r"(公式与口径细则|公式与计算口径|口径管理|专项核验|的官方取数口径|字段的|报送映射要求|监管要求)$",
-                "",
-                raw_title,
-            ).strip()
-            for known in ("交易金额", "交易后余额", "跨境联名账户折算余额", "综合授信额度", "大额结售汇"):
-                if known in cl.clause_title:
-                    metric_name = known
-                    break
-            metric_name = sanitize_business_text(metric_name).strip('“”"\' ：:') or sanitize_business_text(cl.clause_title)
-            if len(metric_name) > 28:
-                metric_name = metric_name[:26].rstrip("，；： ") + "…"
-            cal_code = f"cal-{hashlib.md5(metric_name.encode('utf-8')).hexdigest()[:8]}"
-            if cal_code in seen_cal_codes:
-                continue
-            seen_cal_codes.add(cal_code)
-            matching_evs = [
-                e
-                for e in d_evs
-                if metric_name in e.target_concept_hint
-                or metric_name in e.calculation_summary
-                or (metric_name in {"交易金额", "交易后余额"} and e.calculation_kind == "DIRECT")
-                or (e.calculation_kind == "CONFLICT" and ("联名" in metric_name or "对手" in cl.clause_title or "大额结售汇" in metric_name))
-            ]
-            if not matching_evs and d_evs:
-                matching_evs = [d_evs[0]]
-            ev_for_cal = [e.id for e in matching_evs]
-            is_conflict = any(e.calculation_kind == "CONFLICT" for e in matching_evs) and (
-                "联名" in metric_name or "对手" in cl.clause_title or "对手" in cl.business_requirement
+        for rule_draft in draft["rules"]:
+            _upsert_rule(
+                session,
+                capability_id=cap_row.id,
+                bus=bus,
+                **rule_draft,
             )
-            if not ev_for_cal:
-                r_status = "UNREALIZED"
-                formula_summary = "当前系统逻辑尚未包含该项指标的具体计算实现（仅制度材料提及）。"
-                conflict_notes = ""
-            elif is_conflict:
-                r_status = "DIVERGENT"
-                conflict_ev = next(e for e in matching_evs if e.calculation_kind == "CONFLICT")
-                formula_summary = conflict_ev.calculation_summary
-                conflict_notes = conflict_ev.calculation_summary
-            else:
-                r_status = "VERIFIED"
-                if "交易后余额" in metric_name:
-                    formula_summary = "按交易发生完成瞬间的账户静态余额原值直接传出，不进行跨日累计或日均折算。"
-                elif "交易金额" in metric_name:
-                    formula_summary = "按单笔实际发生金额原值直接传出，不做跨日汇总或四舍五入截断。"
-                else:
-                    formula_summary = matching_evs[0].calculation_summary
-                conflict_notes = ""
+            cap_rule_count += 1
+            rule_total += 1
 
+        for cal_draft in draft["calibers"]:
             _upsert_caliber(
                 session,
                 capability_id=cap_row.id,
-                code=cal_code,
-                metric_name=metric_name,
-                business_definition=sanitize_business_text(cl.business_requirement),
-                formula_summary=formula_summary,
-                inclusion_scope=f"适用业务范围：{domain_name}（随当期主体圈定与有效状态规则一并生效）",
-                exclusion_notes="若属于应报未报待补报账户或已撤回/已报送记录，不计入当期常规报送结果。",
-                distinction_notes=(
-                    "重要区分：交易后余额是交易时点静态快照，严禁与日均余额混用。"
-                    if "余额" in metric_name
-                    else "请勿将该口径与跨业务阶段汇总指标混用。"
-                ),
-                triggers=[metric_name, sanitize_business_text(cl.clause_title)],
-                reconcile_status=r_status,
-                conflict_notes=conflict_notes,
-                evidence_ids=ev_for_cal,
-                clause_ids=[cl.id],
-                audience=cl.audience,
                 bus=bus,
-            )
-            cap_caliber_count += 1
-            caliber_total += 1
-
-        # 如果某领域属于尚未落地的专项监测，且没有 CALIBER 条款，则补充一条 UNREALIZED 口径核验卡以便对账总览清晰呈现
-        if not d_evs and not caliber_clauses and d_clauses:
-            metric_name = sanitize_business_text(d_clauses[0].clause_title)
-            if len(metric_name) > 28:
-                metric_name = metric_name[:26].rstrip("，；： ") + "…"
-            cal_code = f"cal-{hashlib.md5(metric_name.encode('utf-8')).hexdigest()[:8]}"
-            _upsert_caliber(
-                session,
-                capability_id=cap_row.id,
-                code=cal_code,
-                metric_name=metric_name,
-                business_definition=sanitize_business_text(d_clauses[0].business_requirement),
-                formula_summary="制度材料明确提出了此专项核验要求，但当前已接入的系统逻辑尚未实现。",
-                inclusion_scope=domain_name,
-                exclusion_notes="尚待业务与研发确认纳入排期后补齐实现。",
-                distinction_notes="请勿对外宣传系统已具备该专项自动核验能力。",
-                triggers=[metric_name, domain_name],
-                reconcile_status="UNREALIZED",
-                conflict_notes="系统底层暂无对应实现支撑。",
-                evidence_ids=[],
-                clause_ids=[c.id for c in d_clauses],
-                audience=d_clauses[0].audience,
-                bus=bus,
+                **cal_draft,
             )
             cap_caliber_count += 1
             caliber_total += 1
@@ -782,6 +1103,9 @@ def synthesize_business_assets(
         "capability_count": cap_total,
         "rule_count": rule_total,
         "caliber_count": caliber_total,
+        "ai_enabled": active_llm is not None,
+        "llm_model": _resolve_llm_model_name(active_llm, active_settings),
+        "ai_enriched_domains": ai_enriched_domains,
     }
     append_event(
         session,
@@ -801,6 +1125,7 @@ def load_builtin_sample_pack(
     settings: Optional[Settings] = None,
     include_real_sac: bool = False,
     sql_explorer_dir: Optional[str] = None,
+    llm: Any = None,
 ) -> Dict[str, Any]:
     """一键载入金融监管制度 + 逻辑代码双源样例并自动合成业务资产层。"""
     if include_real_sac:
@@ -808,28 +1133,19 @@ def load_builtin_sample_pack(
             session,
             sql_explorer_dir=sql_explorer_dir,
             settings=settings,
+            llm=llm,
         )
-    active_settings = settings or get_settings()
-    for title, raw in BUILTIN_REGULATORY_DOCS:
-        ingest_material(
-            session,
-            title=title,
-            material_kind="REGULATORY_DOC",
-            file_type="md",
-            content=raw,
-            settings=active_settings,
-        )
-    for title, raw in BUILTIN_CODE_SOURCES:
-        ingest_material(
-            session,
-            title=title,
-            material_kind="CODE_LOGIC",
-            file_type="sql",
-            content=raw,
-            settings=active_settings,
-        )
+    active_settings = get_effective_settings(session, settings or get_settings())
+    items = [
+        (title, "REGULATORY_DOC", "md", raw)
+        for title, raw in BUILTIN_REGULATORY_DOCS
+    ] + [
+        (title, "CODE_LOGIC", "sql", raw)
+        for title, raw in BUILTIN_CODE_SOURCES
+    ]
+    _ingest_materials_batch(session, items, settings=active_settings, llm=llm)
     session.commit()
-    return synthesize_business_assets(session, settings=active_settings)
+    return synthesize_business_assets(session, settings=active_settings, llm=llm)
 
 
 def load_real_sac_corpus(
@@ -837,27 +1153,18 @@ def load_real_sac_corpus(
     *,
     sql_explorer_dir: Optional[str] = None,
     settings: Optional[Settings] = None,
+    llm: Any = None,
 ) -> Dict[str, Any]:
     """载入 sql_explorer 真实 25 份 SAC 脚本 + 真实 SAC 监管/口径/术语文档并全量合成业务资产。"""
-    active_settings = settings or get_settings()
+    active_settings = get_effective_settings(session, settings or get_settings())
     reg_docs, code_sources = collect_real_sac_materials(sql_explorer_dir)
-    for title, raw in reg_docs:
-        ingest_material(
-            session,
-            title=title,
-            material_kind="REGULATORY_DOC",
-            file_type="md",
-            content=raw,
-            settings=active_settings,
-        )
-    for title, raw in code_sources:
-        ingest_material(
-            session,
-            title=title,
-            material_kind="CODE_LOGIC",
-            file_type="sql",
-            content=raw,
-            settings=active_settings,
-        )
+    items = [
+        (title, "REGULATORY_DOC", "md", raw)
+        for title, raw in reg_docs
+    ] + [
+        (title, "CODE_LOGIC", "sql", raw)
+        for title, raw in code_sources
+    ]
+    _ingest_materials_batch(session, items, settings=active_settings, llm=llm)
     session.commit()
-    return synthesize_business_assets(session, settings=active_settings)
+    return synthesize_business_assets(session, settings=active_settings, llm=llm)

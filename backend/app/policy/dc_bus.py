@@ -11,6 +11,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from app.kernel.bus import Bus
+from app.kernel.run import BudgetGuard, BudgetLimits
 
 # 仅面向技术/工程对象的词汇与标识符模式（严禁出现在对外业务表述中）
 # 注意：使用 ASCII 边界 (?<![A-Za-z0-9_]) / (?![A-Za-z0-9_])，因为 Python \b 把中文字符也视作 \w 会漏检“处理SF_SAC_...”
@@ -132,6 +133,20 @@ _EXEMPT_KEYS = {
     "triggers",
     "ast_features",
     "statement_kind",
+    "tool",
+    "args",
+    "clause_kind",
+    "keep",
+    "calculation_kind",
+    "reasoning_summary",
+    "section_index",
+    "document_kind",
+    "chunking_strategy",
+    "chunk_group",
+    "role",
+    "group_id",
+    "stage_role",
+    "step_indices",
 }
 
 
@@ -248,4 +263,18 @@ def default_bus(parent: Optional[Bus] = None) -> Bus:
     bus = Bus(parent=parent)
     bus.add_adjudicator(de_jargon_adjudicator)
     bus.add_adjudicator(evidence_backing_adjudicator)
+    return bus
+
+
+def build_run_bus(
+    budget: Optional[Dict[str, Any]] = None,
+    *,
+    parent: Optional[Bus] = None,
+    run_id: Optional[str] = None,
+) -> Bus:
+    """装配挂载 BudgetGuard（并发次数/Token/超时熔断）的 Run 级门禁总线。"""
+    bus = default_bus(parent=parent)
+    if budget:
+        guard = BudgetGuard(BudgetLimits.from_dict(budget), run_id=run_id)
+        guard.attach(bus)
     return bus

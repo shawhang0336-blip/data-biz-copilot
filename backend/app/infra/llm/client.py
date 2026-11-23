@@ -87,7 +87,7 @@ class RealDesignLlm:
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是只使用纯业务语言（严禁出现任何代码、SQL、表名或字段名）的工具调用助手。",
+                    "content": "你是只使用纯中文业务语言（严禁出现任何代码、SQL、物理表名或字段英文名）进行结构化工具调用的金融业务架构专家。",
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -107,7 +107,8 @@ class RealDesignLlm:
         }
         if self.settings.llm_thinking:
             request_json["thinking"] = {"type": self.settings.llm_thinking}
-        url = f"{self.settings.llm_base_url.rstrip('/')}/chat/completions"
+        base_url = self.settings.llm_base_url.rstrip("/")
+        url = f"{base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {self.settings.llm_api_key}"}
         try:
             with llm_call_semaphore():
@@ -117,41 +118,91 @@ class RealDesignLlm:
                     response = httpx.post(url, headers=headers, json=request_json, timeout=timeout)
         except httpx.TimeoutException as exc:
             elapsed = round(time.monotonic() - started_at, 2)
-            raise LlmTimeoutError(f"{type(exc).__name__} after {elapsed}s") from exc
+            raise LlmTimeoutError(f"{type(exc).__name__} after {elapsed}s; request_chars={len(prompt)}") from exc
         except httpx.HTTPError as exc:
             elapsed = round(time.monotonic() - started_at, 2)
-            raise RuntimeError(f"{type(exc).__name__} after {elapsed}s") from exc
+            raise RuntimeError(f"{type(exc).__name__} after {elapsed}s; request_chars={len(prompt)}") from exc
+
         if response.is_error:
-            raise RuntimeError(f"LLM HTTP {response.status_code}: {(response.text or '')[:200]}")
-        body = response.json()
-        choices = body.get("choices") if isinstance(body, dict) else None
+            elapsed = round(time.monotonic() - started_at, 2)
+            try:
+                parsed_err = response.json()
+                error = parsed_err.get("error", {}) if isinstance(parsed_err, dict) else {}
+                code = error.get("code", "")
+                msg = error.get("message", "")
+            except Exception:  # noqa: BLE001
+                code = ""
+                raw_text = (getattr(response, "text", "") or "").strip().replace("\n", " ")
+                msg = raw_text[:240] or "non-JSON error body"
+            raise RuntimeError(f"LLM HTTP {response.status_code} {code}: {msg}; elapsed={elapsed}s")
+
+        try:
+            body = response.json()
+        except Exception as exc:  # noqa: BLE001
+            elapsed = round(time.monotonic() - started_at, 2)
+            raise RuntimeError(f"LLM HTTP 502 invalid JSON response: {exc}; elapsed={elapsed}s") from exc
+
+        if not isinstance(body, dict):
+            elapsed = round(time.monotonic() - started_at, 2)
+            raise RuntimeError(f"LLM HTTP 502 non-object JSON response; elapsed={elapsed}s")
+
+        choices = body.get("choices")
         if not isinstance(choices, list) or not choices:
-            raise RuntimeError("LLM HTTP 502 empty choices")
+            elapsed = round(time.monotonic() - started_at, 2)
+            err = body.get("error") if isinstance(body.get("error"), dict) else {}
+            if err:
+                raise RuntimeError(
+                    f"LLM HTTP 502 upstream error {err.get('code', '')}: {err.get('message', '')}; elapsed={elapsed}s"
+                )
+            raise RuntimeError(f"LLM HTTP 502 empty choices in response; elapsed={elapsed}s")
+
         choice = choices[0] if isinstance(choices[0], dict) else {}
         message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
         calls = message.get("tool_calls") or []
         if not calls:
-            raise RuntimeError("Model returned no tool call")
+            diagnostic = {
+                "request_id": body.get("id"),
+                "finish_reason": choice.get("finish_reason"),
+                "content_chars": len(message.get("content") or ""),
+                "reasoning_chars": len(message.get("reasoning_content") or ""),
+                "request_chars": len(prompt),
+                "usage": body.get("usage"),
+                "elapsed_seconds": round(time.monotonic() - started_at, 2),
+            }
+            raise RuntimeError(f"Model returned no tool call: {json.dumps(diagnostic, ensure_ascii=False)}")
+
         arguments: Dict[str, Any] = {}
+        json_repaired = False
         for call in calls:
             fn_obj = call.get("function") if isinstance(call, dict) else None
             if not isinstance(fn_obj, dict) or fn_obj.get("name") != tool_name:
                 raise RuntimeError("Model returned an unexpected tool")
             raw_arguments = fn_obj.get("arguments")
-            current = (
-                raw_arguments
-                if isinstance(raw_arguments, dict)
-                else repair_json(str(raw_arguments or "{}"), return_objects=True)
-            )
+            if isinstance(raw_arguments, dict):
+                current = raw_arguments
+            elif isinstance(raw_arguments, str):
+                try:
+                    current = json.loads(raw_arguments)
+                except json.JSONDecodeError:
+                    current = repair_json(raw_arguments, return_objects=True)
+                    json_repaired = True
+            else:
+                raise ValueError(f"工具 {tool_name} 返回的参数不是有效 JSON 字符串或对象")
             if not isinstance(current, dict):
-                raise ValueError(f"工具 {tool_name} 参数无法解析为 JSON 对象")
-            arguments.update(current)
+                raise ValueError(f"工具 {tool_name} 返回的参数无法解析为 JSON 对象")
+            for key, value in current.items():
+                if isinstance(value, list):
+                    arguments.setdefault(key, []).extend(value)
+                else:
+                    arguments[key] = value
+
         trace = {
             "provider": self.settings.llm_provider,
             "model": self.settings.llm_model,
             "tool_name": tool_name,
             "elapsed_seconds": round(time.monotonic() - started_at, 2),
             "usage": body.get("usage"),
+            "json_repaired": json_repaired,
             "arguments": arguments,
         }
         return arguments, trace

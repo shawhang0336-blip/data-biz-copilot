@@ -7,18 +7,26 @@
 """
 
 from datetime import datetime
+import json
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 from sqlalchemy.orm import Session
 
-from app.copilot.business_tools import execute_business_tool
+from app.catalog.views import list_capabilities
+from app.copilot.business_tools import BUSINESS_TOOL_SCHEMAS, execute_business_tool
 from app.copilot.disclosure import build_disclosure
-from app.infra.config import Settings, get_effective_settings, get_settings
+from app.infra.config import Settings, get_budget, get_effective_settings, get_settings
 from app.infra.db_tables import CopilotMessageModel, CopilotSessionModel
-from app.infra.llm import RealDesignLlm, call_llm_validated
+from app.infra.errors import WorkflowError
+from app.infra.llm import (
+    RealDesignLlm,
+    call_llm_validated,
+    configure_llm_concurrency,
+    llm_execution_scope,
+)
 from app.kernel.event_log import _SessionRLock, bind_session_lock
-from app.policy.dc_bus import default_bus, detect_technical_jargon, sanitize_business_text
+from app.policy.dc_bus import build_run_bus, default_bus, detect_technical_jargon, sanitize_business_text
 
 _SESSION_LOCKS: Dict[str, _SessionRLock] = {}
 
@@ -238,6 +246,113 @@ def _collect_disclosures_and_citations(
     return disclosures, citations
 
 
+def _resolve_llm_model_name(active_llm: Any, settings: Settings) -> str:
+    if active_llm is None:
+        return "scripted"
+    nested = getattr(active_llm, "settings", None)
+    return str(
+        getattr(active_llm, "model", None)
+        or getattr(nested, "llm_model", None)
+        or settings.llm_model
+        or "configured"
+    )
+
+
+def _normalize_planned_tool_args(tool_name: str, raw_args: Any, clean_query: str, role_lens: str) -> Dict[str, Any]:
+    args = raw_args if isinstance(raw_args, dict) else {}
+    fallback_text = sanitize_business_text(
+        str(
+            args.get("topic")
+            or args.get("metric")
+            or args.get("concept")
+            or args.get("query")
+            or args.get("keyword")
+            or args.get("domain")
+            or clean_query
+        )
+    ) or clean_query
+    if tool_name in {"list_covered_businesses", "check_regulatory_coverage_gap"}:
+        return {}
+    if tool_name == "get_business_scope_and_rules":
+        return {"topic": sanitize_business_text(str(args.get("topic") or fallback_text)) or clean_query}
+    if tool_name == "get_business_caliber_detail":
+        return {"metric": sanitize_business_text(str(args.get("metric") or fallback_text)) or clean_query}
+    if tool_name == "resolve_business_concept":
+        return {"concept": sanitize_business_text(str(args.get("concept") or fallback_text)) or clean_query}
+    if tool_name == "find_rules_by_business_role":
+        return {"role": sanitize_business_text(str(args.get("role") or role_lens)) or role_lens}
+    return {}
+
+
+def _plan_tools_with_llm(
+    session: Session,
+    *,
+    clean_query: str,
+    role_lens: str,
+    recent_history: List[Dict[str, str]],
+    active_llm: Any,
+    bus: Any,
+) -> Tuple[List[Tuple[str, Dict[str, Any]]], bool]:
+    capabilities = list_capabilities(session)
+    domain_catalog = [
+        {
+            "name": c["name"],
+            "coverage_status": c["coverage_status"],
+            "rule_count": c["rule_count"],
+            "caliber_count": c["caliber_count"],
+        }
+        for c in capabilities[:20]
+    ]
+    tool_catalog = [
+        dict(t)
+        for t in BUSINESS_TOOL_SCHEMAS
+        if t.get("name") != "verify_implementation_backing"
+    ]
+    try:
+        planned_args, _trace = call_llm_validated(
+            active_llm,
+            "plan_copilot_tools",
+            (
+                "根据业务人员的当前问题、上下文对话与已收录业务域目录，自主规划 1 至 4 步最合适的纯业务查询工具组合。"
+                "参数必须严格匹配参数名：get_business_scope_and_rules 用 topic；get_business_caliber_detail 用 metric；"
+                "resolve_business_concept 用 concept；find_rules_by_business_role 用 role；其余无参数传 {}。"
+                "严禁出现任何物理表名、字段名、代码或 SQL 关键词。"
+            ),
+            {
+                "question": clean_query,
+                "role_lens": role_lens,
+                "recent_history": recent_history,
+                "available_businesses": domain_catalog,
+                "available_tools": tool_catalog,
+            },
+            backoff=(0.05, 0.1),
+            bus=bus,
+            validation_attempts=2,
+        )
+    except WorkflowError:
+        return [], False
+
+    raw_calls = planned_args.get("tool_calls") or []
+    allowed_tools = {t["name"] for t in tool_catalog}
+    plan: List[Tuple[str, Dict[str, Any]]] = []
+    seen = set()
+    for item in raw_calls:
+        if not isinstance(item, dict):
+            continue
+        tname = str(item.get("tool") or "").strip()
+        if tname not in allowed_tools:
+            continue
+        norm_args = _normalize_planned_tool_args(tname, item.get("args"), clean_query, role_lens)
+        sig = (tname, json.dumps(norm_args, sort_keys=True, ensure_ascii=False))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        plan.append((tname, norm_args))
+        if len(plan) >= 4:
+            break
+    return plan, bool(plan)
+
+
 def ask_business_copilot(
     session: Session,
     query: str,
@@ -278,16 +393,40 @@ def ask_business_copilot(
     session.add(user_msg)
     session.flush()
 
-    route_plan = _route_tools_for_query(clean_query, role_lens)
+    recent_rows = (
+        session.query(CopilotMessageModel)
+        .filter(CopilotMessageModel.session_id == sid, CopilotMessageModel.id != user_msg.id)
+        .order_by(CopilotMessageModel.created_at.desc())
+        .limit(6)
+        .all()
+    )
+    recent_history = [
+        {"role": m.role, "content": m.content[:400]}
+        for m in reversed(recent_rows)
+    ]
+
+    budget = get_budget(session)
+    configure_llm_concurrency(int(budget.get("max_llm_concurrency", 4)))
+    bus = build_run_bus(budget)
+    active_llm = llm
+    if active_llm is None and active_settings.llm_provider != "scripted" and active_settings.llm_api_key:
+        active_llm = RealDesignLlm(active_settings)
+
+    follow_ups: List[str] = [
+        "系统里有哪些客户或账户会被自动剔除不报？",
+        "哪些制度要求是我们当前系统逻辑还没包含的？",
+        "交易后余额和跨境联名账户目前分别按什么口径算？",
+    ]
     tool_outputs: List[Dict[str, Any]] = []
     tool_trace: List[Dict[str, Any]] = []
+    tool_planned_by_ai = False
 
-    for idx, (tool_name, args) in enumerate(route_plan, start=1):
+    def _run_tool_step(tool_name: str, args: Dict[str, Any]) -> None:
         out = execute_business_tool(session, tool_name, args)
         tool_outputs.append(out)
         tool_trace.append(
             {
-                "step": idx,
+                "step": len(tool_trace) + 1,
                 "tool": tool_name,
                 "args": args,
                 "disclose": bool(out.get("disclose")),
@@ -300,72 +439,81 @@ def ask_business_copilot(
             }
         )
 
-    disclosures, citations = _collect_disclosures_and_citations(tool_outputs)
+    with llm_execution_scope(bus=bus):
+        if active_llm is not None:
+            route_plan, tool_planned_by_ai = _plan_tools_with_llm(
+                session,
+                clean_query=clean_query,
+                role_lens=role_lens,
+                recent_history=recent_history,
+                active_llm=active_llm,
+                bus=bus,
+            )
+            if not route_plan:
+                route_plan = _route_tools_for_query(clean_query, role_lens)
+                tool_planned_by_ai = False
+        else:
+            route_plan = _route_tools_for_query(clean_query, role_lens)
 
-    # 再自动调用一次底层实证核验工具，确保所有回答的规则/口径均有清晰支撑定论
-    asset_codes = [c["code"] for c in citations if c["asset_kind"] in {"RULE", "CALIBER"}][:8]
-    backing_verdicts: List[Dict[str, Any]] = []
-    if asset_codes:
-        backing_res = execute_business_tool(session, "verify_implementation_backing", {"asset_codes": asset_codes})
-        backing_verdicts = backing_res.get("verdicts") or []
-        tool_trace.append(
-            {
-                "step": len(tool_trace) + 1,
-                "tool": "verify_implementation_backing",
-                "args": {"asset_count": len(asset_codes)},
-                "disclose": bool(backing_res.get("disclose")),
-                "result_count": len(backing_verdicts),
-            }
-        )
-        if backing_res.get("disclose"):
-            extra_disc = {"kind": backing_res.get("disclose_kind"), "text": backing_res.get("disclose_text")}
-            if not any(d["kind"] == extra_disc["kind"] for d in disclosures):
-                disclosures.append(extra_disc)
+        executed_sigs = set()
+        for tool_name, args in route_plan:
+            sig = (tool_name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+            executed_sigs.add(sig)
+            _run_tool_step(tool_name, args)
 
-    bus = default_bus()
-    active_llm = llm
-    if active_llm is None and active_settings.llm_provider != "scripted" and active_settings.llm_api_key:
-        active_llm = RealDesignLlm(active_settings)
+        disclosures, citations = _collect_disclosures_and_citations(tool_outputs)
 
-    follow_ups: List[str] = [
-        "系统里有哪些客户或账户会被自动剔除不报？",
-        "哪些制度要求是我们当前系统逻辑还没包含的？",
-        "交易后余额和跨境联名账户目前分别按什么口径算？",
-    ]
+        # 若 AI 规划的工具组合未命中任何资产且未覆盖确定性路由，补齐确定性查询以确保完整依据
+        if tool_planned_by_ai and not citations:
+            for tool_name, args in _route_tools_for_query(clean_query, role_lens):
+                sig = (tool_name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+                if sig not in executed_sigs:
+                    executed_sigs.add(sig)
+                    _run_tool_step(tool_name, args)
+            disclosures, citations = _collect_disclosures_and_citations(tool_outputs)
 
-    if active_llm is not None:
-        allowed_codes = [c["code"] for c in citations]
-        recent_rows = (
-            session.query(CopilotMessageModel)
-            .filter(CopilotMessageModel.session_id == sid, CopilotMessageModel.id != user_msg.id)
-            .order_by(CopilotMessageModel.created_at.desc())
-            .limit(6)
-            .all()
-        )
-        recent_history = [
-            {"role": m.role, "content": m.content[:400]}
-            for m in reversed(recent_rows)
-        ]
-        llm_args, _trace = call_llm_validated(
-            active_llm,
-            "compose_business_answer",
-            "结合业务资产与实证校验结论，用通俗纯中文业务语言解释当前系统逻辑是如何处理的以及为什么。严禁出现任何代码、SQL、物理表名或字段名。",
-            {
-                "question": clean_query,
-                "role_lens": role_lens,
-                "recent_history": recent_history,
-                "tool_outputs": tool_outputs,
-                "backing_verdicts": backing_verdicts,
-                "disclosures": disclosures,
-                "allowed_asset_codes": allowed_codes,
-            },
-            backoff=(0.1, 0.2),
-            bus=bus,
-        )
-        raw_answer = str(llm_args.get("answer") or "")
-        follow_ups = llm_args.get("follow_up_questions") or follow_ups
-    else:
-        raw_answer = _deterministic_business_narrative(clean_query, tool_outputs, backing_verdicts)
+        # 再自动调用一次底层实证核验工具，确保所有回答的规则/口径均有清晰支撑定论
+        asset_codes = [c["code"] for c in citations if c["asset_kind"] in {"RULE", "CALIBER"}][:8]
+        backing_verdicts: List[Dict[str, Any]] = []
+        if asset_codes:
+            backing_res = execute_business_tool(session, "verify_implementation_backing", {"asset_codes": asset_codes})
+            backing_verdicts = backing_res.get("verdicts") or []
+            tool_trace.append(
+                {
+                    "step": len(tool_trace) + 1,
+                    "tool": "verify_implementation_backing",
+                    "args": {"asset_count": len(asset_codes)},
+                    "disclose": bool(backing_res.get("disclose")),
+                    "result_count": len(backing_verdicts),
+                }
+            )
+            if backing_res.get("disclose"):
+                extra_disc = {"kind": backing_res.get("disclose_kind"), "text": backing_res.get("disclose_text")}
+                if not any(d["kind"] == extra_disc["kind"] for d in disclosures):
+                    disclosures.append(extra_disc)
+
+        if active_llm is not None:
+            allowed_codes = [c["code"] for c in citations]
+            llm_args, _trace = call_llm_validated(
+                active_llm,
+                "compose_business_answer",
+                "结合业务资产与实证校验结论，用通俗纯中文业务语言解释当前系统逻辑是如何处理的以及为什么。严禁出现任何代码、SQL、物理表名或字段名。",
+                {
+                    "question": clean_query,
+                    "role_lens": role_lens,
+                    "recent_history": recent_history,
+                    "tool_outputs": tool_outputs,
+                    "backing_verdicts": backing_verdicts,
+                    "disclosures": disclosures,
+                    "allowed_asset_codes": allowed_codes,
+                },
+                backoff=(0.1, 0.2),
+                bus=bus,
+            )
+            raw_answer = str(llm_args.get("answer") or "")
+            follow_ups = llm_args.get("follow_up_questions") or follow_ups
+        else:
+            raw_answer = _deterministic_business_narrative(clean_query, tool_outputs, backing_verdicts)
 
     # 强制去技术化二次检查（防任何漏网代码词）
     jargon_hits = detect_technical_jargon(raw_answer)
@@ -388,6 +536,9 @@ def ask_business_copilot(
         "disclosures_count": len(disclosures),
         "cited_asset_count": len(citations),
         "backing_checked": len(backing_verdicts),
+        "ai_powered": active_llm is not None,
+        "tool_planned_by_ai": tool_planned_by_ai,
+        "llm_model": _resolve_llm_model_name(active_llm, active_settings),
     }
 
     assistant_msg = CopilotMessageModel(
