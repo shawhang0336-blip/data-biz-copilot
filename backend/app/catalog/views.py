@@ -18,6 +18,13 @@ from app.infra.db_tables import (
     SourceMaterialModel,
 )
 from app.infra.retrieval import infer_regulatory_regime
+from app.infra.taxonomy import (
+    FINANCIAL_SUBJECT_THEMES,
+    infer_financial_theme,
+    infer_sub_domain,
+    normalize_financial_theme,
+    summarize_subject_theme_matrix,
+)
 
 
 def _compute_capability_regimes(
@@ -57,11 +64,28 @@ def _rule_to_dict(
     capability_name: str = "",
     regime: str = "通用监管",
 ) -> Dict[str, Any]:
+    sub_domain = (getattr(row, "sub_domain", None) or "").strip() or infer_sub_domain(
+        capability_name,
+        row.title,
+        row.business_condition,
+        row.business_action,
+        rule_category=row.rule_category,
+    )
+    raw_theme = getattr(row, "subject_theme", None) or ""
+    subject_theme = normalize_financial_theme(raw_theme) or infer_financial_theme(
+        row.title,
+        row.business_condition,
+        row.business_action,
+        capability_name,
+        row.rule_category,
+    )
     return {
         "id": row.id,
         "capability_id": row.capability_id,
         "capability_name": capability_name,
         "regime": regime,
+        "sub_domain": sub_domain,
+        "subject_theme": subject_theme,
         "code": row.code,
         "title": row.title,
         "rule_category": row.rule_category,
@@ -84,11 +108,28 @@ def _caliber_to_dict(
     capability_name: str = "",
     regime: str = "通用监管",
 ) -> Dict[str, Any]:
+    sub_domain = (getattr(row, "sub_domain", None) or "").strip() or infer_sub_domain(
+        capability_name,
+        row.metric_name,
+        row.business_definition,
+        row.formula_summary,
+        rule_category="CALIBER",
+    )
+    raw_theme = getattr(row, "subject_theme", None) or ""
+    subject_theme = normalize_financial_theme(raw_theme) or infer_financial_theme(
+        row.metric_name,
+        row.business_definition,
+        row.formula_summary,
+        capability_name,
+        "CALIBER",
+    )
     return {
         "id": row.id,
         "capability_id": row.capability_id,
         "capability_name": capability_name,
         "regime": regime,
+        "sub_domain": sub_domain,
+        "subject_theme": subject_theme,
         "code": row.code,
         "metric_name": row.metric_name,
         "business_definition": row.business_definition,
@@ -171,28 +212,75 @@ def list_capabilities(session: Session) -> List[Dict[str, Any]]:
     rows = session.query(BusinessCapabilityModel).order_by(BusinessCapabilityModel.name.asc()).all()
     lineage = _compute_business_lineage(session)
     regimes = _compute_capability_regimes(session, rows)
-    return [
-        {
-            "id": r.id,
-            "code": r.code,
-            "name": r.name,
-            "regime": regimes.get(r.id, "通用监管"),
-            "description": r.description,
-            "scope_summary": r.scope_summary,
-            "audience": r.audience,
-            "coverage_status": r.coverage_status,
-            "rule_count": r.rule_count,
-            "caliber_count": r.caliber_count,
-            "confirmed_count": r.confirmed_count,
-            "logic_backing_count": len(r.evidence_ids_json or []),
-            "clause_backing_count": len(r.clause_ids_json or []),
-            "upstream_businesses": lineage["upstream"].get(r.name, []),
-            "downstream_businesses": lineage["downstream"].get(r.name, []),
-            "status": r.status,
-            "current_version": r.current_version,
-        }
-        for r in rows
-    ]
+    cap_names = {r.id: r.name for r in rows}
+
+    sub_stats: Dict[str, Dict[str, Dict[str, int]]] = {}
+    theme_counts: Dict[str, Dict[str, int]] = {}
+    for rule in session.query(BusinessRuleAssetModel).all():
+        cname = cap_names.get(rule.capability_id, "")
+        sd = (getattr(rule, "sub_domain", None) or "").strip() or infer_sub_domain(
+            cname, rule.title, rule.business_condition, rule.business_action, rule_category=rule.rule_category
+        )
+        th = normalize_financial_theme(getattr(rule, "subject_theme", None) or "") or infer_financial_theme(
+            rule.title, rule.business_condition, rule.business_action, cname, rule.rule_category
+        )
+        sub_entry = sub_stats.setdefault(rule.capability_id, {}).setdefault(sd, {"rule_count": 0, "caliber_count": 0})
+        sub_entry["rule_count"] += 1
+        th_map = theme_counts.setdefault(rule.capability_id, {})
+        th_map[th] = th_map.get(th, 0) + 1
+
+    for cal in session.query(BusinessCaliberAssetModel).all():
+        cname = cap_names.get(cal.capability_id, "")
+        sd = (getattr(cal, "sub_domain", None) or "").strip() or infer_sub_domain(
+            cname, cal.metric_name, cal.business_definition, cal.formula_summary, rule_category="CALIBER"
+        )
+        th = normalize_financial_theme(getattr(cal, "subject_theme", None) or "") or infer_financial_theme(
+            cal.metric_name, cal.business_definition, cal.formula_summary, cname, "CALIBER"
+        )
+        sub_entry = sub_stats.setdefault(cal.capability_id, {}).setdefault(sd, {"rule_count": 0, "caliber_count": 0})
+        sub_entry["caliber_count"] += 1
+        th_map = theme_counts.setdefault(cal.capability_id, {})
+        th_map[th] = th_map.get(th, 0) + 1
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        s_map = sub_stats.get(r.id, {})
+        sorted_subs = [
+            {"name": name, "rule_count": cnts["rule_count"], "caliber_count": cnts["caliber_count"]}
+            for name, cnts in sorted(
+                s_map.items(),
+                key=lambda kv: (kv[1]["rule_count"] + kv[1]["caliber_count"], kv[0]),
+                reverse=True,
+            )
+        ]
+        t_map = theme_counts.get(r.id, {})
+        sorted_themes = [
+            t for t, _ in sorted(t_map.items(), key=lambda kv: kv[1], reverse=True)
+        ]
+        out.append(
+            {
+                "id": r.id,
+                "code": r.code,
+                "name": r.name,
+                "regime": regimes.get(r.id, "通用监管"),
+                "sub_domains": sorted_subs,
+                "subject_themes": sorted_themes,
+                "description": r.description,
+                "scope_summary": r.scope_summary,
+                "audience": r.audience,
+                "coverage_status": r.coverage_status,
+                "rule_count": r.rule_count,
+                "caliber_count": r.caliber_count,
+                "confirmed_count": r.confirmed_count,
+                "logic_backing_count": len(r.evidence_ids_json or []),
+                "clause_backing_count": len(r.clause_ids_json or []),
+                "upstream_businesses": lineage["upstream"].get(r.name, []),
+                "downstream_businesses": lineage["downstream"].get(r.name, []),
+                "status": r.status,
+                "current_version": r.current_version,
+            }
+        )
+    return out
 
 
 def list_business_rules(
@@ -201,6 +289,9 @@ def list_business_rules(
     capability_id: Optional[str] = None,
     rule_category: Optional[str] = None,
     reconcile_status: Optional[str] = None,
+    regime: Optional[str] = None,
+    sub_domain: Optional[str] = None,
+    subject_theme: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     cap_rows = session.query(BusinessCapabilityModel).all()
     caps = {c.id: c.name for c in cap_rows}
@@ -213,7 +304,16 @@ def list_business_rules(
     if reconcile_status:
         q = q.filter(BusinessRuleAssetModel.reconcile_status == reconcile_status)
     rows = q.order_by(BusinessRuleAssetModel.code.asc()).all()
-    return [_rule_to_dict(r, caps.get(r.capability_id, ""), regimes.get(r.capability_id, "通用监管")) for r in rows]
+    items = [_rule_to_dict(r, caps.get(r.capability_id, ""), regimes.get(r.capability_id, "通用监管")) for r in rows]
+    norm_theme = normalize_financial_theme(subject_theme or "") if subject_theme else ""
+    if regime:
+        items = [x for x in items if x["regime"] == regime]
+    if sub_domain:
+        items = [x for x in items if x["sub_domain"] == sub_domain]
+    if subject_theme:
+        target_theme = norm_theme or subject_theme
+        items = [x for x in items if x["subject_theme"] == target_theme]
+    return items
 
 
 def list_business_calibers(
@@ -221,6 +321,9 @@ def list_business_calibers(
     *,
     capability_id: Optional[str] = None,
     reconcile_status: Optional[str] = None,
+    regime: Optional[str] = None,
+    sub_domain: Optional[str] = None,
+    subject_theme: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     cap_rows = session.query(BusinessCapabilityModel).all()
     caps = {c.id: c.name for c in cap_rows}
@@ -231,7 +334,16 @@ def list_business_calibers(
     if reconcile_status:
         q = q.filter(BusinessCaliberAssetModel.reconcile_status == reconcile_status)
     rows = q.order_by(BusinessCaliberAssetModel.code.asc()).all()
-    return [_caliber_to_dict(r, caps.get(r.capability_id, ""), regimes.get(r.capability_id, "通用监管")) for r in rows]
+    items = [_caliber_to_dict(r, caps.get(r.capability_id, ""), regimes.get(r.capability_id, "通用监管")) for r in rows]
+    norm_theme = normalize_financial_theme(subject_theme or "") if subject_theme else ""
+    if regime:
+        items = [x for x in items if x["regime"] == regime]
+    if sub_domain:
+        items = [x for x in items if x["sub_domain"] == sub_domain]
+    if subject_theme:
+        target_theme = norm_theme or subject_theme
+        items = [x for x in items if x["subject_theme"] == target_theme]
+    return items
 
 
 def list_reconcile_ledger(session: Session) -> Dict[str, Any]:
@@ -251,6 +363,8 @@ def list_reconcile_ledger(session: Session) -> Dict[str, Any]:
                 "name": c["metric_name"],
                 "capability_name": c["capability_name"],
                 "regime": c.get("regime", "通用监管"),
+                "sub_domain": c.get("sub_domain", ""),
+                "subject_theme": c.get("subject_theme", ""),
                 "reconcile_status": c["reconcile_status"],
                 "status": c["status"],
                 "summary": c["conflict_notes"] or c["formula_summary"],
@@ -267,6 +381,8 @@ def list_reconcile_ledger(session: Session) -> Dict[str, Any]:
                 "name": r["title"],
                 "capability_name": r["capability_name"],
                 "regime": r.get("regime", "通用监管"),
+                "sub_domain": r.get("sub_domain", ""),
+                "subject_theme": r.get("subject_theme", ""),
                 "reconcile_status": r["reconcile_status"],
                 "status": r["status"],
                 "summary": r["business_action"],
@@ -284,12 +400,34 @@ def get_asset_panorama(session: Session) -> Dict[str, Any]:
     calibers = list_business_calibers(session)
     ledger = list_reconcile_ledger(session)
     materials = list_source_materials(session)
+
+    regime_stats: Dict[str, Dict[str, int]] = {}
+    for c in capabilities:
+        reg = c.get("regime") or "通用监管"
+        entry = regime_stats.setdefault(
+            reg, {"regime": reg, "capability_count": 0, "covered_capabilities": 0, "rule_count": 0, "caliber_count": 0}
+        )
+        entry["capability_count"] += 1
+        if c["coverage_status"] in {"COVERED", "PARTIAL"}:
+            entry["covered_capabilities"] += 1
+        entry["rule_count"] += int(c.get("rule_count") or 0)
+        entry["caliber_count"] += int(c.get("caliber_count") or 0)
+
     return {
         "materials": materials,
         "capabilities": capabilities,
         "rules": rules,
         "calibers": calibers,
         "reconcile": ledger,
+        "taxonomy": {
+            "regimes": sorted(
+                regime_stats.values(),
+                key=lambda x: (x["rule_count"] + x["caliber_count"], x["capability_count"]),
+                reverse=True,
+            ),
+            "subject_themes": summarize_subject_theme_matrix(rules, calibers),
+            "financial_subject_themes": list(FINANCIAL_SUBJECT_THEMES),
+        },
         "stats": {
             "capability_count": len(capabilities),
             "covered_capabilities": sum(1 for c in capabilities if c["coverage_status"] == "COVERED"),

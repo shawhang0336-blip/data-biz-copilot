@@ -142,6 +142,8 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
                         "code": {"type": "string"},
                         "title": {"type": "string"},
                         "rule_category": {"type": "string", "enum": ["INCLUSION", "EXCLUSION", "BRANCH", "DEDUP"]},
+                        "sub_domain": {"type": "string"},
+                        "subject_theme": {"type": "string"},
                         "business_condition": {"type": "string"},
                         "business_action": {"type": "string"},
                         "business_rationale": {"type": "string"},
@@ -164,6 +166,8 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
                     "properties": {
                         "code": {"type": "string"},
                         "metric_name": {"type": "string"},
+                        "sub_domain": {"type": "string"},
+                        "subject_theme": {"type": "string"},
                         "business_definition": {"type": "string"},
                         "formula_summary": {"type": "string"},
                         "distinction_notes": {"type": "string"},

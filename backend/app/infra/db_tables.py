@@ -159,6 +159,8 @@ class BusinessRuleAssetModel(Base):
     capability_id: Mapped[str] = mapped_column(ForeignKey("business_capabilities.id"), index=True)
     code: Mapped[str] = mapped_column(String(96), unique=True, index=True)
     title: Mapped[str] = mapped_column(String(255))
+    sub_domain: Mapped[str] = mapped_column(String(128), index=True, default="")
+    subject_theme: Mapped[str] = mapped_column(String(64), index=True, default="")
     # INCLUSION | EXCLUSION | BRANCH | DEDUP
     rule_category: Mapped[str] = mapped_column(String(24), index=True)
     business_condition: Mapped[str] = mapped_column(_LONG_TEXT, default="")
@@ -185,6 +187,8 @@ class BusinessCaliberAssetModel(Base):
     capability_id: Mapped[str] = mapped_column(ForeignKey("business_capabilities.id"), index=True)
     code: Mapped[str] = mapped_column(String(96), unique=True, index=True)
     metric_name: Mapped[str] = mapped_column(String(255), index=True)
+    sub_domain: Mapped[str] = mapped_column(String(128), index=True, default="")
+    subject_theme: Mapped[str] = mapped_column(String(64), index=True, default="")
     business_definition: Mapped[str] = mapped_column(_LONG_TEXT, default="")
     formula_summary: Mapped[str] = mapped_column(_LONG_TEXT, default="")
     inclusion_scope: Mapped[str] = mapped_column(_LONG_TEXT, default="")

@@ -7,6 +7,8 @@ import {
 } from '../../api/catalog.js'
 import {
   COVERAGE_LABELS,
+  FINANCIAL_SUBJECT_THEMES,
+  FINANCIAL_SUBJECT_THEME_DESCRIPTIONS,
   RECONCILE_LABELS,
   RULE_CATEGORY_LABELS,
   STATUS_LABELS,
@@ -16,8 +18,12 @@ import {
 export default function AssetsPage() {
   const [data, setData] = useState(null)
   const [tab, setTab] = useState('capabilities')
+  const [capViewMode, setCapViewMode] = useState('vertical')
   const [search, setSearch] = useState('')
+  const [regimeFilter, setRegimeFilter] = useState('')
   const [capFilter, setCapFilter] = useState('')
+  const [subDomainFilter, setSubDomainFilter] = useState('')
+  const [themeFilter, setThemeFilter] = useState('')
   const [catFilter, setCatFilter] = useState('')
   const [recFilter, setRecFilter] = useState('')
   const [editing, setEditing] = useState(null)
@@ -72,56 +78,109 @@ export default function AssetsPage() {
 
   const capabilities = data?.capabilities || []
   const capabilityNames = useMemo(() => capabilities.map((c) => c.name), [capabilities])
+  const regimeOptions = useMemo(() => {
+    const regs = (data?.taxonomy?.regimes || []).map((x) => x.regime)
+    if (regs.length > 0) return regs
+    return Array.from(new Set(capabilities.map((c) => c.regime).filter(Boolean)))
+  }, [data, capabilities])
+
+  const subDomainOptions = useMemo(() => {
+    if (capFilter) {
+      const capObj = capabilities.find((c) => c.name === capFilter)
+      if (capObj?.sub_domains?.length) {
+        return capObj.sub_domains.map((s) => s.name)
+      }
+    }
+    const items = [...(data?.rules || []), ...(data?.calibers || [])]
+    return Array.from(new Set(items.map((x) => x.sub_domain).filter(Boolean)))
+  }, [data, capabilities, capFilter])
+
+  const themeMatrix = useMemo(() => {
+    if (data?.taxonomy?.subject_themes?.length) return data.taxonomy.subject_themes
+    return FINANCIAL_SUBJECT_THEMES.map((theme) => ({
+      theme,
+      rule_count: 0,
+      caliber_count: 0,
+      total_assets: 0,
+      capability_count: 0,
+      capabilities: [],
+    }))
+  }, [data])
+
+  const visibleCapabilities = useMemo(() => {
+    if (!regimeFilter) return capabilities
+    return capabilities.filter((c) => c.regime === regimeFilter)
+  }, [capabilities, regimeFilter])
+
   const qLower = search.trim().toLowerCase()
 
   const filteredRules = useMemo(() => {
     return (data?.rules || []).filter((r) => {
+      if (regimeFilter && r.regime !== regimeFilter) return false
       if (capFilter && r.capability_name !== capFilter) return false
+      if (subDomainFilter && r.sub_domain !== subDomainFilter) return false
+      if (themeFilter && r.subject_theme !== themeFilter) return false
       if (catFilter && r.rule_category !== catFilter) return false
       if (recFilter && r.reconcile_status !== recFilter) return false
       if (qLower) {
-        const hay = `${r.title} ${r.capability_name} ${r.business_condition} ${r.business_action} ${r.business_rationale}`.toLowerCase()
+        const hay = `${r.title} ${r.capability_name} ${r.regime || ''} ${r.sub_domain || ''} ${r.subject_theme || ''} ${r.business_condition} ${r.business_action} ${r.business_rationale}`.toLowerCase()
         if (!hay.includes(qLower)) return false
       }
       return true
     })
-  }, [data, capFilter, catFilter, recFilter, qLower])
+  }, [data, regimeFilter, capFilter, subDomainFilter, themeFilter, catFilter, recFilter, qLower])
 
   const filteredCalibers = useMemo(() => {
     return (data?.calibers || []).filter((c) => {
+      if (regimeFilter && c.regime !== regimeFilter) return false
       if (capFilter && c.capability_name !== capFilter) return false
+      if (subDomainFilter && c.sub_domain !== subDomainFilter) return false
+      if (themeFilter && c.subject_theme !== themeFilter) return false
       if (recFilter && c.reconcile_status !== recFilter) return false
       if (qLower) {
-        const hay = `${c.metric_name} ${c.capability_name} ${c.business_definition} ${c.formula_summary} ${c.conflict_notes}`.toLowerCase()
+        const hay = `${c.metric_name} ${c.capability_name} ${c.regime || ''} ${c.sub_domain || ''} ${c.subject_theme || ''} ${c.business_definition} ${c.formula_summary} ${c.conflict_notes}`.toLowerCase()
         if (!hay.includes(qLower)) return false
       }
       return true
     })
-  }, [data, capFilter, recFilter, qLower])
+  }, [data, regimeFilter, capFilter, subDomainFilter, themeFilter, recFilter, qLower])
 
   const filteredReconcile = useMemo(() => {
     return (data?.reconcile?.items || []).filter((item) => {
+      if (regimeFilter && item.regime !== regimeFilter) return false
       if (capFilter && item.capability_name !== capFilter) return false
+      if (subDomainFilter && item.sub_domain !== subDomainFilter) return false
+      if (themeFilter && item.subject_theme !== themeFilter) return false
       if (recFilter && item.reconcile_status !== recFilter) return false
       if (qLower) {
-        const hay = `${item.name} ${item.capability_name} ${item.summary}`.toLowerCase()
+        const hay = `${item.name} ${item.capability_name} ${item.regime || ''} ${item.sub_domain || ''} ${item.subject_theme || ''} ${item.summary}`.toLowerCase()
         if (!hay.includes(qLower)) return false
       }
       return true
     })
-  }, [data, capFilter, recFilter, qLower])
+  }, [data, regimeFilter, capFilter, subDomainFilter, themeFilter, recFilter, qLower])
 
   const stats = data?.stats || {}
+  const hasAnyFilter = Boolean(search || regimeFilter || capFilter || subDomainFilter || themeFilter || catFilter || recFilter)
+  const clearAllFilters = () => {
+    setSearch('')
+    setRegimeFilter('')
+    setCapFilter('')
+    setSubDomainFilter('')
+    setThemeFilter('')
+    setCatFilter('')
+    setRecFilter('')
+  }
 
   return (
     <div>
       <div className="card">
-        <h2>第二步：业务逻辑全景与业务解释中心</h2>
+        <h2>第二步：业务逻辑全景与双维业务解释中心</h2>
         <p style={{ color: '#475569', fontSize: 13, marginTop: 4 }}>
-          直观了解“当前系统逻辑实际包含了哪些业务、底层条件是怎么跑的、以及每条逻辑对应的业务含义解释与制度对照”。
+          纵轴按「监管体系 → 一级业务域 → 二级子专题」逐层钻取对账，横轴按「金融十大主题」跨报表拉通查看同一业务对象的口径规范。
         </p>
         <div className="grid-4" style={{ marginTop: 12 }}>
-          <div className="card" style={{ marginBottom: 0 }}><strong>{stats.capability_count || 0}</strong><div>已识别业务板块</div></div>
+          <div className="card" style={{ marginBottom: 0 }}><strong>{stats.capability_count || 0}</strong><div>已识别一级业务域</div></div>
           <div className="card" style={{ marginBottom: 0 }}><strong>{stats.covered_capabilities || 0}</strong><div>系统逻辑已涵盖板块</div></div>
           <div className="card" style={{ marginBottom: 0 }}><strong>{stats.rule_count || 0}</strong><div>纳入 / 剔除 / 分支规则</div></div>
           <div className="card" style={{ marginBottom: 0 }}><strong>{stats.caliber_count || 0}</strong><div>业务指标口径卡</div></div>
@@ -132,7 +191,7 @@ export default function AssetsPage() {
 
       <div className="tabs">
         <button className={`tab-btn ${tab === 'capabilities' ? 'active' : ''}`} onClick={() => setTab('capabilities')}>
-          1. 业务版图（{capabilities.length}）
+          1. 双维业务版图（{capabilities.length}）
         </button>
         <button className={`tab-btn ${tab === 'rules' ? 'active' : ''}`} onClick={() => setTab('rules')}>
           2. 逻辑与业务解释（{filteredRules.length}）
@@ -149,36 +208,58 @@ export default function AssetsPage() {
         <div className="card filter-bar">
           <input
             className="input"
-            placeholder="搜索规则标题、业务关键词或口径解释…"
+            placeholder="搜索规则标题、子专题、主题或口径解释…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            style={{ flex: '2 1 220px' }}
+            style={{ flex: '2 1 200px' }}
           />
-          <select value={capFilter} onChange={(e) => setCapFilter(e.target.value)} style={{ flex: '1 1 200px' }}>
-            <option value="">全部业务板块</option>
+          <select value={regimeFilter} onChange={(e) => setRegimeFilter(e.target.value)} style={{ flex: '1 1 130px' }}>
+            <option value="">全部监管体系</option>
+            {regimeOptions.map((reg) => (
+              <option key={reg} value={reg}>{reg}</option>
+            ))}
+          </select>
+          <select
+            value={capFilter}
+            onChange={(e) => {
+              setCapFilter(e.target.value)
+              setSubDomainFilter('')
+            }}
+            style={{ flex: '1 1 190px' }}
+          >
+            <option value="">全部一级业务域</option>
             {capabilityNames.map((n) => (
               <option key={n} value={n}>{n}</option>
             ))}
           </select>
+          <select value={subDomainFilter} onChange={(e) => setSubDomainFilter(e.target.value)} style={{ flex: '1 1 160px' }}>
+            <option value="">全部二级子专题</option>
+            {subDomainOptions.map((sd) => (
+              <option key={sd} value={sd}>{sd}</option>
+            ))}
+          </select>
+          <select value={themeFilter} onChange={(e) => setThemeFilter(e.target.value)} style={{ flex: '1 1 150px' }}>
+            <option value="">全部金融十大主题</option>
+            {FINANCIAL_SUBJECT_THEMES.map((th) => (
+              <option key={th} value={th}>{th}</option>
+            ))}
+          </select>
           {tab === 'rules' && (
-            <select value={catFilter} onChange={(e) => setCatFilter(e.target.value)} style={{ flex: '1 1 140px' }}>
+            <select value={catFilter} onChange={(e) => setCatFilter(e.target.value)} style={{ flex: '1 1 130px' }}>
               <option value="">全部规则类型</option>
               {Object.entries(RULE_CATEGORY_LABELS).map(([k, v]) => (
                 <option key={k} value={k}>{v}</option>
               ))}
             </select>
           )}
-          <select value={recFilter} onChange={(e) => setRecFilter(e.target.value)} style={{ flex: '1 1 160px' }}>
+          <select value={recFilter} onChange={(e) => setRecFilter(e.target.value)} style={{ flex: '1 1 150px' }}>
             <option value="">全部对照状态</option>
             {Object.entries(RECONCILE_LABELS).map(([k, v]) => (
               <option key={k} value={k}>{v.label}</option>
             ))}
           </select>
-          {(search || capFilter || catFilter || recFilter) && (
-            <button
-              className="btn"
-              onClick={() => { setSearch(''); setCapFilter(''); setCatFilter(''); setRecFilter('') }}
-            >
+          {hasAnyFilter && (
+            <button className="btn" onClick={clearAllFilters}>
               清空筛选
             </button>
           )}
@@ -186,43 +267,173 @@ export default function AssetsPage() {
       )}
 
       {tab === 'capabilities' && (
-        <div className="grid-2">
-          {capabilities.map((c) => {
-            const cov = formatBadge(COVERAGE_LABELS, c.coverage_status)
-            return (
-              <div key={c.id} className="card">
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-                  <h3 style={{ margin: '0 0 6px' }}>{c.name}</h3>
-                  <span className={`badge badge-${cov.tone}`}>{cov.label}</span>
-                </div>
-                <p style={{ fontSize: 14, color: '#334155', margin: '8px 0' }}>{c.description}</p>
-                <p style={{ fontSize: 13, color: '#475569', margin: '6px 0' }}>
-                  <strong>逻辑覆盖与加工要点：</strong>{c.scope_summary}
-                </p>
-                {((c.upstream_businesses || []).length > 0 || (c.downstream_businesses || []).length > 0) && (
-                  <div className="lineage-row">
-                    {(c.upstream_businesses || []).length > 0 && (
-                      <span><strong>上游依赖业务：</strong>{c.upstream_businesses.join('、')}</span>
-                    )}
-                    {(c.downstream_businesses || []).length > 0 && (
-                      <span><strong>流向下游业务：</strong>{c.downstream_businesses.join('、')}</span>
-                    )}
-                  </div>
-                )}
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 12, gap: 8, flexWrap: 'wrap' }}>
-                  <span style={{ fontSize: 12, color: '#64748b' }}>
-                    规则 {c.rule_count} 条 · 口径 {c.caliber_count} 项 · 底层逻辑实证 {c.logic_backing_count} 处 · 面向：{c.audience}
-                  </span>
+        <div>
+          <div className="card" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <button
+                className={`btn ${capViewMode === 'vertical' ? 'btn-primary' : ''}`}
+                onClick={() => setCapViewMode('vertical')}
+              >
+                纵轴视图：体系 → 一级业务域 → 二级子专题
+              </button>
+              <button
+                className={`btn ${capViewMode === 'theme' ? 'btn-primary' : ''}`}
+                onClick={() => setCapViewMode('theme')}
+              >
+                横轴视图：金融十大主题跨表全景
+              </button>
+            </div>
+            {capViewMode === 'vertical' && (
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                <button
+                  className={`pill-chip ${regimeFilter === '' ? 'active' : ''}`}
+                  onClick={() => setRegimeFilter('')}
+                >
+                  全部体系
+                </button>
+                {regimeOptions.map((reg) => (
                   <button
-                    className="btn"
-                    onClick={() => { setCapFilter(c.name); setTab('rules') }}
+                    key={reg}
+                    className={`pill-chip ${regimeFilter === reg ? 'active' : ''}`}
+                    onClick={() => setRegimeFilter(reg)}
                   >
-                    查看该板块规则与业务解释
+                    {reg}
                   </button>
-                </div>
+                ))}
               </div>
-            )
-          })}
+            )}
+          </div>
+
+          {capViewMode === 'vertical' ? (
+            <div className="grid-2">
+              {visibleCapabilities.map((c) => {
+                const cov = formatBadge(COVERAGE_LABELS, c.coverage_status)
+                return (
+                  <div key={c.id} className="card">
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
+                      <div>
+                        <span className="badge badge-blue" style={{ marginBottom: 6, marginRight: 6 }}>{c.regime || '通用监管'}</span>
+                        <h3 style={{ margin: '0 0 6px' }}>{c.name}</h3>
+                      </div>
+                      <span className={`badge badge-${cov.tone}`} style={{ whiteSpace: 'nowrap' }}>{cov.label}</span>
+                    </div>
+                    <p style={{ fontSize: 14, color: '#334155', margin: '8px 0' }}>{c.description}</p>
+                    <p style={{ fontSize: 13, color: '#475569', margin: '6px 0' }}>
+                      <strong>逻辑覆盖与加工要点：</strong>{c.scope_summary}
+                    </p>
+                    {(c.sub_domains || []).length > 0 && (
+                      <div style={{ marginTop: 8 }}>
+                        <div style={{ fontSize: 12, color: '#475569', fontWeight: 600 }}>二级子专题下钻：</div>
+                        <div className="pill-row">
+                          {c.sub_domains.map((sd) => (
+                            <button
+                              key={sd.name}
+                              className="pill-chip"
+                              onClick={() => {
+                                setRegimeFilter('')
+                                setCapFilter(c.name)
+                                setSubDomainFilter(sd.name)
+                                setThemeFilter('')
+                                setTab('rules')
+                              }}
+                            >
+                              {sd.name} ({sd.rule_count + sd.caliber_count})
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {(c.subject_themes || []).length > 0 && (
+                      <div className="pill-row" style={{ marginTop: 8 }}>
+                        {c.subject_themes.map((th) => (
+                          <button
+                            key={th}
+                            className="badge badge-teal"
+                            style={{ border: 'none', cursor: 'pointer' }}
+                            onClick={() => {
+                              setRegimeFilter('')
+                              setCapFilter(c.name)
+                              setSubDomainFilter('')
+                              setThemeFilter(th)
+                              setTab('rules')
+                            }}
+                          >
+                            #{th}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    {((c.upstream_businesses || []).length > 0 || (c.downstream_businesses || []).length > 0) && (
+                      <div className="lineage-row">
+                        {(c.upstream_businesses || []).length > 0 && (
+                          <span><strong>上游依赖业务：</strong>{c.upstream_businesses.join('、')}</span>
+                        )}
+                        {(c.downstream_businesses || []).length > 0 && (
+                          <span><strong>流向下游业务：</strong>{c.downstream_businesses.join('、')}</span>
+                        )}
+                      </div>
+                    )}
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 12, gap: 8, flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: 12, color: '#64748b' }}>
+                        规则 {c.rule_count} 条 · 口径 {c.caliber_count} 项 · 底层逻辑实证 {c.logic_backing_count} 处 · 面向：{c.audience}
+                      </span>
+                      <button
+                        className="btn"
+                        onClick={() => {
+                          setCapFilter(c.name)
+                          setSubDomainFilter('')
+                          setThemeFilter('')
+                          setTab('rules')
+                        }}
+                      >
+                        查看该板块规则与业务解释
+                      </button>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          ) : (
+            <div className="grid-2">
+              {themeMatrix.map((item) => (
+                <div key={item.theme} className="card">
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                    <h3 style={{ margin: 0 }}>{item.theme}</h3>
+                    <span className="badge badge-teal">
+                      规则 {item.rule_count} · 口径 {item.caliber_count} · 跨 {item.capability_count} 域
+                    </span>
+                  </div>
+                  <p style={{ fontSize: 13, color: '#475569', margin: '8px 0' }}>
+                    {FINANCIAL_SUBJECT_THEME_DESCRIPTIONS[item.theme] || ''}
+                  </p>
+                  {(item.capabilities || []).length > 0 ? (
+                    <div className="pill-row">
+                      {item.capabilities.map((capName) => (
+                        <span key={capName} className="badge badge-slate">{capName}</span>
+                      ))}
+                    </div>
+                  ) : (
+                    <p style={{ fontSize: 12, color: '#94a3b8' }}>当前已接入材料暂未沉淀该主题资产</p>
+                  )}
+                  <div style={{ marginTop: 12 }}>
+                    <button
+                      className="btn"
+                      disabled={item.rule_count + item.caliber_count === 0}
+                      onClick={() => {
+                        setRegimeFilter('')
+                        setCapFilter('')
+                        setSubDomainFilter('')
+                        setThemeFilter(item.theme)
+                        setTab('rules')
+                      }}
+                    >
+                      跨报表查看「{item.theme}」全部规则
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -232,10 +443,13 @@ export default function AssetsPage() {
         return (
           <div key={r.id} className="card">
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-              <div>
-                <span className="badge badge-blue" style={{ marginRight: 8 }}>{RULE_CATEGORY_LABELS[r.rule_category] || r.rule_category}</span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                <span className="badge badge-blue">{RULE_CATEGORY_LABELS[r.rule_category] || r.rule_category}</span>
+                {r.regime && <span className="badge badge-slate">{r.regime}</span>}
+                {r.sub_domain && <span className="badge badge-purple">{r.sub_domain}</span>}
+                {r.subject_theme && <span className="badge badge-teal">{r.subject_theme}</span>}
                 <strong>{r.title}</strong>
-                <span style={{ marginLeft: 8, fontSize: 12, color: '#64748b' }}>（{r.capability_name}）</span>
+                <span style={{ fontSize: 12, color: '#64748b' }}>（{r.capability_name}）</span>
               </div>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 <span className={`badge badge-${rec.tone}`}>{rec.label}</span>
@@ -272,9 +486,12 @@ export default function AssetsPage() {
         return (
           <div key={c.id} className="card">
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-              <div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                {c.regime && <span className="badge badge-slate">{c.regime}</span>}
+                {c.sub_domain && <span className="badge badge-purple">{c.sub_domain}</span>}
+                {c.subject_theme && <span className="badge badge-teal">{c.subject_theme}</span>}
                 <strong>{c.metric_name}</strong>
-                <span style={{ marginLeft: 8, fontSize: 12, color: '#64748b' }}>（{c.capability_name}）</span>
+                <span style={{ fontSize: 12, color: '#64748b' }}>（{c.capability_name}）</span>
               </div>
               <div style={{ display: 'flex', gap: 8 }}>
                 <span className={`badge badge-${rec.tone}`}>{rec.label}</span>
@@ -309,7 +526,13 @@ export default function AssetsPage() {
             return (
               <div key={item.code} style={{ padding: '10px 0', borderBottom: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', gap: 12 }}>
                 <div>
-                  <strong>{item.name}</strong> <span style={{ color: '#64748b', fontSize: 12 }}>({item.capability_name})</span>
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                    {item.regime && <span className="badge badge-slate">{item.regime}</span>}
+                    {item.sub_domain && <span className="badge badge-purple">{item.sub_domain}</span>}
+                    {item.subject_theme && <span className="badge badge-teal">{item.subject_theme}</span>}
+                    <strong>{item.name}</strong>
+                    <span style={{ color: '#64748b', fontSize: 12 }}>({item.capability_name})</span>
+                  </div>
                   <div style={{ fontSize: 13, color: '#475569', marginTop: 4 }}>{item.summary}</div>
                 </div>
                 <span className={`badge badge-${rec.tone}`} style={{ alignSelf: 'center', whiteSpace: 'nowrap' }}>{rec.label}</span>

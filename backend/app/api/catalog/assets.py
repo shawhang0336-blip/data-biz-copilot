@@ -54,6 +54,9 @@ def rules(
     capability_id: Optional[str] = None,
     rule_category: Optional[str] = None,
     reconcile_status: Optional[str] = None,
+    regime: Optional[str] = None,
+    sub_domain: Optional[str] = None,
+    subject_theme: Optional[str] = None,
     session: Session = Depends(db_session),
 ) -> List[Dict[str, Any]]:
     return list_business_rules(
@@ -61,6 +64,9 @@ def rules(
         capability_id=capability_id,
         rule_category=rule_category,
         reconcile_status=reconcile_status,
+        regime=regime,
+        sub_domain=sub_domain,
+        subject_theme=subject_theme,
     )
 
 
@@ -104,9 +110,19 @@ def confirm_rule(rule_id: str, req: AssetConfirmRequest, session: Session = Depe
 def calibers(
     capability_id: Optional[str] = None,
     reconcile_status: Optional[str] = None,
+    regime: Optional[str] = None,
+    sub_domain: Optional[str] = None,
+    subject_theme: Optional[str] = None,
     session: Session = Depends(db_session),
 ) -> List[Dict[str, Any]]:
-    return list_business_calibers(session, capability_id=capability_id, reconcile_status=reconcile_status)
+    return list_business_calibers(
+        session,
+        capability_id=capability_id,
+        reconcile_status=reconcile_status,
+        regime=regime,
+        sub_domain=sub_domain,
+        subject_theme=subject_theme,
+    )
 
 
 @router.patch("/calibers/{caliber_id}")

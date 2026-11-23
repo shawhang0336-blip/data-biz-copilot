@@ -772,3 +772,221 @@ def test_single_step_domain_preservation_and_cross_source_domain_alignment(tmp_p
         if r["capability_name"] == "EAST5.0 对公贷款五级分类统计" and r["rule_category"] == "DEDUP"
     ]
     assert len(east_dedups) == 1
+
+
+def test_dual_taxonomy_subdomains_subject_themes_migration_batching_and_cross_report_copilot(tmp_path):
+    """验证金融十大主题 + 二级子专题、旧库幂等加列升级、Stage3 分批全子专题精炼、API 过滤及 Copilot 横切问答。"""
+    import uuid
+    from fastapi.testclient import TestClient
+    from sqlalchemy import create_engine, inspect, text
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    from app.api.common import db_session
+    from app.copilot.business_tools import BUSINESS_TOOL_SCHEMAS
+    from app.infra.db import Base, ensure_schema_columns
+    from app.infra.db_tables import (
+        BusinessCapabilityModel,
+        BusinessRuleAssetModel,
+        LogicEvidenceModel,
+        SourceMaterialModel,
+    )
+    from app.infra.taxonomy import (
+        FINANCIAL_SUBJECT_THEMES,
+        detect_query_financial_themes,
+        infer_financial_theme,
+        infer_sub_domain,
+    )
+    from app.main import create_app
+
+    # 1) Layer 0 taxonomy 纯中文零黑话、覆盖全部 10 大金融主题与多类子专题
+    assert len(FINANCIAL_SUBJECT_THEMES) == 10
+    assert detect_technical_jargon(" ".join(FINANCIAL_SUBJECT_THEMES)) == []
+    assert infer_financial_theme("质押定期存单扣减净额", capability_name="1104 G01 同业存放与拆放核算") == "授信与押品"
+    assert infer_financial_theme("仅纳入审核通过的人工补录记录", capability_name="PLUS 手工补录与人工覆盖规范") == "渠道与媒介"
+    assert "授信与押品" in detect_query_financial_themes("在所有监管报表里，涉及“授信与押品”和“风控与合规管控”主题怎么算？")
+    assert "风控与合规管控" in detect_query_financial_themes("涉及授信与押品或风控与合规管控主题")
+
+    sd_buy = infer_sub_domain("机构大额结售汇及资金来源与使用报送", "购汇资金来源映射", rule_category="INCLUSION")
+    sd_use = infer_sub_domain("机构大额结售汇及资金来源与使用报送", "结汇资金使用去向", rule_category="INCLUSION")
+    sd_g01_net = infer_sub_domain("1104 G01 同业存放与拆放核算", "单笔净额以账面余额扣减质押金额确定", rule_category="INCLUSION")
+    assert sd_buy != sd_use
+    assert sd_g01_net == "质押扣减与净额核算"
+    assert detect_technical_jargon(f"{sd_buy} {sd_use} {sd_g01_net}") == []
+
+    # 2) 验证已有旧表（缺失 sub_domain / subject_theme 列）可被 ensure_schema_columns 幂等无损迁移
+    legacy_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    with legacy_engine.begin() as conn:
+        conn.execute(text("CREATE TABLE business_rule_assets (id VARCHAR(36) PRIMARY KEY, code VARCHAR(96), title VARCHAR(255))"))
+        conn.execute(text("CREATE TABLE business_caliber_assets (id VARCHAR(36) PRIMARY KEY, code VARCHAR(96), metric_name VARCHAR(255))"))
+        conn.execute(text("INSERT INTO business_rule_assets (id, code, title) VALUES ('r1', 'rule-old-1', '旧库保留规则')"))
+    ensure_schema_columns(legacy_engine)
+    ensure_schema_columns(legacy_engine)
+    cols_rule = {c["name"] for c in inspect(legacy_engine).get_columns("business_rule_assets")}
+    cols_cal = {c["name"] for c in inspect(legacy_engine).get_columns("business_caliber_assets")}
+    assert {"sub_domain", "subject_theme"}.issubset(cols_rule)
+    assert {"sub_domain", "subject_theme"}.issubset(cols_cal)
+    with legacy_engine.connect() as conn:
+        assert conn.execute(text("SELECT title FROM business_rule_assets WHERE id = 'r1'")).scalar() == "旧库保留规则"
+
+    # 3) 验证大域（>20 条规则且跨多个二级子专题）触发按子专题分批送入 Stage 3 AI，突破原 18 条截断
+    batch_session = make_session()
+    settings = Settings(blob_dir=str(tmp_path / "blobs"))
+    m_big = SourceMaterialModel(
+        id=str(uuid.uuid4()),
+        title="big_jsh.sql",
+        material_kind="CODE_LOGIC",
+        file_type="sql",
+        sha256="hash-big-jsh",
+        blob_uri="local://big",
+        item_count=1,
+        summary="big",
+    )
+    batch_session.add(m_big)
+    batch_session.flush()
+    preds_buy = [
+        {"rule_code": f"BUY_{i}", "title": f"购汇资金来源校验-{i}", "condition": f"购汇用途分类代码第{i}项有效", "rationale": "核验购汇资金来源。"}
+        for i in range(15)
+    ]
+    preds_use = [
+        {"rule_code": f"USE_{i}", "title": f"结汇资金使用核验-{i}", "condition": f"结汇资金去向分类代码第{i}项合规", "rationale": "核验结汇资金使用。"}
+        for i in range(15)
+    ]
+    preds_opp = [
+        {"rule_code": f"OPP_{i}", "title": f"交易对手总账映射-{i}", "condition": f"交易对手命中内部总账科目第{i}类", "rationale": "核对对手映射。"}
+        for i in range(10)
+    ]
+    batch_session.add(
+        LogicEvidenceModel(
+            id=str(uuid.uuid4()),
+            material_id=m_big.id,
+            logic_fingerprint="fp-big-jsh",
+            business_domain_hint="机构大额结售汇及资金来源与使用报送",
+            target_concept_hint="大额结售汇全流程",
+            source_summary="涵盖购汇资金来源、结汇资金使用与对手映射 40 条规则。",
+            inclusion_predicates_json=preds_buy + preds_use + preds_opp,
+            exclusion_predicates_json=[],
+            branch_cases_json=[],
+            calculation_kind="DIRECT",
+            calculation_summary="按实际申报原值传递。",
+            dedup_grain_hint="",
+            internal_locator_json={"regime": "SAFE"},
+        )
+    )
+    batch_session.flush()
+
+    class _BatchInspectLlm:
+        model = "deepseek-flash"
+
+        def __init__(self) -> None:
+            self.batches = []
+            self.refined_codes = set()
+
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            if tool_name == "synthesize_domain_assets":
+                self.batches.append((payload.get("batch_index"), payload.get("sub_domain_focus"), len(payload.get("draft_rules") or [])))
+                out_rules = []
+                for r in payload.get("draft_rules") or []:
+                    self.refined_codes.add(r["code"])
+                    out_rules.append(
+                        {
+                            "code": r["code"],
+                            "title": r["title"],
+                            "rule_category": r["rule_category"],
+                            "sub_domain": r["sub_domain"],
+                            "subject_theme": r["subject_theme"],
+                            "business_condition": f"【批量精炼】{r['business_condition']}",
+                            "business_action": r["business_action"],
+                            "business_rationale": r["business_rationale"],
+                            "evidence_ids": r.get("evidence_ids") or [],
+                        }
+                    )
+                return {
+                    "description": "完成全子专题融合",
+                    "scope_summary": "涵盖多子专题",
+                    "rules": out_rules,
+                    "calibers": [],
+                }, {"provider": "test", "model": "deepseek-flash"}
+            return {}, {"provider": "test", "model": "deepseek-flash"}
+
+    batch_llm = _BatchInspectLlm()
+    batch_summary = synthesize_business_assets(batch_session, settings=settings, llm=batch_llm)
+    assert batch_summary["rule_count"] == 40
+    assert len(batch_llm.batches) >= 2
+    assert len(batch_llm.refined_codes) == 40
+    refined_rules_db = batch_session.query(BusinessRuleAssetModel).all()
+    assert all(r.business_condition.startswith("【批量精炼】") for r in refined_rules_db)
+    assert len({r.sub_domain for r in refined_rules_db}) == 3
+
+    # 4) 验证四体系 FastAPI 全景 / taxonomy 过滤 + Copilot 横切十大主题检索（保持 7 工具不变）
+    assert len(BUSINESS_TOOL_SCHEMAS) == 7
+    api_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(bind=api_engine)
+    ApiSession = sessionmaker(bind=api_engine, autoflush=False, expire_on_commit=False)
+    s_api = ApiSession()
+    for kind, ftype, title, raw in [
+        (
+            "REGULATORY_DOC",
+            "md",
+            "1104_G01_同业存放规范.md",
+            "# 1104 G01 同业存放与拆放核算\n\n## 同业存放净额计算口径\n按账面余额扣减已质押定期存单后的净额填报，剔除测试户。".encode("utf-8"),
+        ),
+        (
+            "CODE_LOGIC",
+            "sql",
+            "proc_1104_g01.sql",
+            "/* 报表名称: 1104 G01 同业存放与拆放核算 */\nINSERT INTO RPT_1104_G01 SELECT CUST_TYPE, SUM(BOOK_BAL - PLEDGE_AMT) FROM CORE_IB WHERE STATUS <> 'TEST' GROUP BY CUST_TYPE;".encode("utf-8"),
+        ),
+        (
+            "REGULATORY_DOC",
+            "md",
+            "EAST_不良贷款.md",
+            "# EAST5.0 对公贷款五级分类统计\n\n## 不良与核销剔除\n统计次级可疑损失不良贷款，剔除已核销记录。".encode("utf-8"),
+        ),
+        (
+            "CODE_LOGIC",
+            "sql",
+            "proc_east_loan.sql",
+            "/* 业务说明: EAST5.0 对公贷款五级分类统计 */\nINSERT INTO EAST_LOAN SELECT LOAN_ID, SUM(PRINCIPAL_BAL) FROM CORE_LOAN WHERE GRADE_CODE IN ('3','4','5') AND WRITE_OFF_FLAG <> 'Y' GROUP BY LOAN_ID;".encode("utf-8"),
+        ),
+    ]:
+        ingest_material(s_api, title=title, material_kind=kind, file_type=ftype, content=raw, settings=settings)
+    s_api.commit()
+    synthesize_business_assets(s_api, settings=settings)
+    s_api.commit()
+
+    def _override():
+        db = ApiSession()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app = create_app()
+    app.dependency_overrides[db_session] = _override
+    with TestClient(app) as client:
+        p_resp = client.get("/api/assets/panorama")
+        assert p_resp.status_code == 200
+        pano_api = p_resp.json()
+        assert len(pano_api["taxonomy"]["subject_themes"]) == 10
+        assert len(pano_api["taxonomy"]["regimes"]) >= 2
+        assert all(c.get("sub_domains") and c.get("subject_themes") for c in pano_api["capabilities"])
+        assert detect_technical_jargon(json.dumps({
+            "capabilities": pano_api["capabilities"],
+            "rules": pano_api["rules"],
+            "calibers": pano_api["calibers"],
+            "reconcile": pano_api["reconcile"],
+        }, ensure_ascii=False)) == []
+
+        f_resp = client.get("/api/assets/rules", params={"subject_theme": "授信与押品"})
+        assert f_resp.status_code == 200
+        credit_rules = f_resp.json()
+        assert len(credit_rules) >= 1
+        assert all(r["subject_theme"] == "授信与押品" for r in credit_rules)
+
+    cross_res = execute_business_tool(s_api, "get_business_scope_and_rules", {"topic": "在所有监管报表里，涉及「授信与押品」主题的规则有哪些？"})
+    assert cross_res["rules"]
+    assert all(r["subject_theme"] == "授信与押品" for r in cross_res["rules"])
+    cross_qa = ask_business_copilot(s_api, "在所有监管报表里，涉及「授信与押品」主题的剔除与扣减口径有哪些？", settings=settings)
+    assert cross_qa["verification"]["de_jargon_passed"] is True
+    assert cross_qa["verification"]["residual_jargon"] == []

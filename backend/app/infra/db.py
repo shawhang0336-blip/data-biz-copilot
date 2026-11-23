@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Any, Dict
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.infra.config import get_settings
@@ -44,7 +44,39 @@ class Base(DeclarativeBase):
     pass
 
 
+def ensure_schema_columns(bind_engine: Any = None) -> None:
+    """幂等为已有 SQLite / 关系库表补齐双维分类新增列（零破坏旧数据）。"""
+    target_engine = bind_engine or engine
+    insp = inspect(target_engine)
+    existing_tables = set(insp.get_table_names())
+    migrations = (
+        (
+            "business_rule_assets",
+            (
+                ("sub_domain", "VARCHAR(128) DEFAULT ''"),
+                ("subject_theme", "VARCHAR(64) DEFAULT ''"),
+            ),
+        ),
+        (
+            "business_caliber_assets",
+            (
+                ("sub_domain", "VARCHAR(128) DEFAULT ''"),
+                ("subject_theme", "VARCHAR(64) DEFAULT ''"),
+            ),
+        ),
+    )
+    with target_engine.begin() as conn:
+        for table_name, cols in migrations:
+            if table_name not in existing_tables:
+                continue
+            current_cols = {c["name"] for c in insp.get_columns(table_name)}
+            for col_name, col_ddl in cols:
+                if col_name not in current_cols:
+                    conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_ddl}"))
+
+
 def init_db() -> None:
     import app.infra.db_tables  # noqa: F401 - 确保所有 ORM 表已注册至 Base.metadata
 
     Base.metadata.create_all(bind=engine)
+    ensure_schema_columns(engine)

@@ -7,6 +7,9 @@ export const listRules = (params = {}) => {
   if (params.capability_id) qs.set('capability_id', params.capability_id)
   if (params.rule_category) qs.set('rule_category', params.rule_category)
   if (params.reconcile_status) qs.set('reconcile_status', params.reconcile_status)
+  if (params.regime) qs.set('regime', params.regime)
+  if (params.sub_domain) qs.set('sub_domain', params.sub_domain)
+  if (params.subject_theme) qs.set('subject_theme', params.subject_theme)
   const suffix = qs.toString() ? `?${qs.toString()}` : ''
   return api(`/api/assets/rules${suffix}`)
 }

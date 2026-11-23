@@ -19,6 +19,7 @@ from app.copilot.disclosure import build_disclosure
 from app.infra.config import Settings, get_budget, get_effective_settings, get_settings
 from app.infra.db_tables import CopilotMessageModel, CopilotSessionModel
 from app.infra.errors import WorkflowError
+from app.infra.taxonomy import FINANCIAL_SUBJECT_THEMES, normalize_financial_theme
 from app.infra.llm import (
     RealDesignLlm,
     call_llm_validated,
@@ -257,15 +258,28 @@ def _normalize_planned_tool_args(tool_name: str, raw_args: Any, clean_query: str
             or clean_query
         )
     ) or clean_query
+    sub_domain = sanitize_business_text(str(args.get("sub_domain") or "")).strip()
+    subject_theme = normalize_financial_theme(str(args.get("subject_theme") or ""))
+
     if tool_name == "list_covered_businesses":
         return {}
     if tool_name == "check_regulatory_coverage_gap":
         topic_val = sanitize_business_text(str(args.get("topic") or args.get("query") or "")).strip()
         return {"topic": topic_val} if topic_val else {}
     if tool_name == "get_business_scope_and_rules":
-        return {"topic": sanitize_business_text(str(args.get("topic") or fallback_text)) or clean_query}
+        out: Dict[str, Any] = {"topic": sanitize_business_text(str(args.get("topic") or fallback_text)) or clean_query}
+        if sub_domain:
+            out["sub_domain"] = sub_domain
+        if subject_theme:
+            out["subject_theme"] = subject_theme
+        return out
     if tool_name == "get_business_caliber_detail":
-        return {"metric": sanitize_business_text(str(args.get("metric") or fallback_text)) or clean_query}
+        out = {"metric": sanitize_business_text(str(args.get("metric") or fallback_text)) or clean_query}
+        if sub_domain:
+            out["sub_domain"] = sub_domain
+        if subject_theme:
+            out["subject_theme"] = subject_theme
+        return out
     if tool_name == "resolve_business_concept":
         return {"concept": sanitize_business_text(str(args.get("concept") or fallback_text)) or clean_query}
     if tool_name == "find_rules_by_business_role":
@@ -286,6 +300,9 @@ def _plan_tools_with_llm(
     domain_catalog = [
         {
             "name": c["name"],
+            "regime": c.get("regime", "通用监管"),
+            "sub_domains": [s["name"] for s in (c.get("sub_domains") or [])[:6]],
+            "subject_themes": c.get("subject_themes") or [],
             "coverage_status": c["coverage_status"],
             "rule_count": c["rule_count"],
             "caliber_count": c["caliber_count"],
@@ -303,7 +320,8 @@ def _plan_tools_with_llm(
             "plan_copilot_tools",
             (
                 "根据业务人员的当前问题、上下文对话与已收录业务域目录，自主规划 1 至 4 步最合适的纯业务查询工具组合。"
-                "参数必须严格匹配参数名：get_business_scope_and_rules 用 topic；get_business_caliber_detail 用 metric；"
+                "参数必须严格匹配参数名：get_business_scope_and_rules 用 topic（可选传 sub_domain 二级子专题、subject_theme 金融十大主题作跨报表横切检索）；"
+                "get_business_caliber_detail 用 metric（可选传 subject_theme）；"
                 "resolve_business_concept 用 concept；find_rules_by_business_role 用 role；list_covered_businesses 传 {}；"
                 "check_regulatory_coverage_gap 仅当用户问全局未落地/全景盘点时传 {}，针对特定指标/主题一致性核对务必传 {\"topic\": \"主题词\"}。"
                 "严禁出现任何物理表名、字段名、代码或 SQL 关键词。"
@@ -313,6 +331,7 @@ def _plan_tools_with_llm(
                 "role_lens": role_lens,
                 "recent_history": recent_history,
                 "available_businesses": domain_catalog,
+                "available_subject_themes": list(FINANCIAL_SUBJECT_THEMES),
                 "available_tools": tool_catalog,
             },
             backoff=(0.05, 0.1),

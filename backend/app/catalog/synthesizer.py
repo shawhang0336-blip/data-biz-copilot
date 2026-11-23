@@ -22,6 +22,12 @@ from app.infra.db_tables import (
 )
 from app.infra.errors import WorkflowError
 from app.infra.retrieval import infer_regulatory_regime, tokenize_for_search
+from app.infra.taxonomy import (
+    FINANCIAL_SUBJECT_THEMES,
+    infer_financial_theme,
+    infer_sub_domain,
+    normalize_financial_theme,
+)
 from app.infra.llm import (
     RealDesignLlm,
     call_llm_validated,
@@ -425,6 +431,8 @@ def _upsert_rule(
     evidence_ids: List[str],
     clause_ids: List[str],
     audience: str,
+    sub_domain: str = "",
+    subject_theme: str = "",
     bus,
 ) -> BusinessRuleAssetModel:
     cleaned = _ensure_business_clean(
@@ -434,6 +442,8 @@ def _upsert_rule(
             "code": code,
             "title": title,
             "rule_category": rule_category,
+            "sub_domain": sub_domain,
+            "subject_theme": subject_theme,
             "business_condition": business_condition,
             "business_action": business_action,
             "business_rationale": business_rationale,
@@ -448,6 +458,8 @@ def _upsert_rule(
             capability_id=capability_id,
             code=code,
             title=cleaned["title"],
+            sub_domain=cleaned["sub_domain"],
+            subject_theme=cleaned["subject_theme"],
             rule_category=rule_category,
             business_condition=cleaned["business_condition"],
             business_action=cleaned["business_action"],
@@ -464,9 +476,16 @@ def _upsert_rule(
         row.capability_id = capability_id
         if row.status != "CONFIRMED":
             row.title = cleaned["title"]
+            row.sub_domain = cleaned["sub_domain"]
+            row.subject_theme = cleaned["subject_theme"]
             row.business_condition = cleaned["business_condition"]
             row.business_action = cleaned["business_action"]
             row.business_rationale = cleaned["business_rationale"]
+        else:
+            if not row.sub_domain:
+                row.sub_domain = cleaned["sub_domain"]
+            if not row.subject_theme:
+                row.subject_theme = cleaned["subject_theme"]
         row.reconcile_status = reconcile_status
         row.evidence_ids_json = evidence_ids
         row.clause_ids_json = clause_ids
@@ -492,6 +511,8 @@ def _upsert_caliber(
     evidence_ids: List[str],
     clause_ids: List[str],
     audience: str,
+    sub_domain: str = "",
+    subject_theme: str = "",
     bus,
 ) -> BusinessCaliberAssetModel:
     cleaned = _ensure_business_clean(
@@ -500,6 +521,8 @@ def _upsert_caliber(
         {
             "code": code,
             "metric_name": metric_name,
+            "sub_domain": sub_domain,
+            "subject_theme": subject_theme,
             "business_definition": business_definition,
             "formula_summary": formula_summary,
             "inclusion_scope": inclusion_scope,
@@ -517,6 +540,8 @@ def _upsert_caliber(
             capability_id=capability_id,
             code=code,
             metric_name=cleaned["metric_name"],
+            sub_domain=cleaned["sub_domain"],
+            subject_theme=cleaned["subject_theme"],
             business_definition=cleaned["business_definition"],
             formula_summary=cleaned["formula_summary"],
             inclusion_scope=cleaned["inclusion_scope"],
@@ -536,12 +561,19 @@ def _upsert_caliber(
         row.capability_id = capability_id
         if row.status != "CONFIRMED":
             row.metric_name = cleaned["metric_name"]
+            row.sub_domain = cleaned["sub_domain"]
+            row.subject_theme = cleaned["subject_theme"]
             row.business_definition = cleaned["business_definition"]
             row.formula_summary = cleaned["formula_summary"]
             row.inclusion_scope = cleaned["inclusion_scope"]
             row.exclusion_notes = cleaned["exclusion_notes"]
             row.distinction_notes = cleaned["distinction_notes"]
             row.conflict_notes = cleaned["conflict_notes"]
+        else:
+            if not row.sub_domain:
+                row.sub_domain = cleaned["sub_domain"]
+            if not row.subject_theme:
+                row.subject_theme = cleaned["subject_theme"]
         row.triggers_json = triggers
         row.reconcile_status = reconcile_status
         row.evidence_ids_json = evidence_ids
@@ -615,6 +647,10 @@ def _build_domain_draft(
     dedup_ev_ids: List[str] = []
     # 1) 从底层实证提炼已实现/冲突规则
     for ev in d_evs:
+        ev_loc = ev.internal_locator_json or {}
+        ev_stage = str(ev_loc.get("stage_title") or "")
+        ev_concept = str(ev.target_concept_hint or "")
+
         for item in ev.inclusion_predicates_json or []:
             rc_slug = _safe_rule_slug(item.get("rule_code", ""), "inc")
             rc = f"rule-{cap_code[4:]}-{rc_slug}"
@@ -624,13 +660,26 @@ def _build_domain_draft(
             matched_clauses = _match_relevant_clauses(
                 f"{item['title']} {item['condition']}", d_clauses, {"INCLUSION", "CAPABILITY"}
             )
+            r_action = "满足该条件则纳入当期正式业务处理与报送范围"
             rule_drafts.append(
                 {
                     "code": rc,
                     "title": item["title"],
                     "rule_category": "INCLUSION",
+                    "sub_domain": infer_sub_domain(
+                        domain_name,
+                        item["title"],
+                        item["condition"],
+                        r_action,
+                        target_concept=ev_concept,
+                        stage_title=ev_stage,
+                        rule_category="INCLUSION",
+                    ),
+                    "subject_theme": infer_financial_theme(
+                        item["title"], item["condition"], r_action, domain_name, "INCLUSION"
+                    ),
                     "business_condition": item["condition"],
-                    "business_action": "满足该条件则纳入当期正式业务处理与报送范围",
+                    "business_action": r_action,
                     "business_rationale": item["rationale"],
                     "reconcile_status": "VERIFIED" if matched_clauses else "CONSISTENT",
                     "evidence_ids": [ev.id],
@@ -648,13 +697,26 @@ def _build_domain_draft(
             matched_clauses = _match_relevant_clauses(
                 f"{item['title']} {item['condition']}", d_clauses, {"EXCLUSION"}
             )
+            r_action = "自动剔除出当期常规报送结果（必要时单列进入风险待办清单）"
             rule_drafts.append(
                 {
                     "code": rc,
                     "title": item["title"],
                     "rule_category": "EXCLUSION",
+                    "sub_domain": infer_sub_domain(
+                        domain_name,
+                        item["title"],
+                        item["condition"],
+                        r_action,
+                        target_concept=ev_concept,
+                        stage_title=ev_stage,
+                        rule_category="EXCLUSION",
+                    ),
+                    "subject_theme": infer_financial_theme(
+                        item["title"], item["condition"], r_action, domain_name, "EXCLUSION"
+                    ),
                     "business_condition": item["condition"],
-                    "business_action": "自动剔除出当期常规报送结果（必要时单列进入风险待办清单）",
+                    "business_action": r_action,
                     "business_rationale": item["rationale"],
                     "reconcile_status": "VERIFIED" if matched_clauses else "CONSISTENT",
                     "evidence_ids": [ev.id],
@@ -677,6 +739,18 @@ def _build_domain_draft(
                     "code": rc,
                     "title": item["title"],
                     "rule_category": "BRANCH",
+                    "sub_domain": infer_sub_domain(
+                        domain_name,
+                        item["title"],
+                        item["condition"],
+                        item["action"],
+                        target_concept=ev_concept,
+                        stage_title=ev_stage,
+                        rule_category="BRANCH",
+                    ),
+                    "subject_theme": infer_financial_theme(
+                        item["title"], item["condition"], item["action"], domain_name, "BRANCH"
+                    ),
                     "business_condition": item["condition"],
                     "business_action": item["action"],
                     "business_rationale": "按业务主体类别或账户属性自动进入差异化处理分支。",
@@ -702,12 +776,23 @@ def _build_domain_draft(
             matched_clauses = _match_relevant_clauses(
                 combined_dedup, d_clauses, {"INCLUSION", "CAPABILITY"}
             )
+            dedup_cond = "同一客户、账户或交易在系统加工过程中出现多条状态记录或重复执行时"
             rule_drafts.append(
                 {
                     "code": rc,
                     "title": "唯一记录防重保留规则",
                     "rule_category": "DEDUP",
-                    "business_condition": "同一客户、账户或交易在系统加工过程中出现多条状态记录或重复执行时",
+                    "sub_domain": infer_sub_domain(
+                        domain_name,
+                        "唯一记录防重保留规则",
+                        dedup_cond,
+                        combined_dedup,
+                        rule_category="DEDUP",
+                    ),
+                    "subject_theme": infer_financial_theme(
+                        "唯一记录防重保留规则", dedup_cond, combined_dedup, domain_name, "DEDUP"
+                    ),
+                    "business_condition": dedup_cond,
                     "business_action": combined_dedup,
                     "business_rationale": "保障报送金额与交易笔数准确唯一，防止同一业务被重复计数。",
                     "reconcile_status": "VERIFIED" if matched_clauses else "CONSISTENT",
@@ -724,13 +809,22 @@ def _build_domain_draft(
             if rc in seen_rule_codes:
                 continue
             seen_rule_codes.add(rc)
+            r_cat = cl.clause_kind if cl.clause_kind in {"INCLUSION", "EXCLUSION", "BRANCH", "DEDUP"} else "INCLUSION"
+            r_cond = sanitize_business_text(cl.business_requirement)
+            r_act = "当前系统处理逻辑中尚未检索到该项规则的实际落地实现"
             rule_drafts.append(
                 {
                     "code": rc,
                     "title": cl.clause_title,
-                    "rule_category": cl.clause_kind if cl.clause_kind in {"INCLUSION", "EXCLUSION", "BRANCH", "DEDUP"} else "INCLUSION",
-                    "business_condition": sanitize_business_text(cl.business_requirement),
-                    "business_action": "当前系统处理逻辑中尚未检索到该项规则的实际落地实现",
+                    "rule_category": r_cat,
+                    "sub_domain": infer_sub_domain(
+                        domain_name, cl.clause_title, r_cond, r_act, rule_category=r_cat
+                    ),
+                    "subject_theme": infer_financial_theme(
+                        cl.clause_title, r_cond, r_act, domain_name, r_cat
+                    ),
+                    "business_condition": r_cond,
+                    "business_action": r_act,
                     "business_rationale": "制度规范已明确要求，但目前仅停留在制度文件阶段，建议纳入后续开发排期。",
                     "reconcile_status": "UNREALIZED",
                     "evidence_ids": [],
@@ -830,11 +924,26 @@ def _build_domain_draft(
         else:
             distinction_notes = "请勿将该口径与跨业务阶段汇总指标混用。"
 
+        top_ev_stage = str(((matching_evs[0].internal_locator_json or {}).get("stage_title") or "")) if matching_evs else ""
+        top_ev_concept = str(matching_evs[0].target_concept_hint or "") if matching_evs else ""
+        cal_def = sanitize_business_text(cl.business_requirement)
         caliber_drafts.append(
             {
                 "code": cal_code,
                 "metric_name": metric_name,
-                "business_definition": sanitize_business_text(cl.business_requirement),
+                "sub_domain": infer_sub_domain(
+                    domain_name,
+                    metric_name,
+                    cal_def,
+                    formula_summary,
+                    target_concept=top_ev_concept,
+                    stage_title=top_ev_stage,
+                    rule_category="CALIBER",
+                ),
+                "subject_theme": infer_financial_theme(
+                    metric_name, cal_def, formula_summary, domain_name, "CALIBER"
+                ),
+                "business_definition": cal_def,
                 "formula_summary": formula_summary,
                 "inclusion_scope": f"适用业务范围：{domain_name}（随当期主体圈定与有效状态规则一并生效）",
                 "exclusion_notes": exclusion_notes,
@@ -854,12 +963,20 @@ def _build_domain_draft(
         if len(metric_name) > 28:
             metric_name = metric_name[:26].rstrip("，；： ") + "…"
         cal_code = f"cal-{hashlib.md5(metric_name.encode('utf-8')).hexdigest()[:8]}"
+        cal_def = sanitize_business_text(d_clauses[0].business_requirement)
+        cal_formula = "制度材料明确提出了此专项核验要求，但当前已接入的系统逻辑尚未实现。"
         caliber_drafts.append(
             {
                 "code": cal_code,
                 "metric_name": metric_name,
-                "business_definition": sanitize_business_text(d_clauses[0].business_requirement),
-                "formula_summary": "制度材料明确提出了此专项核验要求，但当前已接入的系统逻辑尚未实现。",
+                "sub_domain": infer_sub_domain(
+                    domain_name, metric_name, cal_def, cal_formula, rule_category="CALIBER"
+                ),
+                "subject_theme": infer_financial_theme(
+                    metric_name, cal_def, cal_formula, domain_name, "CALIBER"
+                ),
+                "business_definition": cal_def,
+                "formula_summary": cal_formula,
                 "inclusion_scope": domain_name,
                 "exclusion_notes": "尚待业务与研发确认纳入排期后补齐实现。",
                 "distinction_notes": "请勿对外宣传系统已具备该专项自动核验能力。",
@@ -893,6 +1010,15 @@ def _build_domain_draft(
         for e in d_evs[:15]
     ]
 
+    sub_counts: Dict[str, int] = {}
+    for item in rule_drafts + caliber_drafts:
+        sd = item.get("sub_domain") or "其他专题"
+        sub_counts[sd] = sub_counts.get(sd, 0) + 1
+    sub_domains = [
+        {"name": sd, "count": cnt}
+        for sd, cnt in sorted(sub_counts.items(), key=lambda kv: kv[1], reverse=True)
+    ]
+
     return {
         "domain_name": domain_name,
         "cap_code": cap_code,
@@ -900,6 +1026,7 @@ def _build_domain_draft(
         "ev_ids": ev_ids,
         "cl_ids": cl_ids,
         "audience": audience,
+        "sub_domains": sub_domains,
         "capability": {
             "code": cap_code,
             "name": domain_name,
@@ -914,114 +1041,206 @@ def _build_domain_draft(
     }
 
 
+def _build_subdomain_batches(
+    rules: List[Dict[str, Any]],
+    *,
+    batch_size: int = 20,
+    max_batches: int = 4,
+) -> List[Tuple[str, List[Dict[str, Any]]]]:
+    """对大域规则按二级子专题轮转采样并分组分批，保障各子专题均衡获得 Stage 3 AI 精炼。"""
+    if len(rules) <= batch_size:
+        return [("全部子专题", rules)]
+
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    order: List[str] = []
+    for r in rules:
+        sd = str(r.get("sub_domain") or "其他专题")
+        if sd not in grouped:
+            order.append(sd)
+            grouped[sd] = []
+        grouped[sd].append(r)
+
+    max_selected = batch_size * max_batches
+    selected_by_sd: Dict[str, List[Dict[str, Any]]] = {sd: [] for sd in order}
+    offsets: Dict[str, int] = {sd: 0 for sd in order}
+    total_selected = 0
+    while total_selected < max_selected:
+        progressed = False
+        for sd in order:
+            idx = offsets[sd]
+            if idx < len(grouped[sd]):
+                selected_by_sd[sd].append(grouped[sd][idx])
+                offsets[sd] = idx + 1
+                total_selected += 1
+                progressed = True
+                if total_selected >= max_selected:
+                    break
+        if not progressed:
+            break
+
+    batches: List[Tuple[str, List[Dict[str, Any]]]] = []
+    cur_labels: List[str] = []
+    cur_items: List[Dict[str, Any]] = []
+    for sd in order:
+        items = selected_by_sd[sd]
+        if not items:
+            continue
+        for start in range(0, len(items), batch_size):
+            chunk = items[start : start + batch_size]
+            if cur_items and len(cur_items) + len(chunk) > batch_size and len(batches) < max_batches - 1:
+                batches.append((" / ".join(dict.fromkeys(cur_labels)), cur_items))
+                cur_labels = []
+                cur_items = []
+            cur_labels.append(sd)
+            cur_items.extend(chunk)
+    if cur_items:
+        if len(batches) >= max_batches:
+            batches[-1][1].extend(cur_items)
+        else:
+            batches.append((" / ".join(dict.fromkeys(cur_labels)), cur_items))
+    return batches
+
+
 def _refine_domain_with_llm(
     draft: Dict[str, Any],
     *,
     llm: Any,
     bus: Any,
 ) -> Tuple[Dict[str, Any], bool]:
-    """利用受控大模型对单一业务域进行代码实证 × 监管制度深度业务融合提炼。"""
+    """利用受控大模型对单一业务域按二级子专题分批进行代码实证 × 监管制度深度业务融合提炼。"""
     if llm is None:
         return draft, False
     from app.kernel.run import BudgetExceededError
 
-    payload = {
-        "domain_name": draft["domain_name"],
-        "coverage_status": draft["coverage_status"],
-        "allowed_evidence_ids": draft["ev_ids"],
-        "regulatory_clauses": draft["brief_clauses"],
-        "logic_evidences": draft["brief_evidences"],
-        "draft_capability": draft["capability"],
-        "draft_rules": [
-            {
-                "code": r["code"],
-                "title": r["title"],
-                "rule_category": r["rule_category"],
-                "business_condition": r["business_condition"],
-                "business_action": r["business_action"],
-                "business_rationale": r["business_rationale"],
-                "evidence_ids": r["evidence_ids"],
-            }
-            for r in draft["rules"][:18]
-        ],
-        "draft_calibers": [
-            {
-                "code": c["code"],
-                "metric_name": c["metric_name"],
-                "business_definition": c["business_definition"],
-                "formula_summary": c["formula_summary"],
-                "distinction_notes": c["distinction_notes"],
-                "conflict_notes": c["conflict_notes"],
-                "evidence_ids": c["evidence_ids"],
-            }
-            for c in draft["calibers"][:8]
-        ],
-    }
-    try:
-        args, _trace = call_llm_validated(
-            llm,
-            "synthesize_domain_assets",
-            (
-                "结合监管制度条款与系统底层实证，在不编造未实证规则、不丢失原规则 code、"
-                "且严禁出现任何物理表名、字段名（大小写）、文件名或 SQL 关键词的前提下，将本业务域的概述、"
-                "适用边界、核心规则条件/结果/业务原因及指标口径提炼融合为清晰自然的中文业务表述。"
-                "请逐条核对 logic_evidences 与 draft_rules：凡系统实证已明确实现的扣减公式、审批/复核门禁、状态排除或覆盖机制，"
-                "必须在融合描述与口径公式中如实肯定为“已落地”并写清具体业务口径，严禁把已实现逻辑误判为尚未落地；"
-                "仅在确实存在多口径分歧或制度未落地缺口时如实点明。"
-            ),
-            payload,
-            backoff=(0.1, 0.2),
-            bus=bus,
-        )
-    except BudgetExceededError:
-        raise
-    except (WorkflowError, RuntimeError):
-        return draft, False
-
-    cap = draft["capability"]
-    if str(args.get("description") or "").strip():
-        cap["description"] = sanitize_business_text(str(args["description"]).strip()) or cap["description"]
-    if str(args.get("scope_summary") or "").strip():
-        cap["scope_summary"] = sanitize_business_text(str(args["scope_summary"]).strip()) or cap["scope_summary"]
-
+    batches = _build_subdomain_batches(draft["rules"], batch_size=20, max_batches=4)
     allowed_ev_set = set(draft["ev_ids"])
-    ai_rules = {
-        str(item.get("code")): item
-        for item in (args.get("rules") or [])
-        if isinstance(item, dict) and item.get("code")
-    }
-    for rule in draft["rules"]:
-        refined = ai_rules.get(rule["code"])
-        if not refined:
-            continue
-        for field in ("title", "business_condition", "business_action", "business_rationale"):
-            val = sanitize_business_text(str(refined.get(field) or "").strip())
-            if val:
-                rule[field] = val
-        if isinstance(refined.get("evidence_ids"), list) and rule["evidence_ids"]:
-            filtered = [eid for eid in refined["evidence_ids"] if eid in allowed_ev_set]
-            if filtered:
-                rule["evidence_ids"] = filtered
+    rule_by_code = {r["code"]: r for r in draft["rules"]}
+    cal_by_code = {c["code"]: c for c in draft["calibers"]}
+    any_ok = False
 
-    ai_calibers = {
-        str(item.get("code")): item
-        for item in (args.get("calibers") or [])
-        if isinstance(item, dict) and item.get("code")
-    }
-    for cal in draft["calibers"]:
-        refined = ai_calibers.get(cal["code"])
-        if not refined:
-            continue
-        for field in ("metric_name", "business_definition", "formula_summary", "distinction_notes", "conflict_notes"):
-            val = sanitize_business_text(str(refined.get(field) or "").strip())
-            if val:
-                cal[field] = val
-        if isinstance(refined.get("evidence_ids"), list) and cal["evidence_ids"]:
-            filtered = [eid for eid in refined["evidence_ids"] if eid in allowed_ev_set]
-            if filtered:
-                cal["evidence_ids"] = filtered
+    instruction = (
+        "结合监管制度条款与系统底层实证，在不编造未实证规则、不丢失原规则 code、"
+        "且严禁出现任何物理表名、字段名（大小写）、文件名或 SQL 关键词的前提下，将本业务域的概述、"
+        "适用边界、核心规则条件/结果/业务原因及指标口径提炼融合为清晰自然的中文业务表述。"
+        "同时可按需校准每条规则/口径的二级子专题 sub_domain（2~22字纯业务名词，不得含技术词）与金融十大主题 subject_theme"
+        f"（仅可取自：{'、'.join(FINANCIAL_SUBJECT_THEMES)}）。"
+        "请逐条核对 logic_evidences 与 draft_rules：凡系统实证已明确实现的扣减公式、审批/复核门禁、状态排除或覆盖机制，"
+        "必须在融合描述与口径公式中如实肯定为“已落地”并写清具体业务口径，严禁把已实现逻辑误判为尚未落地；"
+        "仅在确实存在多口径分歧或制度未落地缺口时如实点明。"
+    )
 
-    return draft, True
+    for b_idx, (sub_domain_focus, batch_rules) in enumerate(batches):
+        payload = {
+            "domain_name": draft["domain_name"],
+            "sub_domain_focus": sub_domain_focus,
+            "batch_index": b_idx,
+            "batch_total": len(batches),
+            "coverage_status": draft["coverage_status"],
+            "allowed_evidence_ids": draft["ev_ids"],
+            "regulatory_clauses": draft["brief_clauses"],
+            "logic_evidences": draft["brief_evidences"],
+            "draft_capability": draft["capability"],
+            "draft_rules": [
+                {
+                    "code": r["code"],
+                    "title": r["title"],
+                    "rule_category": r["rule_category"],
+                    "sub_domain": r.get("sub_domain") or "",
+                    "subject_theme": r.get("subject_theme") or "",
+                    "business_condition": r["business_condition"],
+                    "business_action": r["business_action"],
+                    "business_rationale": r["business_rationale"],
+                    "evidence_ids": r["evidence_ids"],
+                }
+                for r in batch_rules
+            ],
+            "draft_calibers": (
+                [
+                    {
+                        "code": c["code"],
+                        "metric_name": c["metric_name"],
+                        "sub_domain": c.get("sub_domain") or "",
+                        "subject_theme": c.get("subject_theme") or "",
+                        "business_definition": c["business_definition"],
+                        "formula_summary": c["formula_summary"],
+                        "distinction_notes": c["distinction_notes"],
+                        "conflict_notes": c["conflict_notes"],
+                        "evidence_ids": c["evidence_ids"],
+                    }
+                    for c in draft["calibers"][:10]
+                ]
+                if b_idx == 0
+                else []
+            ),
+        }
+        try:
+            args, _trace = call_llm_validated(
+                llm,
+                "synthesize_domain_assets",
+                instruction,
+                payload,
+                backoff=(0.1, 0.2),
+                bus=bus,
+            )
+        except BudgetExceededError:
+            raise
+        except (WorkflowError, RuntimeError):
+            if b_idx == 0 and len(batches) == 1:
+                return draft, False
+            continue
+
+        any_ok = True
+        if b_idx == 0:
+            cap = draft["capability"]
+            if str(args.get("description") or "").strip():
+                cap["description"] = sanitize_business_text(str(args["description"]).strip()) or cap["description"]
+            if str(args.get("scope_summary") or "").strip():
+                cap["scope_summary"] = sanitize_business_text(str(args["scope_summary"]).strip()) or cap["scope_summary"]
+
+        for item in args.get("rules") or []:
+            if not isinstance(item, dict) or not item.get("code"):
+                continue
+            rule = rule_by_code.get(str(item["code"]))
+            if not rule:
+                continue
+            for field in ("title", "business_condition", "business_action", "business_rationale"):
+                val = sanitize_business_text(str(item.get(field) or "").strip())
+                if val:
+                    rule[field] = val
+            sd_val = sanitize_business_text(str(item.get("sub_domain") or "").strip())
+            if 2 <= len(sd_val) <= 24 and not detect_technical_jargon(sd_val):
+                rule["sub_domain"] = sd_val
+            th_val = normalize_financial_theme(str(item.get("subject_theme") or ""))
+            if th_val:
+                rule["subject_theme"] = th_val
+            if isinstance(item.get("evidence_ids"), list) and rule["evidence_ids"]:
+                filtered = [eid for eid in item["evidence_ids"] if eid in allowed_ev_set]
+                if filtered:
+                    rule["evidence_ids"] = filtered
+
+        if b_idx == 0:
+            for item in args.get("calibers") or []:
+                if not isinstance(item, dict) or not item.get("code"):
+                    continue
+                cal = cal_by_code.get(str(item["code"]))
+                if not cal:
+                    continue
+                for field in ("metric_name", "business_definition", "formula_summary", "distinction_notes", "conflict_notes"):
+                    val = sanitize_business_text(str(item.get(field) or "").strip())
+                    if val:
+                        cal[field] = val
+                sd_val = sanitize_business_text(str(item.get("sub_domain") or "").strip())
+                if 2 <= len(sd_val) <= 24 and not detect_technical_jargon(sd_val):
+                    cal["sub_domain"] = sd_val
+                th_val = normalize_financial_theme(str(item.get("subject_theme") or ""))
+                if th_val:
+                    cal["subject_theme"] = th_val
+                if isinstance(item.get("evidence_ids"), list) and cal["evidence_ids"]:
+                    filtered = [eid for eid in item["evidence_ids"] if eid in allowed_ev_set]
+                    if filtered:
+                        cal["evidence_ids"] = filtered
+
+    return draft, any_ok
 
 
 _DOMAIN_PREFIX_RE = re.compile(
