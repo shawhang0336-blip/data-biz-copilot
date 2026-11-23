@@ -17,13 +17,51 @@ from app.infra.db_tables import (
     RegulatoryClauseModel,
     SourceMaterialModel,
 )
+from app.infra.retrieval import infer_regulatory_regime
 
 
-def _rule_to_dict(row: BusinessRuleAssetModel, capability_name: str = "") -> Dict[str, Any]:
+def _compute_capability_regimes(
+    session: Session, caps: List[BusinessCapabilityModel]
+) -> Dict[str, str]:
+    """根据关联条款/底层实证来源及业务概述自动归纳所属监管报送体系（1104 / EAST / SAFE / PLUS / 一表通 / 人行统计）。"""
+    clause_regimes = {
+        cid: (loc or {}).get("regime")
+        for cid, loc in session.query(RegulatoryClauseModel.id, RegulatoryClauseModel.source_locator_json).all()
+        if isinstance(loc, dict) and loc.get("regime")
+    }
+    ev_regimes = {
+        eid: (loc or {}).get("regime")
+        for eid, loc in session.query(LogicEvidenceModel.id, LogicEvidenceModel.internal_locator_json).all()
+        if isinstance(loc, dict) and loc.get("regime")
+    }
+    result: Dict[str, str] = {}
+    for cap in caps:
+        counts: Dict[str, int] = {}
+        for cid in cap.clause_ids_json or []:
+            reg = clause_regimes.get(cid)
+            if reg and reg != "通用监管":
+                counts[reg] = counts.get(reg, 0) + 1
+        for eid in cap.evidence_ids_json or []:
+            reg = ev_regimes.get(eid)
+            if reg and reg != "通用监管":
+                counts[reg] = counts.get(reg, 0) + 1
+        if counts:
+            result[cap.id] = max(counts.items(), key=lambda kv: kv[1])[0]
+        else:
+            result[cap.id] = infer_regulatory_regime(cap.name, cap.description, cap.scope_summary)
+    return result
+
+
+def _rule_to_dict(
+    row: BusinessRuleAssetModel,
+    capability_name: str = "",
+    regime: str = "通用监管",
+) -> Dict[str, Any]:
     return {
         "id": row.id,
         "capability_id": row.capability_id,
         "capability_name": capability_name,
+        "regime": regime,
         "code": row.code,
         "title": row.title,
         "rule_category": row.rule_category,
@@ -41,11 +79,16 @@ def _rule_to_dict(row: BusinessRuleAssetModel, capability_name: str = "") -> Dic
     }
 
 
-def _caliber_to_dict(row: BusinessCaliberAssetModel, capability_name: str = "") -> Dict[str, Any]:
+def _caliber_to_dict(
+    row: BusinessCaliberAssetModel,
+    capability_name: str = "",
+    regime: str = "通用监管",
+) -> Dict[str, Any]:
     return {
         "id": row.id,
         "capability_id": row.capability_id,
         "capability_name": capability_name,
+        "regime": regime,
         "code": row.code,
         "metric_name": row.metric_name,
         "business_definition": row.business_definition,
@@ -127,11 +170,13 @@ def _compute_business_lineage(session: Session) -> Dict[str, Dict[str, List[str]
 def list_capabilities(session: Session) -> List[Dict[str, Any]]:
     rows = session.query(BusinessCapabilityModel).order_by(BusinessCapabilityModel.name.asc()).all()
     lineage = _compute_business_lineage(session)
+    regimes = _compute_capability_regimes(session, rows)
     return [
         {
             "id": r.id,
             "code": r.code,
             "name": r.name,
+            "regime": regimes.get(r.id, "通用监管"),
             "description": r.description,
             "scope_summary": r.scope_summary,
             "audience": r.audience,
@@ -157,7 +202,9 @@ def list_business_rules(
     rule_category: Optional[str] = None,
     reconcile_status: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    caps = {c.id: c.name for c in session.query(BusinessCapabilityModel).all()}
+    cap_rows = session.query(BusinessCapabilityModel).all()
+    caps = {c.id: c.name for c in cap_rows}
+    regimes = _compute_capability_regimes(session, cap_rows)
     q = session.query(BusinessRuleAssetModel)
     if capability_id:
         q = q.filter(BusinessRuleAssetModel.capability_id == capability_id)
@@ -166,7 +213,7 @@ def list_business_rules(
     if reconcile_status:
         q = q.filter(BusinessRuleAssetModel.reconcile_status == reconcile_status)
     rows = q.order_by(BusinessRuleAssetModel.code.asc()).all()
-    return [_rule_to_dict(r, caps.get(r.capability_id, "")) for r in rows]
+    return [_rule_to_dict(r, caps.get(r.capability_id, ""), regimes.get(r.capability_id, "通用监管")) for r in rows]
 
 
 def list_business_calibers(
@@ -175,14 +222,16 @@ def list_business_calibers(
     capability_id: Optional[str] = None,
     reconcile_status: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    caps = {c.id: c.name for c in session.query(BusinessCapabilityModel).all()}
+    cap_rows = session.query(BusinessCapabilityModel).all()
+    caps = {c.id: c.name for c in cap_rows}
+    regimes = _compute_capability_regimes(session, cap_rows)
     q = session.query(BusinessCaliberAssetModel)
     if capability_id:
         q = q.filter(BusinessCaliberAssetModel.capability_id == capability_id)
     if reconcile_status:
         q = q.filter(BusinessCaliberAssetModel.reconcile_status == reconcile_status)
     rows = q.order_by(BusinessCaliberAssetModel.code.asc()).all()
-    return [_caliber_to_dict(r, caps.get(r.capability_id, "")) for r in rows]
+    return [_caliber_to_dict(r, caps.get(r.capability_id, ""), regimes.get(r.capability_id, "通用监管")) for r in rows]
 
 
 def list_reconcile_ledger(session: Session) -> Dict[str, Any]:
@@ -201,6 +250,7 @@ def list_reconcile_ledger(session: Session) -> Dict[str, Any]:
                 "code": c["code"],
                 "name": c["metric_name"],
                 "capability_name": c["capability_name"],
+                "regime": c.get("regime", "通用监管"),
                 "reconcile_status": c["reconcile_status"],
                 "status": c["status"],
                 "summary": c["conflict_notes"] or c["formula_summary"],
@@ -216,6 +266,7 @@ def list_reconcile_ledger(session: Session) -> Dict[str, Any]:
                 "code": r["code"],
                 "name": r["title"],
                 "capability_name": r["capability_name"],
+                "regime": r.get("regime", "通用监管"),
                 "reconcile_status": r["reconcile_status"],
                 "status": r["status"],
                 "summary": r["business_action"],

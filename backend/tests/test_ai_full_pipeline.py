@@ -502,9 +502,9 @@ def test_copilot_tool_topk_scoped_gap_disclosure_and_sac_multidomain_preservatio
                 id=f"extra-inc-{i}",
                 capability_id=cap.id,
                 code=f"rule-extra-inc-{i}",
-                title=f"结售汇大额申报常规纳入规则-{i}",
+                title=f"结售汇客户大额申报常规纳入规则-{i}",
                 rule_category="INCLUSION",
-                business_condition="结售汇金额达到申报门槛",
+                business_condition="结售汇客户申报金额达到申报门槛",
                 business_action="纳入正常报送",
                 business_rationale="常规测试条款",
                 reconcile_status="VERIFIED",
@@ -520,7 +520,7 @@ def test_copilot_tool_topk_scoped_gap_disclosure_and_sac_multidomain_preservatio
             id="extra-exc-priority",
             capability_id=cap.id,
             code="rule-extra-exc-priority",
-            title="结售汇特殊测试客户排除规则",
+            title="结售汇客户特殊排除规则",
             rule_category="EXCLUSION",
             business_condition="属于结售汇测试或豁免客户时排除",
             business_action="直接排除不予报送",
@@ -535,9 +535,12 @@ def test_copilot_tool_topk_scoped_gap_disclosure_and_sac_multidomain_preservatio
     )
     session.flush()
 
+    topk_res = execute_business_tool(session, "get_business_scope_and_rules", {"topic": "结售汇客户"})
+    assert len(topk_res["rules"]) == 15
+    assert topk_res["total_matched"] >= 21
+
     scope_res = execute_business_tool(session, "get_business_scope_and_rules", {"topic": "结售汇哪些客户会被排除"})
-    assert len(scope_res["rules"]) <= 15
-    assert scope_res["total_matched"] >= 21
+    assert 1 <= len(scope_res["rules"]) <= 15
     assert scope_res["rules"][0]["rule_category"] == "EXCLUSION"
 
     # 2) check_regulatory_coverage_gap 带 topic 时只披露与该主题相关的问题，不把无关未落地领域强塞到顶部

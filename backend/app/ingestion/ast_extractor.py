@@ -168,7 +168,7 @@ def extract_sql_ast_skeleton(stmt: str) -> Dict[str, Any]:
 def _clean_comment_topic(comments: List[str], filename: str) -> str:
     """从中文注释提炼纯粹的业务主题名，严禁透出表名/文件名/英文代码。"""
     for raw in comments:
-        c = re.sub(r"^(?:任务描述|程序描述|程序名称|业务说明|功能说明)[：:\s]*", "", raw).strip()
+        c = re.sub(r"^(?:任务描述|程序描述|程序名称|业务说明|功能说明|报表名称|主题|指标说明)[：:\s]*", "", raw).strip()
         c = sanitize_business_text(c)
         c = re.sub(r"[（(][^）)]*[）)]", "", c).strip()
         if len(c) >= 4 and not detect_technical_jargon(c):
@@ -176,7 +176,7 @@ def _clean_comment_topic(comments: List[str], filename: str) -> str:
     stem = sanitize_business_text(re.sub(r"\.[A-Za-z0-9]+$", "", filename).replace("_", " "))
     if any("\u4e00" <= ch <= "\u9fff" for ch in stem) and not detect_technical_jargon(stem):
         return stem[:24]
-    return "通用业务数据处理域"
+    return "待AI归类监管逻辑域"
 
 
 def synthesize_generic_business_semantics(
@@ -391,6 +391,16 @@ def _compute_upstream_step_map(evidences: List[Any]) -> Dict[int, List[int]]:
     return upstream_map
 
 
+_GENERIC_CODE_DOMAINS = {
+    "",
+    "核心业务规则",
+    "核心业务规则与逻辑加工",
+    "通用业务规范",
+    "通用业务数据处理域",
+    "待AI归类监管逻辑域",
+}
+
+
 def survey_code_script(
     filename: str,
     banner: str,
@@ -405,10 +415,15 @@ def survey_code_script(
         if c and not detect_technical_jargon(sanitize_business_text(c))
     ][:10]
     canonical_hints = list(
-        dict.fromkeys(ev.business_domain_hint for ev in evidences if ev.business_domain_hint)
+        dict.fromkeys(
+            ev.business_domain_hint
+            for ev in evidences
+            if ev.business_domain_hint and ev.business_domain_hint not in _GENERIC_CODE_DOMAINS
+        )
     )
     return {
         "step_count": len(evidences),
+        "regulatory_regime": (evidences[0].internal_locator or {}).get("regime", "通用监管") if evidences else "通用监管",
         "procedure_banner": sanitize_business_text(banner),
         "canonical_domain_hints": canonical_hints,
         "business_comments": clean_comments,
@@ -431,8 +446,12 @@ def survey_code_script(
 def _default_code_groups(evidences: List[Any]) -> List[Dict[str, Any]]:
     domain_order: List[str] = []
     by_domain: Dict[str, List[int]] = {}
+    fallback_dom = next(
+        (ev.business_domain_hint for ev in evidences if ev.business_domain_hint not in _GENERIC_CODE_DOMAINS),
+        "核心业务规则与逻辑加工",
+    )
     for idx, ev in enumerate(evidences):
-        d = ev.business_domain_hint or "核心业务规则与逻辑加工"
+        d = ev.business_domain_hint if ev.business_domain_hint not in _GENERIC_CODE_DOMAINS else fallback_dom
         if d not in by_domain:
             domain_order.append(d)
             by_domain[d] = []
@@ -480,7 +499,8 @@ def _plan_code_structure_with_llm(
                 "1. 用纯中文概述整套处理流程的 business_overview 及主归属业务域 canonical_domain；"
                 "2. 将 0 到 step_count-1 所有步骤不重不漏地归并划分为 1 至 4 个连续且职能清晰的逻辑阶段 chunk_groups"
                 "（stage_role 取 SCOPE_FILTER/BRANCH_LOGIC/CALCULATION/DEDUP_MERGE/OUTPUT_REPORT；仅纯技术准备工作标 IGNORE）；"
-                "3. 若同一份代码内部存在多个不同的 canonical_domain_hints（如同时包含主报送域与「应报未报漏报风险识别」），不同 draft_domain 的步骤应分别划分为独立阶段，保留各自原本的 draft_domain，严禁出现表名、字段名、SQL 或脚本名。"
+                "3. 若同一份代码内部存在多个不同的 canonical_domain_hints（如同时包含主报送域与「应报未报漏报风险识别」），不同 draft_domain 的步骤应分别划分为独立阶段，保留各自原本的 draft_domain；"
+                "若所有步骤属同一业务主题且 canonical_domain_hints 非空，应直接复用 canonical_domain_hints 中的标准域名，不要另造近义新词，且严禁原样回填占位词「待AI归类监管逻辑域」或出现表名/字段名/SQL。"
             ),
             survey,
             backoff=(0.2, 0.5),
@@ -497,6 +517,14 @@ def _plan_code_structure_with_llm(
     total_steps = len(evidences)
     used_steps = set()
     validated_groups: List[Dict[str, Any]] = []
+
+    raw_canonical = sanitize_business_text(str(args.get("canonical_domain") or "")).strip()
+    if raw_canonical in _GENERIC_CODE_DOMAINS:
+        raw_canonical = ""
+    if canonical_hints and (is_sac_script or not raw_canonical or any(h in raw_canonical or raw_canonical in h for h in canonical_hints)):
+        canonical_domain = raw_canonical if raw_canonical in canonical_hints else canonical_hints[0]
+    else:
+        canonical_domain = raw_canonical or (canonical_hints[0] if canonical_hints else "核心业务规则与逻辑加工")
 
     for g in raw_groups or []:
         if not isinstance(g, dict):
@@ -517,13 +545,23 @@ def _plan_code_structure_with_llm(
         if role not in valid_roles:
             role = "SCOPE_FILTER"
 
-        group_hints = [evidences[i].business_domain_hint for i in cleaned_indices if evidences[i].business_domain_hint]
-        dominant_hint = group_hints[0] if group_hints else (canonical_hints[0] if canonical_hints else "核心业务规则")
+        group_hints = [
+            evidences[i].business_domain_hint
+            for i in cleaned_indices
+            if evidences[i].business_domain_hint and evidences[i].business_domain_hint not in _GENERIC_CODE_DOMAINS
+        ]
+        dominant_hint = group_hints[0] if group_hints else canonical_domain
         proposed_domain = sanitize_business_text(str(g.get("business_domain") or "")).strip()
+        if proposed_domain in _GENERIC_CODE_DOMAINS:
+            proposed_domain = ""
         if is_sac_script and canonical_hints:
             resolved_domain = proposed_domain if proposed_domain in canonical_hints else dominant_hint
         else:
-            resolved_domain = proposed_domain or dominant_hint
+            resolved_domain = (
+                dominant_hint
+                if (not proposed_domain or (dominant_hint not in _GENERIC_CODE_DOMAINS and (dominant_hint in proposed_domain or proposed_domain in dominant_hint)))
+                else proposed_domain
+            )
 
         validated_groups.append(
             {
@@ -547,6 +585,8 @@ def _plan_code_structure_with_llm(
             remapped = [missing[k] for k in extra["step_indices"]]
             extra["group_id"] = len(validated_groups)
             extra["step_indices"] = remapped
+            if extra["business_domain"] in _GENERIC_CODE_DOMAINS:
+                extra["business_domain"] = canonical_domain
             validated_groups.append(extra)
 
     if not validated_groups:
@@ -555,12 +595,6 @@ def _plan_code_structure_with_llm(
     if all(g["stage_role"] == "IGNORE" for g in validated_groups):
         for g in validated_groups:
             g["stage_role"] = "SCOPE_FILTER"
-
-    raw_canonical = sanitize_business_text(str(args.get("canonical_domain") or "")).strip()
-    if is_sac_script and canonical_hints:
-        canonical_domain = raw_canonical if raw_canonical in canonical_hints else canonical_hints[0]
-    else:
-        canonical_domain = raw_canonical or (canonical_hints[0] if canonical_hints else "核心业务规则")
 
     step_to_stage: Dict[int, str] = {}
     for g in validated_groups:

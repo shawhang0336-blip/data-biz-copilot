@@ -111,7 +111,7 @@ export default function SourcesPage({ onSynthesized }) {
         </div>
         <div style={{ marginTop: 16, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
           <select value={kind} onChange={(e) => setKind(e.target.value)} style={{ maxWidth: 260 }}>
-            <option value="REGULATORY_DOC">监管 / 业务制度文档 (md/docx/xlsx)</option>
+            <option value="REGULATORY_DOC">监管 / 业务制度文档 (pdf/md/docx/xlsx)</option>
             <option value="CODE_LOGIC">系统计算逻辑源 (仅作后台静默实证)</option>
           </select>
           <input type="file" multiple onChange={handleUpload} disabled={busy} style={{ maxWidth: 340 }} />

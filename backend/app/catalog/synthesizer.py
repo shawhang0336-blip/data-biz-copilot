@@ -21,6 +21,7 @@ from app.infra.db_tables import (
     SourceMaterialModel,
 )
 from app.infra.errors import WorkflowError
+from app.infra.retrieval import tokenize_for_search
 from app.infra.llm import (
     RealDesignLlm,
     call_llm_validated,
@@ -733,13 +734,16 @@ def _build_domain_draft(
         if cal_code in seen_cal_codes:
             continue
         seen_cal_codes.add(cal_code)
+        metric_tokens = set(tokenize_for_search(f"{metric_name} {cl.clause_title}"))
         matching_evs = [
             e
             for e in d_evs
             if metric_name in e.target_concept_hint
             or metric_name in e.calculation_summary
+            or metric_name in e.source_summary
             or (metric_name in {"交易金额", "交易后余额"} and e.calculation_kind == "DIRECT")
             or (e.calculation_kind == "CONFLICT" and ("联名" in metric_name or "对手" in cl.clause_title or "大额结售汇" in metric_name))
+            or bool(metric_tokens and (metric_tokens & set(tokenize_for_search(f"{e.target_concept_hint} {e.calculation_summary} {e.source_summary}"))))
         ]
         if not matching_evs and d_evs:
             matching_evs = [d_evs[0]]

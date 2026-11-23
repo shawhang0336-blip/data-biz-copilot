@@ -13,6 +13,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.infra.contracts import ExtractedLogicEvidence
+from app.infra.retrieval import infer_regulatory_regime
 from app.ingestion.ast_extractor import (
     enrich_script_evidences_with_llm,
     extract_sql_ast_skeleton,
@@ -113,12 +114,12 @@ def _extract_comments(chunk: str) -> List[str]:
 
 
 def _extract_procedure_banner(sql_text: str) -> str:
-    """从 Oracle 存储过程头部注释中提炼中文任务/程序描述，作为无行内注释块的基础语义。"""
+    """从存储过程/SQL 头部注释中提炼中文任务/报表/业务描述，作为无行内注释块的基础语义。"""
     head = "\n".join(sql_text.splitlines()[:45])
     comments = _extract_comments(head)
     parts: List[str] = []
     for c in comments:
-        for pat in (r"(?:任务描述|程序描述|程序名称|业务说明)[：:\s]*(.+)",):
+        for pat in (r"(?:任务描述|程序描述|程序名称|业务说明|功能说明|报表名称|主题|指标说明)[：:\s]*(.+)",):
             m = re.search(pat, c)
             if m and m.group(1).strip():
                 parts.append(m.group(1).strip())
@@ -160,10 +161,10 @@ def _is_housekeeping_chunk(stmt: str, targets: List[str]) -> bool:
 
 
 _SAC_CUES = (
-    "SAC", "EAST", "GRCKFHZ", "DGKHXXB", "JGXXB", "SXXXB", "JGDEJSH", "LARGEFUNDS",
+    "SAC_", "SF_SAC_", "SP_SAC_", "GRCKFHZ", "DGKHXXB", "JGXXB", "SXXXB", "JGDEJSH", "LARGEFUNDS",
     "UNREPORT", "应报未报", "漏报", "DFVLOC", "DEALAMOUNT", "ACCOUNTBALAN", "KHHZH",
-    "DDACMSP", "HSMSMP", "GLACMSP", "分户账", "联名账户", "JOINT_BAL", "大额", "可疑",
-    "外汇", "统括", "TDACMSP", "IPACMSP", "EPACMSP", "VALID_FLAG",
+    "DDACMSP", "HSMSMP", "GLACMSP", "分户账", "个人存款分户账", "联名账户", "跨境联名账户",
+    "JOINT_BAL", "大额与可疑外汇", "TDACMSP", "IPACMSP", "EPACMSP",
 )
 
 
@@ -669,6 +670,7 @@ def parse_code_logic(
         return _parse_schema_ddl_by_domain(filename, text)
 
     banner = _extract_procedure_banner(text)
+    script_regime = infer_regulatory_regime(filename, banner, text[:2000])
     raw_chunks = split_sql_chunks(text)
     evidences: List[ExtractedLogicEvidence] = []
     comments_pool: List[str] = []
@@ -702,9 +704,10 @@ def parse_code_logic(
                 source_summary = f"支撑「{concept}」处理的第 {idx + 1} 项底层逻辑环节。"
             source_summary = re.sub(r"^(?:程序描述|业务说明|任务描述|程序名称)[：:\s]*", "", source_summary).strip()
         else:
-            generic = synthesize_generic_business_semantics(skeleton, comments, filename)
+            effective_comments = comments or ([banner] if banner else [])
+            generic = synthesize_generic_business_semantics(skeleton, effective_comments, filename)
             if not evidences:
-                single_generic_info = (skeleton, comments, generic)
+                single_generic_info = (skeleton, effective_comments, generic)
             domain = generic["business_domain_hint"]
             concept = generic["target_concept_hint"]
             inclusions = generic["inclusions"]
@@ -729,6 +732,7 @@ def parse_code_logic(
             dedup_grain_hint=dedup_hint,
             internal_locator={
                 "script": filename,
+                "regime": script_regime,
                 "chunk_index": idx,
                 "start_line": start_line,
                 "physical_objects": merged_targets,

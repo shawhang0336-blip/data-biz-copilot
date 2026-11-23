@@ -119,8 +119,9 @@ def _deterministic_business_narrative(
                 lines = ["相关业务指标的计算与统计口径说明如下："]
                 for c in cals[:4]:
                     extra = f"\n  - ⚠️ 内部多口径分歧提示：{c['conflict_notes']}" if c.get("conflict_notes") else ""
+                    regime_tag = f"｜{c['regime']}" if c.get("regime") else ""
                     lines.append(
-                        f"- **{c['metric_name']}**：{c['business_definition']}\n"
+                        f"- **{c['metric_name']}**（所属业务：{c['capability_name']}{regime_tag}）：{c['business_definition']}\n"
                         f"  - 实际处理算法：{c['formula_summary']}\n"
                         f"  - 适用与防混淆说明：{c['distinction_notes']}{extra}"
                     )
@@ -194,7 +195,8 @@ def _collect_disclosures_and_citations(
     seen_disc = set()
     citations: List[Dict[str, Any]] = []
     seen_codes = set()
-    max_citations = 12
+    # 白名单需覆盖工具结果中返回给模型的全部资产，避免模型引用第 13~15 条有效规则时被误判越界
+    max_citations = 60
 
     def _append_citation(asset_kind: str, code: str, title: str, reconcile_status: str) -> None:
         if len(citations) >= max_citations or not code or code in seen_codes:
@@ -498,6 +500,7 @@ def ask_business_copilot(
                 (
                     "结合业务资产与实证校验结论作答，采用「先给 2-3 句明确结论，再分点用短句说明逻辑及原因」的精炼格式"
                     "（单主题问答建议控制在 400~800 字，全景盘点不超过 1200 字，禁止同义车轱辘重复）；"
+                    "cited_asset_codes 只能填写 allowed_asset_codes 中实际存在的编号；"
                     "如系统存在多口径分歧或制度未落地需如实点明。严禁出现任何代码、SQL、物理表名或字段名。"
                 ),
                 {
@@ -514,8 +517,17 @@ def ask_business_copilot(
             )
             raw_answer = str(llm_args.get("answer") or "")
             follow_ups = llm_args.get("follow_up_questions") or follow_ups
+            cited_set = set(str(x) for x in (llm_args.get("cited_asset_codes") or []) if x)
+            if cited_set:
+                citations = (
+                    [c for c in citations if c["code"] in cited_set]
+                    + [c for c in citations if c["code"] not in cited_set]
+                )[:16]
+            else:
+                citations = citations[:16]
         else:
             raw_answer = _deterministic_business_narrative(clean_query, tool_outputs, backing_verdicts)
+            citations = citations[:16]
 
     # 强制去技术化二次检查（防任何漏网代码词）
     jargon_hits = detect_technical_jargon(raw_answer)

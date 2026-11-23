@@ -6,6 +6,8 @@
 
 import io
 import re
+import subprocess
+import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 from docx import Document
@@ -14,6 +16,7 @@ from openpyxl import load_workbook
 from app.infra.contracts import ExtractedClause
 from app.infra.errors import WorkflowError
 from app.infra.llm import call_llm_validated
+from app.infra.retrieval import infer_regulatory_regime
 from app.kernel.run import BudgetExceededError
 from app.policy.dc_bus import sanitize_business_text
 
@@ -134,7 +137,28 @@ def _infer_clause_kind(title: str, body: str, meta: Optional[Dict[str, Any]] = N
     # 长行政条文标题（非第五条大额标准）不当作单指标口径卡
     is_statute_article = bool(re.match(r"^第[一二三四六七八九十百0-9]+条", t))
     is_explicit_caliber_title = (
-        any(k in t for k in ("公式", "口径", "算式", "折算余额", "交易金额", "交易后余额", "大额交易报送标准", "授信额度", "30 万美元"))
+        any(
+            k in t
+            for k in (
+                "公式",
+                "口径",
+                "算式",
+                "折算余额",
+                "交易金额",
+                "交易后余额",
+                "大额交易报送标准",
+                "授信额度",
+                "30 万美元",
+                "比率",
+                "比例",
+                "充足率",
+                "不良率",
+                "头寸",
+                "限额",
+                "净额",
+                "计算方法",
+            )
+        )
         and not any(k in t for k in ("办法", "废止", "答记者问", "通知", "实施方案", "圈定规则", "统计口径管理"))
         and not is_statute_article
     )
@@ -197,7 +221,20 @@ def _infer_domain(chapter: str, title: str, body: str, meta: Optional[Dict[str, 
         return "应报未报漏报风险识别"
     if any(k in body for k in ("个人存款分户账", "个人存款交易流水")):
         return "个人存款分户账明细加工"
-    return "大额与可疑外汇交易报送"
+    # 仅显式命中 SAC / 反洗钱大额可疑交易规范特征时才归入「大额与可疑外汇交易报送」，避免误吞 1104 / PLUS / SAFE / 其他 EAST 主题
+    if any(
+        k in head_text.lower()
+        for k in ("大额交易", "可疑交易", "大额与可疑", "涉外外汇", "sac-deal-amount", "sac-account-balance", "sac-reporting-scope", "subject-scope", "deal-amount")
+    ) or any(k in body for k in ("大额和可疑交易报告", "大额与可疑外汇", "交易后余额是交易时点", "跨境联名账户")):
+        return "大额与可疑外汇交易报送"
+
+    candidate = re.sub(r"^(?:第[一二三四五六七八九十百0-9]+[章节条]\s*)", "", (meta.get("description") or chapter or "")).strip()
+    if (
+        4 <= len(candidate) <= 40
+        and candidate not in {"业务总则", "总则", "前言", "前言与编者按", "编者按", "引言", "正文", "目录"}
+    ):
+        return candidate
+    return "待AI归类监管业务域"
 
 
 def _extract_metrics_mentioned(text: str) -> List[str]:
@@ -215,6 +252,24 @@ def _extract_metrics_mentioned(text: str) -> List[str]:
 
 def _extract_raw_text(filename: str, content: bytes) -> str:
     lower = filename.lower()
+    if lower.endswith(".pdf"):
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
+            tmp.write(content)
+            tmp.flush()
+            try:
+                proc = subprocess.run(
+                    ["pdftotext", "-layout", tmp.name, "-"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=True,
+                )
+            except FileNotFoundError as exc:
+                raise ValueError("解析 PDF 监管文件需要本机安装 pdftotext（poppler）") from exc
+            except subprocess.CalledProcessError as exc:
+                raise ValueError(f"PDF 文本提取失败：{exc.stderr or exc}") from exc
+        cleaned_lines = [re.sub(r"[ \t]{3,}", "  ", ln.rstrip()) for ln in proc.stdout.splitlines()]
+        return "\n".join(cleaned_lines)
     if lower.endswith(".docx"):
         doc = Document(io.BytesIO(content))
         parts: List[str] = []
@@ -290,16 +345,23 @@ def _is_actionable_macro_clause(title: str, body: str) -> bool:
     return any(k in text for k in data_keywords)
 
 
-_GENERIC_DOC_DOMAINS = {"通用业务规范", "通用监管合规", "宏观监管要求", "业务总则"}
+_GENERIC_DOC_DOMAINS = {"通用业务规范", "通用监管合规", "宏观监管要求", "业务总则", "待AI归类监管业务域"}
 
 
 def survey_document_sections(filename: str, doc_tier: str, clauses: List[ExtractedClause]) -> Dict[str, Any]:
     """构建监管与制度文档的轻量级全局结构总览（供 Plan 阶段 AI 审视整体目录与域归属）。"""
     canonical_domains = list(dict.fromkeys(c.business_domain for c in clauses))
     total_chars = sum(len(c.business_requirement or "") for c in clauses)
+    regimes = [
+        (c.source_locator or {}).get("regime")
+        for c in clauses
+        if (c.source_locator or {}).get("regime") and (c.source_locator or {}).get("regime") != "通用监管"
+    ]
+    doc_regime = regimes[0] if regimes else infer_regulatory_regime(filename, *canonical_domains)
     return {
         "filename": filename,
         "doc_tier": doc_tier,
+        "regulatory_regime": doc_regime,
         "section_count": len(clauses),
         "total_chars": total_chars,
         "canonical_domains": canonical_domains,
@@ -712,6 +774,7 @@ def parse_regulatory_document(
         buf.append(line.lstrip("-• "))
     _flush()
 
+    doc_regime = infer_regulatory_regime(filename, default_chapter, text[:2000])
     clauses: List[ExtractedClause] = []
     for idx, sec in enumerate(sections):
         if doc_tier == "MACRO_POLICY" and not _is_actionable_macro_clause(sec["title"], sec["body"]):
@@ -732,6 +795,7 @@ def parse_regulatory_document(
                 metrics_mentioned=_extract_metrics_mentioned(f"{sec['title']} {sec['body']}"),
                 source_locator={
                     "filename": filename,
+                    "regime": doc_regime,
                     "section_index": idx,
                     "chapter": sec["chapter"],
                     "doc_tier": doc_tier,

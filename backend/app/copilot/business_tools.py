@@ -16,24 +16,25 @@ from app.catalog.views import (
     list_reconcile_ledger,
 )
 from app.copilot.disclosure import build_disclosure, format_disclosure_subjects
+from app.infra.retrieval import bm25_score_documents, infer_regulatory_regime
 from app.policy.dc_bus import sanitize_business_text
 
 BUSINESS_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "name": "list_covered_businesses",
-        "description": "盘点系统逻辑里已经包含的全部业务板块、规则数量与覆盖落地状态，用于回答“我们的逻辑里面包含了哪些业务”。",
+        "description": "盘点系统逻辑里已经包含的全部业务板块（含所属监管体系 1104/EAST/SAFE/PLUS 等）、规则数量与覆盖落地状态。",
     },
     {
         "name": "resolve_business_concept",
-        "description": "把业务人员的日常问法映射到对应的业务板块、处理规则或指标口径卡。",
+        "description": "把业务人员的日常问法映射到对应的监管业务板块、处理规则或指标口径卡。",
     },
     {
         "name": "get_business_scope_and_rules",
-        "description": "查询某项业务或规则下具体的纳入范围、剔除情形、分支处理与防重规则（纯业务语言）。",
+        "description": "查询某项业务或规则下具体的纳入范围、剔除情形、分支处理与防重规则（纯业务语言，支持跨监管体系按相关度排序）。",
     },
     {
         "name": "get_business_caliber_detail",
-        "description": "查询某个业务指标（如交易金额、交易后余额、联名账户余额等）的定义、算法口径与防混淆注意事项。",
+        "description": "查询某个业务指标（如同业存放、贷款五级分类、交易金额、交易后余额等）的定义、算法口径与防混淆注意事项。",
     },
     {
         "name": "verify_implementation_backing",
@@ -50,49 +51,43 @@ BUSINESS_TOOL_SCHEMAS: List[Dict[str, Any]] = [
 ]
 
 
-def _score_match(query: str, *fields: str) -> int:
-    q = (query or "").strip()
-    if not q:
-        return 0
-    hay = " ".join(f for f in fields if f)
-    if q in hay:
-        return 120
-    primary_field = " ".join(f for f in fields[:2] if f)
-    domain_keywords = (
-        "应报未报", "漏报", "补报", "结售汇", "购汇", "结汇", "资金来源", "资金使用",
-        "30万", "变动编号", "交易对手", "总账", "开户行", "个体工商户", "迁移",
-        "对公客户", "捞回", "境内外", "居民", "机构信息", "银行机构", "营业执照", "金融代码", "上级机构",
-        "授信额度", "授信", "测试客户", "测试", "虚拟", "港澳通行证", "信用卡",
-        "分户账", "个人存款", "客户归并", "交易后余额", "交易金额", "联名", "折算",
-        "离岸", "转口贸易", "延期", "个人卡", "对公", "统括", "去重",
-        "数字人民币", "一表通", "互联网贷款", "资产转让", "大额", "可疑", "外汇", "余额",
-    )
-    generic_keywords = ("报送", "范围", "纳入", "剔除", "排除", "重复", "合规", "分歧", "未包含")
-    score = 0
-    for w in domain_keywords:
-        if w in q and w in hay:
-            score += 65 if w in primary_field else 20
-    for w in generic_keywords:
-        if w in q and w in hay:
-            score += 8 if w in primary_field else 4
-    return score
-
-
 def _rule_intent_bonus(topic: str, rule: Dict[str, Any]) -> int:
     bonus = 0
     if any(k in topic for k in ("剔除", "排除", "不报", "跳过", "风险清单", "异常")):
         if rule.get("rule_category") == "EXCLUSION":
-            bonus += 45
+            bonus += 12
     if any(k in topic for k in ("分支", "差异", "不一致", "分歧", "并行", "冲突")):
         if rule.get("rule_category") == "BRANCH" or rule.get("reconcile_status") == "DIVERGENT":
-            bonus += 45
+            bonus += 12
     if any(k in topic for k in ("去重", "防重", "重复", "唯一")):
         if rule.get("rule_category") == "DEDUP":
-            bonus += 45
+            bonus += 12
     if any(k in topic for k in ("纳入", "范围", "门槛", "覆盖")):
         if rule.get("rule_category") == "INCLUSION":
-            bonus += 25
+            bonus += 6
     return bonus
+
+
+def _rank_by_bm25(
+    query: str,
+    items: List[Dict[str, Any]],
+    *,
+    field_weights: Dict[str, float],
+    extractor,
+    min_ratio: float = 0.35,
+    min_floor: float = 0.25,
+) -> List[Dict[str, Any]]:
+    if not items or not (query or "").strip():
+        return items
+    docs = [extractor(item) for item in items]
+    regimes = [str(item.get("regime") or "通用监管") for item in items]
+    scores = bm25_score_documents(query, docs, field_weights=field_weights, regimes=regimes)
+    max_sc = max(scores, default=0.0)
+    if max_sc <= 0.0:
+        return []
+    cutoff = max(min_floor, max_sc * min_ratio)
+    ranked = [item for item, sc in sorted(zip(items, scores), key=lambda x: x[1], reverse=True) if sc >= cutoff]
+    return ranked
 
 
 def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -106,6 +101,7 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
                 {
                     "code": c["code"],
                     "name": c["name"],
+                    "regime": c.get("regime", "通用监管"),
                     "description": sanitize_business_text(c["description"]),
                     "scope_summary": sanitize_business_text(c["scope_summary"]),
                     "coverage_status": c["coverage_status"],
@@ -120,6 +116,7 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
                 {
                     "code": c["code"],
                     "name": c["name"],
+                    "regime": c.get("regime", "通用监管"),
                     "description": sanitize_business_text(c["description"]),
                     "coverage_status": c["coverage_status"],
                 }
@@ -137,20 +134,39 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
         caps = list_capabilities(session)
         rules = list_business_rules(session)
         calibers = list_business_calibers(session)
-        matched_caps = sorted(
-            [c for c in caps if _score_match(query, c["name"], c["description"], c["scope_summary"]) > 0],
-            key=lambda x: _score_match(query, x["name"], x["description"], x["scope_summary"]),
-            reverse=True,
+        matched_caps = _rank_by_bm25(
+            query,
+            caps,
+            field_weights={"name": 2.6, "regime": 1.6, "description": 1.2, "scope_summary": 1.0},
+            extractor=lambda c: {
+                "name": c["name"],
+                "regime": c.get("regime", "通用监管"),
+                "description": c["description"],
+                "scope_summary": c["scope_summary"],
+            },
         )[:4]
-        matched_rules = sorted(
-            [r for r in rules if _score_match(query, r["title"], r["business_condition"], r["business_action"]) > 0],
-            key=lambda x: _score_match(query, x["title"], x["business_condition"], x["business_action"]),
-            reverse=True,
+        matched_rules = _rank_by_bm25(
+            query,
+            rules,
+            field_weights={"title": 2.4, "capability_name": 1.5, "regime": 1.4, "business_condition": 1.1, "business_action": 1.0},
+            extractor=lambda r: {
+                "title": r["title"],
+                "capability_name": r["capability_name"],
+                "regime": r.get("regime", "通用监管"),
+                "business_condition": r["business_condition"],
+                "business_action": r["business_action"],
+            },
         )[:5]
-        matched_cals = sorted(
-            [c for c in calibers if _score_match(query, c["metric_name"], c["business_definition"], " ".join(c["triggers"])) > 0],
-            key=lambda x: _score_match(query, x["metric_name"], x["business_definition"], " ".join(x["triggers"])),
-            reverse=True,
+        matched_cals = _rank_by_bm25(
+            query,
+            calibers,
+            field_weights={"metric_name": 2.8, "triggers": 2.0, "regime": 1.4, "business_definition": 1.0},
+            extractor=lambda c: {
+                "metric_name": c["metric_name"],
+                "triggers": " ".join(c["triggers"]),
+                "regime": c.get("regime", "通用监管"),
+                "business_definition": c["business_definition"],
+            },
         )[:4]
         res: Dict[str, Any] = {
             "tool": tool_name,
@@ -168,15 +184,30 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
         rules = list_business_rules(session, rule_category=category)
         total_matched = len(rules)
         if topic:
-            scored = []
-            for r in rules:
-                base_sc = _score_match(topic, r["title"], r["capability_name"], r["business_condition"], r["business_action"])
-                # 仅在命中主题关键词的前提下叠加意图加权，防止无关规则靠类别加分混入
-                total_sc = (base_sc + _rule_intent_bonus(topic, r)) if base_sc > 0 else 0
-                scored.append((r, base_sc, total_sc))
-            max_base = max((b for _, b, _ in scored), default=0)
-            cutoff = max(18, int(max_base * 0.45)) if max_base >= 20 else 1
-            filtered = [r for r, base_sc, _ in sorted(scored, key=lambda x: (x[2], x[1]), reverse=True) if base_sc >= cutoff]
+            docs = [
+                {
+                    "title": r["title"],
+                    "capability_name": r["capability_name"],
+                    "regime": r.get("regime", "通用监管"),
+                    "business_condition": r["business_condition"],
+                    "business_action": r["business_action"],
+                }
+                for r in rules
+            ]
+            regimes = [str(r.get("regime") or "通用监管") for r in rules]
+            base_scores = bm25_score_documents(
+                topic,
+                docs,
+                field_weights={"title": 2.5, "capability_name": 1.6, "regime": 1.5, "business_condition": 1.2, "business_action": 1.0},
+                regimes=regimes,
+            )
+            max_base = max(base_scores, default=0.0)
+            cutoff = max(0.25, max_base * 0.42) if max_base > 0.0 else 0.25
+            scored = [
+                (r, bsc, (bsc + _rule_intent_bonus(topic, r)) if bsc > 0.0 else 0.0)
+                for r, bsc in zip(rules, base_scores)
+            ]
+            filtered = [r for r, bsc, _ in sorted(scored, key=lambda x: (x[2], x[1]), reverse=True) if bsc >= cutoff]
             if filtered:
                 total_matched = len(filtered)
                 rules = filtered[:15]
@@ -195,6 +226,7 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
                     "code": r["code"],
                     "title": sanitize_business_text(r["title"]),
                     "capability_name": r["capability_name"],
+                    "regime": r.get("regime", "通用监管"),
                     "rule_category": r["rule_category"],
                     "business_condition": sanitize_business_text(r["business_condition"]),
                     "business_action": sanitize_business_text(r["business_action"]),
@@ -220,13 +252,18 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
         calibers = list_business_calibers(session)
         total_matched = len(calibers)
         if metric:
-            scored = [
-                (c, _score_match(metric, c["metric_name"], c["capability_name"], c["business_definition"], " ".join(c["triggers"])))
-                for c in calibers
-            ]
-            max_sc = max((sc for _, sc in scored), default=0)
-            cutoff = max(18, int(max_sc * 0.45)) if max_sc >= 20 else 1
-            hits = [c for c, sc in sorted(scored, key=lambda x: x[1], reverse=True) if sc >= cutoff]
+            hits = _rank_by_bm25(
+                metric,
+                calibers,
+                field_weights={"metric_name": 2.8, "triggers": 2.2, "capability_name": 1.6, "regime": 1.5, "business_definition": 1.0},
+                extractor=lambda c: {
+                    "metric_name": c["metric_name"],
+                    "triggers": " ".join(c["triggers"]),
+                    "capability_name": c["capability_name"],
+                    "regime": c.get("regime", "通用监管"),
+                    "business_definition": c["business_definition"],
+                },
+            )
             if hits:
                 total_matched = len(hits)
                 calibers = hits[:8]
@@ -245,6 +282,7 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
                     "code": c["code"],
                     "metric_name": sanitize_business_text(c["metric_name"]),
                     "capability_name": c["capability_name"],
+                    "regime": c.get("regime", "通用监管"),
                     "business_definition": sanitize_business_text(c["business_definition"]),
                     "formula_summary": sanitize_business_text(c["formula_summary"]),
                     "inclusion_scope": sanitize_business_text(c["inclusion_scope"]),
@@ -304,9 +342,16 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
         unrealized = [x for x in ledger["items"] if x["reconcile_status"] == "UNREALIZED"]
         verified = [x for x in ledger["items"] if x["reconcile_status"] in {"VERIFIED", "CONSISTENT"}]
         if topic:
-            divergent = [x for x in divergent if _score_match(topic, x["name"], x["capability_name"], x["summary"]) > 0]
-            unrealized = [x for x in unrealized if _score_match(topic, x["name"], x["capability_name"], x["summary"]) > 0]
-            verified = [x for x in verified if _score_match(topic, x["name"], x["capability_name"], x["summary"]) > 0][:15]
+            extractor = lambda x: {
+                "name": x["name"],
+                "capability_name": x["capability_name"],
+                "regime": x.get("regime", infer_regulatory_regime(x["capability_name"], x["name"])),
+                "summary": x["summary"],
+            }
+            fw = {"name": 2.5, "capability_name": 1.6, "regime": 1.4, "summary": 1.0}
+            divergent = _rank_by_bm25(topic, divergent, field_weights=fw, extractor=extractor)
+            unrealized = _rank_by_bm25(topic, unrealized, field_weights=fw, extractor=extractor)
+            verified = _rank_by_bm25(topic, verified, field_weights=fw, extractor=extractor)[:15]
         else:
             verified = verified[:15]
         out = {
