@@ -1101,6 +1101,26 @@ def _build_subdomain_batches(
     return batches
 
 
+def _resolve_refined_sub_domain(
+    candidate: str,
+    current_sd: str,
+    draft_sub_domains: List[str],
+    active_sub_domains: List[str],
+) -> str:
+    """约束 Stage 3 二级子专题颗粒度，避免单域被拆碎为每条规则一个子专题。"""
+    sd_val = sanitize_business_text(str(candidate or "").strip())
+    if not (2 <= len(sd_val) <= 24) or detect_technical_jargon(sd_val):
+        return current_sd
+    if sd_val in active_sub_domains or sd_val in draft_sub_domains:
+        if sd_val not in active_sub_domains:
+            active_sub_domains.append(sd_val)
+        return sd_val
+    if len(draft_sub_domains) < 2 and len(active_sub_domains) < 6:
+        active_sub_domains.append(sd_val)
+        return sd_val
+    return current_sd
+
+
 def _refine_domain_with_llm(
     draft: Dict[str, Any],
     *,
@@ -1116,14 +1136,17 @@ def _refine_domain_with_llm(
     allowed_ev_set = set(draft["ev_ids"])
     rule_by_code = {r["code"]: r for r in draft["rules"]}
     cal_by_code = {c["code"]: c for c in draft["calibers"]}
+    draft_sub_domains = [s["name"] for s in (draft.get("sub_domains") or [])[:6] if s.get("name")]
+    active_sub_domains = list(draft_sub_domains)
     any_ok = False
 
     instruction = (
         "结合监管制度条款与系统底层实证，在不编造未实证规则、不丢失原规则 code、"
         "且严禁出现任何物理表名、字段名（大小写）、文件名或 SQL 关键词的前提下，将本业务域的概述、"
         "适用边界、核心规则条件/结果/业务原因及指标口径提炼融合为清晰自然的中文业务表述。"
-        "同时可按需校准每条规则/口径的二级子专题 sub_domain（2~22字纯业务名词，不得含技术词）与金融十大主题 subject_theme"
-        f"（仅可取自：{'、'.join(FINANCIAL_SUBJECT_THEMES)}）。"
+        "二级子专题 sub_domain（2~22字纯业务名词，不得含技术词）应优先复用 allowed_sub_domains，单域子专题总数控制在 2~6 个，"
+        "禁止为单条规则各自另造新子专题名；金融十大主题 subject_theme"
+        f"（仅可取自：{'、'.join(FINANCIAL_SUBJECT_THEMES)}）按规则实际业务对象精准归类。"
         "请逐条核对 logic_evidences 与 draft_rules：凡系统实证已明确实现的扣减公式、审批/复核门禁、状态排除或覆盖机制，"
         "必须在融合描述与口径公式中如实肯定为“已落地”并写清具体业务口径，严禁把已实现逻辑误判为尚未落地；"
         "仅在确实存在多口径分歧或制度未落地缺口时如实点明。"
@@ -1133,6 +1156,7 @@ def _refine_domain_with_llm(
         payload = {
             "domain_name": draft["domain_name"],
             "sub_domain_focus": sub_domain_focus,
+            "allowed_sub_domains": draft_sub_domains,
             "batch_index": b_idx,
             "batch_total": len(batches),
             "coverage_status": draft["coverage_status"],
@@ -1207,9 +1231,12 @@ def _refine_domain_with_llm(
                 val = sanitize_business_text(str(item.get(field) or "").strip())
                 if val:
                     rule[field] = val
-            sd_val = sanitize_business_text(str(item.get("sub_domain") or "").strip())
-            if 2 <= len(sd_val) <= 24 and not detect_technical_jargon(sd_val):
-                rule["sub_domain"] = sd_val
+            rule["sub_domain"] = _resolve_refined_sub_domain(
+                item.get("sub_domain") or "",
+                rule.get("sub_domain") or "",
+                draft_sub_domains,
+                active_sub_domains,
+            )
             th_val = normalize_financial_theme(str(item.get("subject_theme") or ""))
             if th_val:
                 rule["subject_theme"] = th_val
@@ -1229,9 +1256,12 @@ def _refine_domain_with_llm(
                     val = sanitize_business_text(str(item.get(field) or "").strip())
                     if val:
                         cal[field] = val
-                sd_val = sanitize_business_text(str(item.get("sub_domain") or "").strip())
-                if 2 <= len(sd_val) <= 24 and not detect_technical_jargon(sd_val):
-                    cal["sub_domain"] = sd_val
+                cal["sub_domain"] = _resolve_refined_sub_domain(
+                    item.get("sub_domain") or "",
+                    cal.get("sub_domain") or "",
+                    draft_sub_domains,
+                    active_sub_domains,
+                )
                 th_val = normalize_financial_theme(str(item.get("subject_theme") or ""))
                 if th_val:
                     cal["subject_theme"] = th_val

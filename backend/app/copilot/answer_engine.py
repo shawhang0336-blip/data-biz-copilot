@@ -230,6 +230,20 @@ def _collect_disclosures_and_citations(
             _append_citation("RULE", str(rule.get("code") or ""), rule["title"], rule.get("reconcile_status", "VERIFIED"))
         for cal in out.get("calibers") or []:
             _append_citation("CALIBER", str(cal.get("code") or ""), cal["metric_name"], cal.get("reconcile_status", "VERIFIED"))
+
+    has_query_match = any(
+        out.get("tool")
+        in {
+            "get_business_scope_and_rules",
+            "get_business_caliber_detail",
+            "resolve_business_concept",
+            "find_rules_by_business_role",
+        }
+        and bool((out.get("rules") or []) or (out.get("calibers") or []) or (out.get("capabilities") or []))
+        for out in tool_outputs
+    )
+    if has_query_match:
+        disclosures = [d for d in disclosures if d.get("kind") != "not_found"]
     return disclosures, citations
 
 

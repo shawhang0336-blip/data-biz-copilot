@@ -990,3 +990,54 @@ def test_dual_taxonomy_subdomains_subject_themes_migration_batching_and_cross_re
     cross_qa = ask_business_copilot(s_api, "在所有监管报表里，涉及「授信与押品」主题的剔除与扣减口径有哪些？", settings=settings)
     assert cross_qa["verification"]["de_jargon_passed"] is True
     assert cross_qa["verification"]["residual_jargon"] == []
+
+    # 5) 规则已命中 + 口径空时不误置顶 not_found；全空仍保留 not_found；Stage3 不得将多规则碎裂超过 6 个子专题
+    from app.copilot.answer_engine import _collect_disclosures_and_citations
+    mixed_disc, mixed_cites = _collect_disclosures_and_citations(
+        [
+            {"tool": "get_business_scope_and_rules", "rules": [{"code": "rule-1", "title": "五级分类纳入", "reconcile_status": "VERIFIED"}]},
+            {"tool": "get_business_caliber_detail", "calibers": [], "disclose": True, "disclose_kind": "not_found", "disclose_text": DISCLOSURE_TEXT["not_found"]},
+        ]
+    )
+    assert mixed_cites
+    assert all(d["kind"] != "not_found" for d in mixed_disc)
+
+    empty_disc, empty_cites = _collect_disclosures_and_citations(
+        [
+            {"tool": "get_business_caliber_detail", "calibers": [], "disclose": True, "disclose_kind": "not_found", "disclose_text": DISCLOSURE_TEXT["not_found"]},
+        ]
+    )
+    assert not empty_cites
+    assert any(d["kind"] == "not_found" for d in empty_disc)
+
+    class _FragmentingLlm:
+        model = "deepseek-flash"
+
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            if tool_name == "synthesize_domain_assets":
+                out_rules = []
+                for idx, r in enumerate(payload.get("draft_rules") or []):
+                    out_rules.append(
+                        {
+                            "code": r["code"],
+                            "title": r["title"],
+                            "rule_category": r["rule_category"],
+                            "sub_domain": f"自定义细碎专题{idx}",
+                            "subject_theme": r["subject_theme"],
+                            "business_condition": r["business_condition"],
+                            "business_action": r["business_action"],
+                            "business_rationale": r["business_rationale"],
+                            "evidence_ids": r.get("evidence_ids") or [],
+                        }
+                    )
+                return {
+                    "description": "测试子专题防碎裂",
+                    "scope_summary": "测试子专题收敛",
+                    "rules": out_rules,
+                    "calibers": [],
+                }, {"provider": "test", "model": "deepseek-flash"}
+            return {}, {"provider": "test", "model": "deepseek-flash"}
+
+    synthesize_business_assets(s_api, settings=settings, llm=_FragmentingLlm())
+    g01_after = [c for c in get_asset_panorama(s_api)["capabilities"] if "1104" in c["name"]]
+    assert g01_after and len(g01_after[0]["sub_domains"]) <= 6
