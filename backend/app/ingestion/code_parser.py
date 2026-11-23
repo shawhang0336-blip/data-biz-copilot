@@ -673,6 +673,7 @@ def parse_code_logic(
     script_regime = infer_regulatory_regime(filename, banner, text[:2000])
     raw_chunks = split_sql_chunks(text)
     evidences: List[ExtractedLogicEvidence] = []
+    step_sql_contexts: List[Dict[str, Any]] = []
     comments_pool: List[str] = []
     any_sac = False
     single_generic_info: Optional[Tuple[Dict[str, Any], List[str], Dict[str, Any]]] = None
@@ -745,6 +746,7 @@ def parse_code_logic(
             },
         )
         evidences.append(ev)
+        step_sql_contexts.append(dict(skeleton.get("logic_details") or {}))
 
     if llm is not None and bus is not None and evidences:
         if len(evidences) >= 2:
@@ -756,10 +758,18 @@ def parse_code_logic(
                 is_sac_script=any_sac,
                 llm=llm,
                 bus=bus,
+                step_sql_contexts=step_sql_contexts,
             )
         elif not any_sac and single_generic_info is not None:
             sk, cm, gen = single_generic_info
-            translated = translate_evidence_with_llm(sk, cm, gen, llm=llm, bus=bus)
+            translated = translate_evidence_with_llm(
+                sk,
+                cm,
+                gen,
+                llm=llm,
+                bus=bus,
+                sql_context=step_sql_contexts[0],
+            )
             ev0 = evidences[0]
             ev0.business_domain_hint = translated["business_domain_hint"]
             ev0.target_concept_hint = translated["target_concept_hint"]
@@ -780,5 +790,7 @@ def parse_code_logic(
                 comments_pool,
                 llm=llm,
                 bus=bus,
+                step_sql_contexts=step_sql_contexts,
+                is_sac_script=any_sac,
             )
     return evidences

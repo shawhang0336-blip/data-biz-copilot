@@ -21,7 +21,7 @@ from app.infra.db_tables import (
     SourceMaterialModel,
 )
 from app.infra.errors import WorkflowError
-from app.infra.retrieval import tokenize_for_search
+from app.infra.retrieval import infer_regulatory_regime, tokenize_for_search
 from app.infra.llm import (
     RealDesignLlm,
     call_llm_validated,
@@ -551,6 +551,25 @@ def _upsert_caliber(
     return row
 
 
+def _summarize_evidence_rules(ev: LogicEvidenceModel, limit: int = 6) -> List[str]:
+    items: List[str] = []
+    for label, col in (
+        ("纳入", ev.inclusion_predicates_json),
+        ("排除", ev.exclusion_predicates_json),
+        ("分支", ev.branch_cases_json),
+    ):
+        for rule in col or []:
+            if not isinstance(rule, dict):
+                continue
+            title = sanitize_business_text(str(rule.get("title") or "")).strip()
+            cond = sanitize_business_text(str(rule.get("condition") or "")).strip()[:120]
+            if title or cond:
+                items.append(f"[{label}] {title}: {cond}".strip(": "))
+            if len(items) >= limit:
+                return items
+    return items
+
+
 def _safe_rule_slug(raw_code: str, prefix: str) -> str:
     """将规则编号归一化为短标识；若超长或命中技术黑话词（如 exists/number），改写为安全哈希编号。"""
     slug = re.sub(r"[^a-z0-9-]+", "-", str(raw_code or "").lower().replace("_", "-")).strip("-")
@@ -592,6 +611,8 @@ def _build_domain_draft(
 
     rule_drafts: List[Dict[str, Any]] = []
     seen_rule_codes = set()
+    dedup_hints: List[str] = []
+    dedup_ev_ids: List[str] = []
     # 1) 从底层实证提炼已实现/冲突规则
     for ev in d_evs:
         for item in ev.inclusion_predicates_json or []:
@@ -667,26 +688,34 @@ def _build_domain_draft(
             )
 
         if ev.dedup_grain_hint:
-            rc = f"rule-{cap_code[4:]}-dedup-{hashlib.md5(ev.dedup_grain_hint.encode('utf-8')).hexdigest()[:6]}"
-            if rc not in seen_rule_codes:
-                seen_rule_codes.add(rc)
-                matched_clauses = _match_relevant_clauses(
-                    ev.dedup_grain_hint, d_clauses, {"INCLUSION", "CAPABILITY"}
-                )
-                rule_drafts.append(
-                    {
-                        "code": rc,
-                        "title": "唯一记录防重保留规则",
-                        "rule_category": "DEDUP",
-                        "business_condition": "同一客户、账户或交易在系统加工过程中出现多条状态记录时",
-                        "business_action": ev.dedup_grain_hint,
-                        "business_rationale": "保障报送金额与交易笔数准确唯一，防止同一业务被重复计数。",
-                        "reconcile_status": "VERIFIED" if matched_clauses else "CONSISTENT",
-                        "evidence_ids": [ev.id],
-                        "clause_ids": matched_clauses,
-                        "audience": audience,
-                    }
-                )
+            clean_hint = sanitize_business_text(ev.dedup_grain_hint).strip()
+            if clean_hint and clean_hint not in dedup_hints:
+                dedup_hints.append(clean_hint)
+            if ev.id not in dedup_ev_ids:
+                dedup_ev_ids.append(ev.id)
+
+    if dedup_hints:
+        combined_dedup = "；".join(dedup_hints)
+        rc = f"rule-{cap_code[4:]}-dedup-{hashlib.md5(combined_dedup.encode('utf-8')).hexdigest()[:6]}"
+        if rc not in seen_rule_codes:
+            seen_rule_codes.add(rc)
+            matched_clauses = _match_relevant_clauses(
+                combined_dedup, d_clauses, {"INCLUSION", "CAPABILITY"}
+            )
+            rule_drafts.append(
+                {
+                    "code": rc,
+                    "title": "唯一记录防重保留规则",
+                    "rule_category": "DEDUP",
+                    "business_condition": "同一客户、账户或交易在系统加工过程中出现多条状态记录或重复执行时",
+                    "business_action": combined_dedup,
+                    "business_rationale": "保障报送金额与交易笔数准确唯一，防止同一业务被重复计数。",
+                    "reconcile_status": "VERIFIED" if matched_clauses else "CONSISTENT",
+                    "evidence_ids": dedup_ev_ids,
+                    "clause_ids": matched_clauses,
+                    "audience": audience,
+                }
+            )
 
     # 2) 制度里有要求但当前代码尚未包含的领域：落 UNREALIZED 规则提示差距
     if not d_evs:
@@ -746,7 +775,23 @@ def _build_domain_draft(
             or bool(metric_tokens and (metric_tokens & set(tokenize_for_search(f"{e.target_concept_hint} {e.calculation_summary} {e.source_summary}"))))
         ]
         if not matching_evs and d_evs:
-            matching_evs = [d_evs[0]]
+            matching_evs = list(d_evs)
+
+        def _ev_caliber_priority(ev: LogicEvidenceModel) -> Tuple[int, int, int, int, int]:
+            loc = ev.internal_locator_json or {}
+            text_blob = f"{ev.target_concept_hint} {ev.calculation_summary} {ev.source_summary}"
+            is_conflict_match = 1 if (
+                ev.calculation_kind == "CONFLICT"
+                and ("联名" in metric_name or "对手" in cl.clause_title or "对手" in cl.business_requirement or "分歧" in text_blob)
+            ) else 0
+            calc_rank = {"CONFLICT": 4, "AGGREGATE": 3, "CONDITIONAL": 2, "DIRECT": 1}.get(ev.calculation_kind, 0)
+            token_hits = len(metric_tokens & set(tokenize_for_search(text_blob))) if metric_tokens else 0
+            stage_role_calc = 1 if str(loc.get("stage_role") or "") == "CALCULATION" else 0
+            ai_lead_score = 2 if (loc.get("ai_refined") and loc.get("stage_lead")) else (1 if loc.get("ai_refined") else 0)
+            chunk_idx = int(loc.get("chunk_index") or 0)
+            return (is_conflict_match, calc_rank, token_hits, stage_role_calc + ai_lead_score, chunk_idx)
+
+        matching_evs.sort(key=_ev_caliber_priority, reverse=True)
         ev_for_cal = [e.id for e in matching_evs]
         is_conflict = any(e.calculation_kind == "CONFLICT" for e in matching_evs) and (
             "联名" in metric_name or "对手" in cl.clause_title or "对手" in cl.business_requirement
@@ -770,6 +815,21 @@ def _build_domain_draft(
                 formula_summary = matching_evs[0].calculation_summary
             conflict_notes = ""
 
+        domain_exclusions = [r["title"] for r in rule_drafts if r["rule_category"] == "EXCLUSION" and r.get("title")]
+        if domain_exclusions:
+            exclusion_notes = "当期自动排除以下情形：" + "；".join(dict.fromkeys(domain_exclusions[:3])) + "。"
+        elif "应报未报" in domain_name or "大额与可疑外汇交易" in domain_name:
+            exclusion_notes = "若属于应报未报待补报账户或已撤回/已报送记录，不计入当期常规报送结果。"
+        else:
+            exclusion_notes = "符合当期剔除规则或例外排除条件的业务记录不计入本口径统计。"
+
+        if "交易后余额" in metric_name:
+            distinction_notes = "重要区分：交易后余额是交易时点静态快照，严禁与日均余额混用。"
+        elif "余额" in metric_name:
+            distinction_notes = "请按当期真实核算时点与净额/全额口径区分使用，避免与日均余额或未扣减质押冻结前的毛额混用。"
+        else:
+            distinction_notes = "请勿将该口径与跨业务阶段汇总指标混用。"
+
         caliber_drafts.append(
             {
                 "code": cal_code,
@@ -777,12 +837,8 @@ def _build_domain_draft(
                 "business_definition": sanitize_business_text(cl.business_requirement),
                 "formula_summary": formula_summary,
                 "inclusion_scope": f"适用业务范围：{domain_name}（随当期主体圈定与有效状态规则一并生效）",
-                "exclusion_notes": "若属于应报未报待补报账户或已撤回/已报送记录，不计入当期常规报送结果。",
-                "distinction_notes": (
-                    "重要区分：交易后余额是交易时点静态快照，严禁与日均余额混用。"
-                    if "余额" in metric_name
-                    else "请勿将该口径与跨业务阶段汇总指标混用。"
-                ),
+                "exclusion_notes": exclusion_notes,
+                "distinction_notes": distinction_notes,
                 "triggers": [metric_name, sanitize_business_text(cl.clause_title)],
                 "reconcile_status": r_status,
                 "conflict_notes": conflict_notes,
@@ -830,7 +886,9 @@ def _build_domain_draft(
             "target_concept": sanitize_business_text(e.target_concept_hint),
             "source_summary": sanitize_business_text(e.source_summary)[:240],
             "calculation_kind": e.calculation_kind,
-            "calculation_summary": sanitize_business_text(e.calculation_summary)[:200],
+            "calculation_summary": sanitize_business_text(e.calculation_summary)[:240],
+            "dedup_grain": sanitize_business_text(e.dedup_grain_hint or "")[:160],
+            "key_rules": _summarize_evidence_rules(e, limit=6),
         }
         for e in d_evs[:15]
     ]
@@ -884,7 +942,7 @@ def _refine_domain_with_llm(
                 "business_rationale": r["business_rationale"],
                 "evidence_ids": r["evidence_ids"],
             }
-            for r in draft["rules"][:12]
+            for r in draft["rules"][:18]
         ],
         "draft_calibers": [
             {
@@ -905,9 +963,11 @@ def _refine_domain_with_llm(
             "synthesize_domain_assets",
             (
                 "结合监管制度条款与系统底层实证，在不编造未实证规则、不丢失原规则 code、"
-                "且严禁出现任何物理表名、字段名、文件名或 SQL 关键词的前提下，将本业务域的概述、"
+                "且严禁出现任何物理表名、字段名（大小写）、文件名或 SQL 关键词的前提下，将本业务域的概述、"
                 "适用边界、核心规则条件/结果/业务原因及指标口径提炼融合为清晰自然的中文业务表述。"
-                "如底层存在多口径分歧或制度未落地缺口，必须如实点明。"
+                "请逐条核对 logic_evidences 与 draft_rules：凡系统实证已明确实现的扣减公式、审批/复核门禁、状态排除或覆盖机制，"
+                "必须在融合描述与口径公式中如实肯定为“已落地”并写清具体业务口径，严禁把已实现逻辑误判为尚未落地；"
+                "仅在确实存在多口径分歧或制度未落地缺口时如实点明。"
             ),
             payload,
             backoff=(0.1, 0.2),
@@ -964,6 +1024,77 @@ def _refine_domain_with_llm(
     return draft, True
 
 
+_DOMAIN_PREFIX_RE = re.compile(
+    r"^(?:1104|EAST(?:\s*5\.0|5|4)?|SAFE|FAL|BOP|PLUS|SAC|一表通|G\d{2}|S\d{2}|GF\d{2}|SF\d{2})[-－—·:：\s]*",
+    re.IGNORECASE,
+)
+
+
+def _normalize_domain_core(name: str) -> str:
+    """去除监管体系前缀、括号后缀及空白，提取业务域核心语义名称用于跨源精准对齐。"""
+    core = re.sub(r"[（(].*$", "", str(name or "")).strip()
+    while True:
+        stripped = _DOMAIN_PREFIX_RE.sub("", core).strip()
+        if stripped == core:
+            break
+        core = stripped
+    return re.sub(r"\s+", "", core).strip()
+
+
+def _align_evidence_domain_to_clauses(
+    ev: LogicEvidenceModel,
+    doc_domains: List[str],
+    doc_domain_regimes: Dict[str, str],
+) -> str:
+    """在严守监管体系同源与高相似度前提下，将代码实证域安全对齐到对应监管制度域，防止同类微差拆成假未落地。"""
+    ev_domain = ev.business_domain_hint
+    if ev_domain in doc_domains:
+        return ev_domain
+
+    ev_loc = ev.internal_locator_json or {}
+    ev_regime = str(ev_loc.get("regime") or "").strip() or infer_regulatory_regime(
+        ev_domain,
+        ev.target_concept_hint,
+        ev.source_summary,
+    )
+    ev_core = _normalize_domain_core(ev_domain)
+    ev_tokens = set(tokenize_for_search(ev_core or ev_domain))
+
+    best_domain = ev_domain
+    best_score = 0.0
+
+    for doc_domain in doc_domains:
+        doc_regime = doc_domain_regimes.get(doc_domain) or "通用监管"
+        if ev_regime != "通用监管" and doc_regime != "通用监管" and ev_regime != doc_regime:
+            continue
+
+        doc_core = _normalize_domain_core(doc_domain)
+        score = 0.0
+        if len(ev_core) >= 4 and len(doc_core) >= 4:
+            if ev_core == doc_core:
+                score = 1.0
+            elif ev_core in doc_core or doc_core in ev_core:
+                ratio = min(len(ev_core), len(doc_core)) / max(len(ev_core), len(doc_core))
+                if ratio >= 0.55:
+                    score = 0.90
+
+        if score < 0.50 and ev_tokens:
+            doc_tokens = set(tokenize_for_search(doc_core or doc_domain))
+            if doc_tokens:
+                overlap = len(ev_tokens & doc_tokens)
+                if overlap >= 3:
+                    jaccard = overlap / len(ev_tokens | doc_tokens)
+                    contain = overlap / min(len(ev_tokens), len(doc_tokens))
+                    if jaccard >= 0.50 or (contain >= 0.72 and jaccard >= 0.35):
+                        score = max(score, 0.50 + 0.30 * jaccard)
+
+        if score > best_score:
+            best_score = score
+            best_domain = doc_domain
+
+    return best_domain if best_score >= 0.50 else ev_domain
+
+
 def synthesize_business_assets(
     session: Session,
     *,
@@ -990,20 +1121,42 @@ def synthesize_business_assets(
         bus=bus,
     )
 
-    domains_order: List[str] = []
+    doc_domains: List[str] = []
+    doc_clauses_by_domain: Dict[str, List[RegulatoryClauseModel]] = {}
     for cl in clauses:
-        if cl.business_domain not in domains_order:
-            domains_order.append(cl.business_domain)
-    for ev in evidences:
-        if ev.business_domain_hint not in domains_order:
-            domains_order.append(ev.business_domain_hint)
+        if cl.business_domain not in doc_clauses_by_domain:
+            doc_domains.append(cl.business_domain)
+            doc_clauses_by_domain[cl.business_domain] = []
+        doc_clauses_by_domain[cl.business_domain].append(cl)
 
-    domain_clauses: Dict[str, List[RegulatoryClauseModel]] = {d: [] for d in domains_order}
-    domain_evidences: Dict[str, List[LogicEvidenceModel]] = {d: [] for d in domains_order}
-    for cl in clauses:
-        domain_clauses[cl.business_domain].append(cl)
+    doc_domain_regimes: Dict[str, str] = {}
+    for d in doc_domains:
+        clause_regimes = [
+            str((c.source_locator_json or {}).get("regime") or "").strip()
+            for c in doc_clauses_by_domain[d]
+            if (c.source_locator_json or {}).get("regime")
+        ]
+        if clause_regimes and clause_regimes[0] != "通用监管":
+            doc_domain_regimes[d] = clause_regimes[0]
+        else:
+            doc_domain_regimes[d] = infer_regulatory_regime(
+                d,
+                " ".join(c.clause_title for c in doc_clauses_by_domain[d][:3]),
+            )
+
+    domains_order: List[str] = list(doc_domains)
+    domain_clauses: Dict[str, List[RegulatoryClauseModel]] = {
+        d: list(doc_clauses_by_domain[d]) for d in doc_domains
+    }
+    domain_evidences: Dict[str, List[LogicEvidenceModel]] = {d: [] for d in doc_domains}
+
     for ev in evidences:
-        domain_evidences[ev.business_domain_hint].append(ev)
+        target_domain = _align_evidence_domain_to_clauses(ev, doc_domains, doc_domain_regimes)
+        if target_domain not in domains_order:
+            domains_order.append(target_domain)
+            domain_clauses[target_domain] = []
+            domain_evidences[target_domain] = []
+        domain_evidences[target_domain].append(ev)
 
     append_event(
         session,

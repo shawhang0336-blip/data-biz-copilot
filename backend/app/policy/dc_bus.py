@@ -16,12 +16,19 @@ from app.kernel.run import BudgetGuard, BudgetLimits
 # 仅面向技术/工程对象的词汇与标识符模式（严禁出现在对外业务表述中）
 # 注意：使用 ASCII 边界 (?<![A-Za-z0-9_]) / (?![A-Za-z0-9_])，因为 Python \b 把中文字符也视作 \w 会漏检“处理SF_SAC_...”
 _SQL_KEYWORDS_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:SELECT|FROM|WHERE|INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|CROSS\s+JOIN|"
+    r"(?:(?<![A-Za-z0-9_])(?:SELECT|FROM|WHERE|INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|CROSS\s+JOIN|"
     r"JOIN|GROUP\s+BY|ORDER\s+BY|HAVING|CASE\s+WHEN|NOT\s+EXISTS|EXISTS|ROW_NUMBER|"
     r"PARTITION\s+BY|TRUNCATE|MERGE\s+INTO|INSERT\s+INTO|DELETE\s+FROM|UNION\s+ALL|"
+    r"WHEN\s+MATCHED|WHEN\s+NOT\s+MATCHED|UPDATE\s+SET|"
     r"VARCHAR2?|NUMBER|NVL|COALESCE|DECODE|IS\s+NULL|IS\s+NOT\s+NULL|SELECT\s+DISTINCT|"
-    r"EXECUTE\s+IMMEDIATE|BETWEEN)(?![A-Za-z0-9_])",
+    r"EXECUTE\s+IMMEDIATE|BETWEEN)(?![A-Za-z0-9_])|"
+    r"(?<![A-Za-z0-9_])(?:SUM|COUNT|AVG|MAX|MIN)\s*\()",
     re.IGNORECASE,
+)
+
+# 仅用于业务输出字符串值扫描与清洗（严禁纳入 detect_technical_jargon，避免误伤序列化 JSON 的 snake_case 字段键名）
+_LOWER_SNAKE_IDENT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])[a-z][a-z0-9]{1,}_[a-z0-9_]{2,}(?![A-Za-z0-9_])"
 )
 
 _PHYSICAL_IDENT_RE = re.compile(
@@ -194,6 +201,7 @@ def sanitize_business_text(text: str) -> str:
         cleaned = re.sub(pat, repl, cleaned, flags=re.IGNORECASE)
     cleaned = _SQL_KEYWORDS_RE.sub("", cleaned)
     cleaned = _PHYSICAL_IDENT_RE.sub("相关业务数据项", cleaned)
+    cleaned = _LOWER_SNAKE_IDENT_RE.sub("相关业务数据项", cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     cleaned = re.sub(r"\s+([，。；：、）])", r"\1", cleaned)
     return cleaned.strip()
@@ -229,6 +237,10 @@ def de_jargon_adjudicator(
         for hit in detect_technical_jargon(txt):
             if hit not in found:
                 found.append(hit)
+        for match in _LOWER_SNAKE_IDENT_RE.finditer(txt):
+            token = match.group(0).strip()
+            if token and token not in found:
+                found.append(token)
     if found:
         return (
             f"去技术化门禁拦截：业务输出中禁止出现代码、SQL 或物理表/字段名称 {found[:6]}，"

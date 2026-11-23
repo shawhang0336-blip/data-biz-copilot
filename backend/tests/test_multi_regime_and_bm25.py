@@ -317,3 +317,458 @@ def test_multi_regime_1104_east_safe_plus_coexist_without_sac_bias_and_answer_vi
     # 完全不相关金融词仍可靠返回 not_found 披露，不被 BM25 噪音频召回
     ans_unmatched = ask_business_copilot(session, "期货期权保证金日间强平规则是什么？", settings=settings)
     assert DISCLOSURE_TEXT["not_found"] in ans_unmatched["answer"]
+
+
+def test_sql_logic_details_in_memory_feeding_jargon_gate_and_multistep_caliber_priority(tmp_path):
+    """验证 SQL AST 真实细节仅内存喂给 Stage2 翻译、不落库且不进 Plan；小写列名被拦截；多步口径优先选 AGGREGATE。"""
+    from app.infra.db_tables import LogicEvidenceModel
+    from app.ingestion.ast_extractor import extract_sql_ast_skeleton
+    from app.policy.dc_bus import build_run_bus
+
+    # 1) 验证四大监管典型 SQL 的真实 AST logic_details 抽取
+    sk_1104 = extract_sql_ast_skeleton(
+        "INSERT INTO RPT_1104_G01 (ACCT_NO, NET_BAL) "
+        "SELECT a.ACCT_NO, SUM(a.BOOK_BAL - a.PLEDGE_AMT) AS NET_BAL "
+        "FROM CORE_INTERBANK_ACCT a "
+        "WHERE a.STATUS <> 'TEST' "
+        "  AND NOT EXISTS (SELECT 1 FROM CORE_INTERNAL_CLEAR c WHERE c.ACCT_NO = a.ACCT_NO) "
+        "GROUP BY a.ACCT_NO;"
+    )
+    det_1104 = sk_1104["logic_details"]
+    assert any("BOOK_BAL - a.PLEDGE_AMT" in expr or "BOOK_BAL - PLEDGE_AMT" in expr for expr in det_1104["select_expressions"])
+    assert any("STATUS <> 'TEST'" in p for p in det_1104["where_predicates"])
+    assert any("NOT EXISTS" in p for p in det_1104["where_predicates"])
+
+    sk_east = extract_sql_ast_skeleton(
+        "SELECT l.LOAN_ID, SUM(l.PRINCIPAL_BAL) AS BAL FROM CORE_CORP_LOAN l "
+        "WHERE l.GRADE_CODE IN ('3', '4', '5') AND l.WRITE_OFF_FLAG <> 'Y' GROUP BY l.LOAN_ID;"
+    )
+    assert any("GRADE_CODE IN ('3', '4', '5')" in p for p in sk_east["logic_details"]["where_predicates"])
+    assert any("WRITE_OFF_FLAG <> 'Y'" in p for p in sk_east["logic_details"]["where_predicates"])
+
+    sk_safe = extract_sql_ast_skeleton(
+        "SELECT t.DECL_ID FROM FX_INWARD_REMIT t WHERE t.CUST_KIND = 'ORG' OR t.USD_AMT > 5000;"
+    )
+    assert any("CUST_KIND = 'ORG' OR" in p and "5000" in p for p in sk_safe["logic_details"]["where_predicates"])
+
+    sk_plus = extract_sql_ast_skeleton(
+        "MERGE INTO RPT_PLUS_FINAL dst "
+        "USING (SELECT REC_KEY, FINAL_AMT FROM PLUS_MANUAL_INPUT WHERE AUDIT_STATUS = 'APPROVED') src "
+        "ON (dst.REC_KEY = src.REC_KEY) "
+        "WHEN MATCHED THEN UPDATE SET dst.FINAL_AMT = src.FINAL_AMT;"
+    )
+    md_plus = sk_plus["logic_details"]["merge_details"]
+    assert "REC_KEY" in md_plus["on_condition"]
+    assert any("AUDIT_STATUS = 'APPROVED'" in w for w in sk_plus["logic_details"]["where_predicates"])
+    assert any("UPDATE" in wc.upper() for wc in md_plus["when_clauses"])
+
+    # 2) 验证 Bus 能拦截小写蛇形字段名（redeem_units / audit_status）与 SUM(/WHEN MATCHED
+    bus = build_run_bus({"max_llm_calls": 30, "max_retries": 3, "max_total_tokens": 200000})
+    rej_snake = bus.adjudicate(
+        "translate_logic_evidence",
+        {"source_summary": "按 redeem_units 与 audit_status 判断是否入选。"},
+        {},
+    )
+    assert rej_snake is not None and "redeem_units" in rej_snake
+    rej_sum = bus.adjudicate(
+        "translate_logic_evidence",
+        {"calculation_summary": "直接执行 SUM(余额) 后输出并 WHEN MATCHED 更新。"},
+        {},
+    )
+    assert rej_sum is not None
+
+    # 3) 多步 1104 G01 SQL + PLUS MERGE 单步 SQL：验证 Plan 零泄漏、Extract 收到 sql_logic_context、
+    #    内部库不落 sql_snippet/logic_details、且冗余 GEN_* 被清理、口径卡片选中 AGGREGATE 扣减公式且无 SAC 硬编码
+    class _InspectionLlm:
+        model = "deepseek-flash"
+
+        def __init__(self) -> None:
+            self.plan_payloads = []
+            self.extract_payloads = []
+
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            if tool_name == "plan_code_structure":
+                self.plan_payloads.append(payload)
+                steps = payload.get("steps") or []
+                return {
+                    "business_overview": "先剔除测试与系统内清算账户，再按净额扣减已质押存单汇总同业存放。",
+                    "canonical_domain": "1104 G01 同业存放与拆放核算",
+                    "chunk_groups": [
+                        {
+                            "group_id": 0,
+                            "stage_title": "有效同业账户筛选阶段",
+                            "business_domain": "1104 G01 同业存放与拆放核算",
+                            "stage_role": "SCOPE_FILTER",
+                            "step_indices": [0],
+                            "stage_purpose": "剔除测试户与系统内清算过渡户",
+                        },
+                        {
+                            "group_id": 1,
+                            "stage_title": "净额扣减汇总核算阶段",
+                            "business_domain": "1104 G01 同业存放与拆放核算",
+                            "stage_role": "CALCULATION",
+                            "step_indices": [s["step_index"] for s in steps[1:]] or [0],
+                            "stage_purpose": "按账面余额扣减质押存单输出同业存放净额",
+                        },
+                    ],
+                }, {"provider": "test", "model": "deepseek-flash"}
+
+            if tool_name == "translate_logic_evidence":
+                self.extract_payloads.append(payload)
+                ctx_json = json.dumps(payload.get("sql_logic_context") or {}, ensure_ascii=False)
+                stage_role = (payload.get("code_plan") or {}).get("stage_role")
+                if "AUDIT_STATUS" in ctx_json:
+                    return {
+                        "business_domain_hint": "PLUS 手工补录与人工覆盖规范",
+                        "target_concept_hint": "审核通过人工补录覆盖",
+                        "source_summary": "仅提取经合规复核确认通过的人工补录台账记录，按唯一业务标识覆盖原自动采集结果。",
+                        "calculation_summary": "复核通过后按最新人工确认金额覆盖原记录，未审批记录不生效。",
+                        "inclusions": [
+                            {
+                                "rule_code": "PLUS_APPROVED_ONLY",
+                                "title": "仅纳入审核通过的手工补录记录",
+                                "condition": "手工补录台账的复核审批状态明确为已通过",
+                                "rationale": "确保未经审批确认的手工修改不会覆盖正式监管台账。",
+                            }
+                        ],
+                        "exclusions": [],
+                        "branches": [],
+                        "dedup_grain_hint": "按唯一业务记录标识覆盖匹配台账，确保同一记录幂等生效。",
+                    }, {"provider": "test", "model": "deepseek-flash"}
+                if stage_role == "CALCULATION":
+                    return {
+                        "business_domain_hint": "1104 G01 同业存放与拆放核算",
+                        "target_concept_hint": "同业存放净额",
+                        "source_summary": "承接有效同业存放明细，按账户属性分组汇总净额。",
+                        "calculation_summary": "已落地同业存放净额算法：按同业存放期末账面余额扣减已质押定期存单金额后的净额分组汇总。",
+                        "inclusions": [],
+                        "exclusions": [],
+                        "branches": [],
+                    }, {"provider": "test", "model": "deepseek-flash"}
+                return {
+                    "business_domain_hint": "1104 G01 同业存放与拆放核算",
+                    "target_concept_hint": "同业存放有效账户筛选",
+                    "source_summary": "从境内外同业存放台账圈定报告期末有效记录，剔除测试户与系统内清算过渡户。",
+                    "calculation_summary": "单笔原值暂存筛选，尚待下一步净额汇总。",
+                    "inclusions": [
+                        {
+                            "rule_code": "G01_REPORT_DATE",
+                            "title": "限定报告期末当日同业存放台账",
+                            "condition": "仅纳入报告日属于当期月末基准日的同业存放账户记录",
+                            "rationale": "对齐 1104 期末时点口径要求。",
+                        }
+                    ],
+                    "exclusions": [
+                        {
+                            "rule_code": "G01_EXC_TEST_CLEAR",
+                            "title": "剔除测试账户及系统内往来清算过渡户",
+                            "condition": "若账户状态为测试状态或命中系统内往来清算清单，则直接剔除",
+                            "rationale": "避免虚增同业存放余额。",
+                        }
+                    ],
+                    "branches": [],
+                }, {"provider": "test", "model": "deepseek-flash"}
+
+            if tool_name == "synthesize_domain_assets":
+                cap = payload.get("draft_capability") or {}
+                cals = [
+                    {
+                        "code": c["code"],
+                        "metric_name": c["metric_name"],
+                        "business_definition": c["business_definition"],
+                        "formula_summary": c["formula_summary"],
+                        "distinction_notes": c.get("distinction_notes") or "",
+                        "conflict_notes": c.get("conflict_notes") or "",
+                        "evidence_ids": c.get("evidence_ids") or [],
+                    }
+                    for c in (payload.get("draft_calibers") or [])
+                ]
+                return {
+                    "description": cap.get("description") or "已完成融合",
+                    "scope_summary": cap.get("scope_summary") or "已完成边界融合",
+                    "rules": payload.get("draft_rules") or [],
+                    "calibers": cals,
+                }, {"provider": "test", "model": "deepseek-flash"}
+
+            return {"tool_calls": [], "reasoning_summary": ""}, {"provider": "test", "model": "deepseek-flash"}
+
+    session = make_session()
+    settings = Settings(blob_dir=str(tmp_path / "blobs"))
+    llm = _InspectionLlm()
+
+    ingest_material(
+        session,
+        title="1104_G01_spec.md",
+        material_kind="REGULATORY_DOC",
+        file_type="md",
+        content=(
+            "# 1104 G01 同业存放与拆放核算\n\n"
+            "## 同业存放净额计算口径\n"
+            "按统计期末账面余额扣减已冻结质押定期存单后的净额填报。"
+        ).encode("utf-8"),
+        settings=settings,
+    )
+    ingest_material(
+        session,
+        title="proc_1104_g01_two_step.sql",
+        material_kind="CODE_LOGIC",
+        file_type="sql",
+        content=(
+            "/* 报表名称: 1104 G01 同业存放与拆放核算 */\n"
+            "INSERT INTO TMP_1104_G01_VALID (ACCT_NO, CUST_TYPE, BOOK_BAL, PLEDGE_AMT)\n"
+            "SELECT a.ACCT_NO, a.CUST_TYPE, a.BOOK_BAL, a.PLEDGE_AMT\n"
+            "FROM CORE_INTERBANK_ACCT a\n"
+            "WHERE a.RPT_DATE = '2026-06-30'\n"
+            "  AND a.STATUS <> 'TEST'\n"
+            "  AND NOT EXISTS (SELECT 1 FROM CORE_INTERNAL_CLEAR c WHERE c.ACCT_NO = a.ACCT_NO);\n"
+            "INSERT INTO RPT_1104_G01_INTERBANK (CUST_TYPE, NET_BAL)\n"
+            "SELECT t.CUST_TYPE, SUM(t.BOOK_BAL - t.PLEDGE_AMT) AS NET_BAL\n"
+            "FROM TMP_1104_G01_VALID t\n"
+            "GROUP BY t.CUST_TYPE;"
+        ).encode("utf-8"),
+        settings=settings,
+        llm=llm,
+    )
+    ingest_material(
+        session,
+        title="proc_plus_override.sql",
+        material_kind="CODE_LOGIC",
+        file_type="sql",
+        content=(
+            "/* 程序描述: PLUS 手工补录与人工覆盖规范 */\n"
+            "MERGE INTO RPT_PLUS_FINAL dst\n"
+            "USING (SELECT REC_KEY, FINAL_AMT FROM PLUS_MANUAL_INPUT WHERE AUDIT_STATUS = 'APPROVED') src\n"
+            "ON (dst.REC_KEY = src.REC_KEY)\n"
+            "WHEN MATCHED THEN UPDATE SET dst.FINAL_AMT = src.FINAL_AMT;"
+        ).encode("utf-8"),
+        settings=settings,
+        llm=llm,
+    )
+    session.commit()
+
+    # Plan 绝不能看到表名/字段名，Extract 必须收到真实 sql_logic_context
+    plan_json = json.dumps(llm.plan_payloads, ensure_ascii=False)
+    for forbidden in ("CORE_INTERBANK_ACCT", "TMP_1104_G01_VALID", "BOOK_BAL", "PLEDGE_AMT", "sql_logic_context"):
+        assert forbidden not in plan_json
+    assert any("PLEDGE_AMT" in json.dumps(p.get("sql_logic_context") or {}, ensure_ascii=False) for p in llm.extract_payloads)
+    assert any("AUDIT_STATUS" in json.dumps(p.get("sql_logic_context") or {}, ensure_ascii=False) for p in llm.extract_payloads)
+
+    # 持久化入库的 internal_locator_json 不包含 sql_snippet 或 logic_details
+    for ev_row in session.query(LogicEvidenceModel).all():
+        loc = ev_row.internal_locator_json or {}
+        assert "sql_snippet" not in loc
+        assert "logic_details" not in loc
+
+    summary = synthesize_business_assets(session, settings=settings, llm=llm)
+    assert summary["capability_count"] == 2
+    pano = get_asset_panorama(session)
+    serialized = json.dumps(
+        {
+            "capabilities": pano["capabilities"],
+            "rules": pano["rules"],
+            "calibers": pano["calibers"],
+            "reconcile": pano["reconcile"],
+        },
+        ensure_ascii=False,
+    )
+    assert detect_technical_jargon(serialized) == []
+
+    # 1104 规则已被精简且冗余 GEN_* 占位规则已清理
+    g01_rules = [r for r in pano["rules"] if r["capability_name"] == "1104 G01 同业存放与拆放核算"]
+    assert len(g01_rules) == 2
+    g01_cals = [c for c in pano["calibers"] if c["capability_name"] == "1104 G01 同业存放与拆放核算"]
+    assert len(g01_cals) == 1
+    assert "扣减已质押定期存单" in g01_cals[0]["formula_summary"]
+    assert "应报未报" not in g01_cals[0]["exclusion_notes"]
+    assert "交易后余额是交易时点静态快照" not in g01_cals[0]["distinction_notes"]
+
+
+def test_single_step_domain_preservation_and_cross_source_domain_alignment(tmp_path):
+    """验证单步具体域名不被括号改写、跨源同名异写安全合并、无关域不误合并、且同域 DEDUP 规则不重复。"""
+    import uuid
+    from app.infra.db_tables import LogicEvidenceModel, RegulatoryClauseModel, SourceMaterialModel
+    from app.ingestion.ast_extractor import translate_evidence_with_llm
+    from app.policy.dc_bus import build_run_bus
+
+    # 1) 单步已有具体域名时，不被模型的近义扩写覆盖
+    class _ParaphraseDomainLlm:
+        model = "deepseek-flash"
+
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            return {
+                "business_domain_hint": "对公贷款五级分类统计（监管报送口径）",
+                "target_concept_hint": "对公不良贷款余额",
+                "source_summary": "筛选三四五档不良贷款且排除已核销记录。",
+                "calculation_summary": "按贷款加分类汇总余额。",
+                "inclusions": [],
+                "exclusions": [],
+                "branches": [],
+            }, {"provider": "test", "model": "deepseek-flash"}
+
+    bus = build_run_bus({"max_llm_calls": 10, "max_retries": 2, "max_total_tokens": 100000})
+    out = translate_evidence_with_llm(
+        {"statement_kind": "INSERT"},
+        ["EAST5.0 对公贷款五级分类统计"],
+        {
+            "business_domain_hint": "EAST5.0 对公贷款五级分类统计",
+            "target_concept_hint": "EAST5.0 对公贷款五级分类统计",
+            "source_summary": "草稿",
+            "inclusions": [],
+            "exclusions": [],
+            "branches": [],
+            "calculation_kind": "AGGREGATE",
+            "calculation_summary": "草稿",
+            "dedup_grain_hint": "",
+        },
+        llm=_ParaphraseDomainLlm(),
+        bus=bus,
+    )
+    assert out["business_domain_hint"] == "EAST5.0 对公贷款五级分类统计"
+
+    # 2) synthesize_business_assets 跨源域名安全对齐 + 防误合并 + 同域 DEDUP 去重
+    session = make_session()
+    settings = Settings(blob_dir=str(tmp_path / "blobs"))
+    m_doc = SourceMaterialModel(
+        id=str(uuid.uuid4()),
+        title="reg_docs.md",
+        material_kind="REGULATORY_DOC",
+        file_type="md",
+        sha256="hash-doc-align",
+        blob_uri="local://doc",
+        item_count=3,
+        summary="doc",
+    )
+    m_code = SourceMaterialModel(
+        id=str(uuid.uuid4()),
+        title="code_scripts.sql",
+        material_kind="CODE_LOGIC",
+        file_type="sql",
+        sha256="hash-code-align",
+        blob_uri="local://code",
+        item_count=3,
+        summary="code",
+    )
+    session.add_all([m_doc, m_code])
+    session.flush()
+
+    session.add_all(
+        [
+            RegulatoryClauseModel(
+                id=str(uuid.uuid4()),
+                material_id=m_doc.id,
+                chapter="第一章",
+                business_domain="EAST5.0 对公贷款五级分类统计",
+                clause_title="对公不良贷款核销剔除",
+                clause_kind="EXCLUSION",
+                business_requirement="剔除已核销贷款后汇总对公不良贷款。",
+                audience="业务",
+                metrics_mentioned_json=[],
+                source_locator_json={"regime": "EAST"},
+            ),
+            RegulatoryClauseModel(
+                id=str(uuid.uuid4()),
+                material_id=m_doc.id,
+                chapter="第二章",
+                business_domain="SAFE FAL 国际收支涉外收入申报",
+                clause_title="涉外收入小额免申报",
+                clause_kind="INCLUSION",
+                business_requirement="对公全部纳入，对私超五千美元纳入。",
+                audience="业务",
+                metrics_mentioned_json=[],
+                source_locator_json={"regime": "SAFE"},
+            ),
+            RegulatoryClauseModel(
+                id=str(uuid.uuid4()),
+                material_id=m_doc.id,
+                chapter="第三章",
+                business_domain="大额与可疑外汇交易报送",
+                clause_title="大额交易申报",
+                clause_kind="INCLUSION",
+                business_requirement="达到三十万美元门限纳入大额申报。",
+                audience="业务",
+                metrics_mentioned_json=[],
+                source_locator_json={"regime": "SAFE"},
+            ),
+        ]
+    )
+    session.add_all(
+        [
+            LogicEvidenceModel(
+                id=str(uuid.uuid4()),
+                material_id=m_code.id,
+                logic_fingerprint="fp-east-paraphrase-1",
+                business_domain_hint="对公贷款五级分类统计（监管报送口径）",
+                target_concept_hint="不良贷款余额",
+                source_summary="排除已核销标记记录，按分类统计余额。",
+                inclusion_predicates_json=[],
+                exclusion_predicates_json=[],
+                branch_cases_json=[],
+                calculation_kind="AGGREGATE",
+                calculation_summary="汇总本金余额。",
+                dedup_grain_hint="按贷款编号与分类等级防重汇总",
+                internal_locator_json={"regime": "EAST"},
+            ),
+            LogicEvidenceModel(
+                id=str(uuid.uuid4()),
+                material_id=m_code.id,
+                logic_fingerprint="fp-east-paraphrase-2",
+                business_domain_hint="对公贷款五级分类统计（监管报送口径）",
+                target_concept_hint="不良贷款余额二期",
+                source_summary="补充汇总同一口径。",
+                inclusion_predicates_json=[],
+                exclusion_predicates_json=[],
+                branch_cases_json=[],
+                calculation_kind="DIRECT",
+                calculation_summary="汇总本金余额。",
+                dedup_grain_hint="按贷款编号与分类等级防重汇总",
+                internal_locator_json={"regime": "EAST"},
+            ),
+            LogicEvidenceModel(
+                id=str(uuid.uuid4()),
+                material_id=m_code.id,
+                logic_fingerprint="fp-safe-paraphrase",
+                business_domain_hint="国际收支涉外收入申报（涉外收入（境外汇入汇款）业务）",
+                target_concept_hint="涉外收入免申报筛选",
+                source_summary="机构全量或超五千美元纳入。",
+                inclusion_predicates_json=[],
+                exclusion_predicates_json=[],
+                branch_cases_json=[],
+                calculation_kind="DIRECT",
+                calculation_summary="逐笔传出。",
+                dedup_grain_hint="",
+                internal_locator_json={"regime": "SAFE"},
+            ),
+            LogicEvidenceModel(
+                id=str(uuid.uuid4()),
+                material_id=m_code.id,
+                logic_fingerprint="fp-sac-unreported",
+                business_domain_hint="应报未报漏报风险识别",
+                target_concept_hint="应报未报风险清单",
+                source_summary="单独识别应报未报账户。",
+                inclusion_predicates_json=[],
+                exclusion_predicates_json=[],
+                branch_cases_json=[],
+                calculation_kind="DIRECT",
+                calculation_summary="逐笔统计。",
+                dedup_grain_hint="",
+                internal_locator_json={"regime": "SAFE"},
+            ),
+        ]
+    )
+    session.flush()
+
+    summary = synthesize_business_assets(session, settings=settings)
+    assert summary["capability_count"] == 4
+    pano = get_asset_panorama(session)
+    caps = {c["name"]: c for c in pano["capabilities"]}
+    assert caps["EAST5.0 对公贷款五级分类统计"]["coverage_status"] == "COVERED"
+    assert caps["SAFE FAL 国际收支涉外收入申报"]["coverage_status"] == "COVERED"
+    assert caps["应报未报漏报风险识别"]["coverage_status"] == "COVERED"
+    assert caps["大额与可疑外汇交易报送"]["coverage_status"] == "UNREALIZED"
+    assert "对公贷款五级分类统计（监管报送口径）" not in caps
+    assert "国际收支涉外收入申报（涉外收入（境外汇入汇款）业务）" not in caps
+    east_dedups = [
+        r for r in pano["rules"]
+        if r["capability_name"] == "EAST5.0 对公贷款五级分类统计" and r["rule_category"] == "DEDUP"
+    ]
+    assert len(east_dedups) == 1

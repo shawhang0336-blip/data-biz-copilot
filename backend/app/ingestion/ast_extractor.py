@@ -60,9 +60,228 @@ def _table_name(node: exp.Table) -> str:
     return ".".join(parts).upper() if parts else (node.name or "").upper()
 
 
+def _truncate_sql_piece(text: str, limit: int) -> str:
+    compact = " ".join((text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _compact_sql_snippet(stmt: str, max_chars: int = 1600) -> str:
+    """保留中文注释与可执行 SQL 主体，压扁多余缩进空行并控长，仅作内存 Stage 2 解析参考。"""
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in (stmt or "").splitlines()]
+    compact = "\n".join(ln for ln in lines if ln)
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max(0, max_chars - 16)].rstrip() + "\n...(truncated)"
+
+
+def _split_top_level_and(node: Optional[exp.Expression]) -> List[exp.Expression]:
+    """仅展开顶层 AND 链，完整保留 OR 条件（如 `CUST_KIND = 'ORG' OR USD_AMT > 5000`）。"""
+    if node is None:
+        return []
+    while isinstance(node, exp.Paren) and node.this is not None:
+        node = node.this
+    if isinstance(node, exp.And):
+        return _split_top_level_and(node.left) + _split_top_level_and(node.right)
+    return [node]
+
+
+def _append_unique_sql(bucket: List[str], expr_sql: str, *, limit: int, max_items: int) -> None:
+    if len(bucket) >= max_items:
+        return
+    clean = _truncate_sql_piece(expr_sql, limit)
+    if clean and clean not in bucket:
+        bucket.append(clean)
+
+
+def _extract_logic_details(tree: Optional[exp.Expression], stmt: str) -> Dict[str, Any]:
+    """用 sqlglot 提取真实谓词、算式、分支、MERGE/UPDATE 动作与压缩 SQL（绝不入库）。"""
+    snippet = _compact_sql_snippet(stmt, 1600)
+    if tree is None:
+        return {"sql_snippet": snippet} if snippet else {}
+
+    where_predicates: List[str] = []
+    for where_node in tree.find_all(exp.Where):
+        for cond in _split_top_level_and(where_node.this):
+            _append_unique_sql(where_predicates, cond.sql(), limit=200, max_items=12)
+
+    having_predicates: List[str] = []
+    for having_node in tree.find_all(exp.Having):
+        for cond in _split_top_level_and(having_node.this):
+            _append_unique_sql(having_predicates, cond.sql(), limit=200, max_items=4)
+
+    computed_types = (
+        exp.AggFunc,
+        exp.Sum,
+        exp.Count,
+        exp.Avg,
+        exp.Max,
+        exp.Min,
+        exp.Add,
+        exp.Sub,
+        exp.Mul,
+        exp.Div,
+        exp.Case,
+        exp.Window,
+        exp.Coalesce,
+        exp.Anonymous,
+        exp.Cast,
+        exp.Alias,
+    )
+    priority_select: List[str] = []
+    plain_select: List[str] = []
+    for sel in tree.find_all(exp.Select):
+        for proj in sel.expressions or []:
+            proj_sql = proj.sql()
+            if isinstance(proj, computed_types) or any(proj.find(t) is not None for t in computed_types):
+                _append_unique_sql(priority_select, proj_sql, limit=180, max_items=12)
+            else:
+                _append_unique_sql(plain_select, proj_sql, limit=120, max_items=8)
+    select_expressions = priority_select[:12] if priority_select else plain_select[:8]
+
+    case_expressions: List[str] = []
+    for case_node in tree.find_all(exp.Case):
+        _append_unique_sql(case_expressions, case_node.sql(), limit=260, max_items=6)
+
+    merge_details: Dict[str, Any] = {}
+    if isinstance(tree, exp.Merge):
+        on_node = tree.args.get("on")
+        using_node = tree.args.get("using")
+        whens_node = tree.args.get("whens")
+        when_list = (
+            list(whens_node.expressions or [])
+            if isinstance(whens_node, exp.Whens)
+            else (list(whens_node) if isinstance(whens_node, list) else [])
+        )
+        when_clauses: List[str] = []
+        for w in when_list:
+            _append_unique_sql(when_clauses, w.sql(), limit=220, max_items=4)
+        if on_node is not None:
+            merge_details["on_condition"] = _truncate_sql_piece(on_node.sql(), 200)
+        if using_node is not None:
+            merge_details["using_query"] = _truncate_sql_piece(using_node.sql(), 400)
+        if when_clauses:
+            merge_details["when_clauses"] = when_clauses
+
+    set_clauses: List[str] = []
+    if isinstance(tree, exp.Update):
+        for eq_node in tree.expressions or []:
+            _append_unique_sql(set_clauses, eq_node.sql(), limit=180, max_items=6)
+
+    join_conditions: List[str] = []
+    for join_node in tree.find_all(exp.Join):
+        on_expr = join_node.args.get("on")
+        if on_expr is not None:
+            _append_unique_sql(join_conditions, on_expr.sql(), limit=160, max_items=6)
+        elif join_node.args.get("using"):
+            using_cols = ", ".join(c.sql() for c in (join_node.args.get("using") or []))
+            if using_cols:
+                _append_unique_sql(join_conditions, f"USING ({using_cols})", limit=160, max_items=6)
+
+    group_by_exprs: List[str] = []
+    for grp_node in tree.find_all(exp.Group):
+        for gexpr in grp_node.expressions or []:
+            _append_unique_sql(group_by_exprs, gexpr.sql(), limit=120, max_items=8)
+
+    window_specs: List[str] = []
+    for win_node in tree.find_all(exp.Window):
+        _append_unique_sql(window_specs, win_node.sql(), limit=180, max_items=4)
+
+    details: Dict[str, Any] = {}
+    for k, v in (
+        ("where_predicates", where_predicates),
+        ("having_predicates", having_predicates),
+        ("select_expressions", select_expressions),
+        ("case_expressions", case_expressions),
+        ("merge_details", merge_details),
+        ("set_clauses", set_clauses),
+        ("join_conditions", join_conditions),
+        ("group_by_exprs", group_by_exprs),
+        ("window_specs", window_specs),
+        ("sql_snippet", snippet),
+    ):
+        if v:
+            details[k] = v
+    return details
+
+
+def _clean_sql_logic_context(details: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """清理空列表、空字典与空白字符串，仅保留真实有效的内部逻辑上下文。"""
+    if not isinstance(details, dict):
+        return {}
+    cleaned: Dict[str, Any] = {}
+    for k, v in details.items():
+        if isinstance(v, str):
+            s = v.strip()
+            if s:
+                cleaned[k] = s
+        elif isinstance(v, list):
+            items = [x for x in v if x not in (None, "", [], {})]
+            if items:
+                cleaned[k] = items
+        elif isinstance(v, dict):
+            sub = _clean_sql_logic_context(v)
+            if sub:
+                cleaned[k] = sub
+    return cleaned
+
+
+def _merge_group_sql_contexts(
+    contexts: Optional[List[Dict[str, Any]]],
+    max_snippet_chars: int = 3200,
+) -> Dict[str, Any]:
+    """合并同一逻辑阶段下多个 SQL 步骤的 AST 逻辑细节（仅用于内存 Stage 2 输入）。"""
+    if not contexts:
+        return {}
+    list_caps = {
+        "where_predicates": 16,
+        "having_predicates": 6,
+        "select_expressions": 16,
+        "case_expressions": 8,
+        "set_clauses": 8,
+        "join_conditions": 8,
+        "group_by_exprs": 10,
+        "window_specs": 6,
+    }
+    merged_lists: Dict[str, List[str]] = {k: [] for k in list_caps}
+    merge_entries: List[Dict[str, Any]] = []
+    snippets: List[str] = []
+
+    for idx, raw_ctx in enumerate(contexts):
+        ctx = _clean_sql_logic_context(raw_ctx)
+        if not ctx:
+            continue
+        for key, cap in list_caps.items():
+            for item in ctx.get(key) or []:
+                s = str(item).strip()
+                if s and s not in merged_lists[key] and len(merged_lists[key]) < cap:
+                    merged_lists[key].append(s)
+        md = ctx.get("merge_details")
+        if isinstance(md, dict) and md and md not in merge_entries and len(merge_entries) < 4:
+            merge_entries.append(md)
+        snip = ctx.get("sql_snippet")
+        if isinstance(snip, str) and snip.strip():
+            snippets.append(f"-- [step {idx}] --\n{snip.strip()}" if len(contexts) > 1 else snip.strip())
+
+    out: Dict[str, Any] = {}
+    for key, vals in merged_lists.items():
+        if vals:
+            out[key] = vals
+    if merge_entries:
+        out["merge_details"] = merge_entries[0] if len(merge_entries) == 1 else merge_entries
+    if snippets:
+        joined = "\n".join(snippets)
+        if len(joined) > max_snippet_chars:
+            joined = joined[: max(0, max_snippet_chars - 16)].rstrip() + "\n...(truncated)"
+        out["sql_snippet"] = joined
+    return out
+
+
 def extract_sql_ast_skeleton(stmt: str) -> Dict[str, Any]:
     """用 sqlglot 解析 SQL AST，提取结构化逻辑特征（物理表与字段严格留存供内部审计）。"""
     tree = _parse_ast_best_effort(stmt)
+    logic_details = _extract_logic_details(tree, stmt)
     if tree is None:
         return {
             "ast_parsed": False,
@@ -80,6 +299,7 @@ def extract_sql_ast_skeleton(stmt: str) -> Dict[str, Any]:
             "aggregate_funcs": [],
             "group_by_count": 0,
             "has_arithmetic": False,
+            "logic_details": logic_details,
         }
 
     stmt_kind = type(tree).__name__.upper()
@@ -162,6 +382,7 @@ def extract_sql_ast_skeleton(stmt: str) -> Dict[str, Any]:
         "aggregate_funcs": aggregate_funcs,
         "group_by_count": group_by_count,
         "has_arithmetic": has_arithmetic,
+        "logic_details": logic_details,
     }
 
 
@@ -312,11 +533,13 @@ def translate_evidence_with_llm(
     *,
     llm: Any,
     bus: Any,
+    sql_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """若配置了真实 LLM，把 AST 结构特征与脱敏后的注释交给模型翻译为自然业务表达并经 Bus 门禁拦截。"""
+    """若配置了真实 LLM，把 AST 逻辑细节、结构特征与注释交给模型精准翻译为纯业务表达并经 Bus 门禁拦截。"""
     if llm is None:
         return fallback_evidence
-    payload = {
+    clean_context = _clean_sql_logic_context(sql_context if sql_context is not None else skeleton.get("logic_details"))
+    payload: Dict[str, Any] = {
         "ast_features": {
             "statement_kind": skeleton.get("statement_kind"),
             "join_count": skeleton.get("join_count"),
@@ -333,17 +556,25 @@ def translate_evidence_with_llm(
         "developer_comments": [c for c in comments if c][:6],
         "deterministic_draft": fallback_evidence,
     }
+    if clean_context:
+        payload["sql_logic_context"] = clean_context
+
     args, _trace = call_llm_validated(
         llm,
         "translate_logic_evidence",
-        "将系统逻辑结构特征和注释翻译成通俗易懂、完全面向业务人员的中文业务解释（严禁出现任何表名、字段名、SQL 关键字或存储过程名称）。",
+        (
+            "请仔细核对 sql_logic_context 中的真实过滤条件、字面量/阈值、加减乘除/扣减算式、分支条件、合并覆盖匹配键及开发注释，"
+            "用通俗纯中文逐项如实还原代码已经实现的业务纳入规则、剔除规则、分类分支、计算公式与去重合并粒度。"
+            "若 deterministic_draft.business_domain_hint 已是具体业务主题名（非占位词），请原样沿用不要无故加括号或改写近义词；"
+            "deterministic_draft 的其余字段仅作兜底参考，切勿照搬泛化套话，更不得凭空编造未出现在代码中的规则；"
+            "同时严格遵守去技术化原则：输出文本中严禁出现任何物理表名、字段名（无论大小写）、SQL 关键字或函数名。"
+        ),
         payload,
         backoff=(0.1, 0.2),
         bus=bus,
     )
     merged = {**fallback_evidence}
     for key in (
-        "business_domain_hint",
         "target_concept_hint",
         "source_summary",
         "calculation_summary",
@@ -352,24 +583,33 @@ def translate_evidence_with_llm(
         val = args.get(key)
         if isinstance(val, str) and val.strip():
             merged[key] = sanitize_business_text(val)
-    for list_key in ("inclusions", "exclusions", "branches"):
-        val = args.get(list_key)
-        if isinstance(val, list) and val:
-            cleaned_list: List[Dict[str, Any]] = []
-            for idx, item in enumerate(val):
-                if not isinstance(item, dict):
-                    continue
-                cleaned_item = {
-                    k: sanitize_business_text(str(v)) if isinstance(v, str) else v
-                    for k, v in item.items()
-                }
-                if list_key in {"inclusions", "exclusions"} and not cleaned_item.get("rule_code"):
-                    cleaned_item["rule_code"] = (
-                        f"LLM_{list_key[:3].upper()}_{hashlib.md5(str(cleaned_item).encode('utf-8')).hexdigest()[:6]}"
-                    )
-                cleaned_list.append(cleaned_item)
-            if cleaned_list:
-                merged[list_key] = cleaned_list
+
+    orig_domain = str(fallback_evidence.get("business_domain_hint") or "").strip()
+    proposed_domain = sanitize_business_text(str(args.get("business_domain_hint") or "")).strip()
+    if orig_domain and orig_domain not in _GENERIC_CODE_DOMAINS:
+        merged["business_domain_hint"] = orig_domain
+    elif proposed_domain and proposed_domain not in _GENERIC_CODE_DOMAINS:
+        merged["business_domain_hint"] = proposed_domain
+    elif orig_domain:
+        merged["business_domain_hint"] = orig_domain
+
+    for list_key, prefix in (("inclusions", "LLM_INC"), ("exclusions", "LLM_EXC")):
+        if list_key in args and isinstance(args[list_key], list):
+            merged[list_key] = _merge_rule_list(
+                merged.get(list_key) or [],
+                args[list_key],
+                prefix,
+                replace=True,
+            )
+    if "branches" in args and isinstance(args["branches"], list):
+        cleaned_branches: List[Dict[str, Any]] = []
+        for item in args["branches"]:
+            if not isinstance(item, dict) or not item.get("title"):
+                continue
+            cleaned_branches.append(
+                {k: sanitize_business_text(str(v)) if isinstance(v, str) else v for k, v in item.items()}
+            )
+        merged["branches"] = cleaned_branches
     return merged
 
 
@@ -610,10 +850,21 @@ def _plan_code_structure_with_llm(
     return code_plan, validated_groups
 
 
-def _merge_rule_list(existing: List[Dict[str, Any]], incoming: Any, prefix: str) -> List[Dict[str, Any]]:
-    if not isinstance(incoming, list) or not incoming:
+def _merge_rule_list(
+    existing: List[Dict[str, Any]],
+    incoming: Any,
+    prefix: str,
+    *,
+    replace: bool = False,
+) -> List[Dict[str, Any]]:
+    if not isinstance(incoming, list):
         return existing
-    by_code = {x.get("rule_code"): dict(x) for x in existing if x.get("rule_code")}
+    if not incoming:
+        return [] if replace else existing
+
+    existing_by_code = {x.get("rule_code"): dict(x) for x in existing if x.get("rule_code")}
+    by_code: Dict[str, Dict[str, Any]] = {} if replace else {k: dict(v) for k, v in existing_by_code.items()}
+
     for item in incoming:
         if not isinstance(item, dict):
             continue
@@ -622,14 +873,22 @@ def _merge_rule_list(existing: List[Dict[str, Any]], incoming: Any, prefix: str)
             for k, v in item.items()
         }
         raw_rc = str(clean_item.get("rule_code") or "").strip()
-        if raw_rc in by_code:
+        if not replace and raw_rc in by_code:
             by_code[raw_rc].update({k: v for k, v in clean_item.items() if k != "rule_code" and v})
+        elif replace and raw_rc in existing_by_code and not raw_rc.startswith("GEN_"):
+            updated = dict(existing_by_code[raw_rc])
+            updated.update({k: v for k, v in clean_item.items() if k != "rule_code" and v})
+            by_code[raw_rc] = updated
         elif clean_item.get("title") and clean_item.get("condition"):
             # 新增AI提炼规则统一生成短哈希编号，禁止把LLM随手造的英文/SQL词写进资产编码
-            hashed_rc = f"{prefix}_{hashlib.md5(str(clean_item.get('title') or clean_item).encode('utf-8')).hexdigest()[:8]}"
+            digest_src = f"{raw_rc}|{clean_item.get('title')}|{clean_item.get('condition')}"
+            hashed_rc = f"{prefix}_{hashlib.md5(digest_src.encode('utf-8')).hexdigest()[:8]}"
             clean_item["rule_code"] = hashed_rc
             by_code[hashed_rc] = clean_item
     return list(by_code.values())
+
+
+_CALC_KIND_PRIORITY = {"CONFLICT": 4, "AGGREGATE": 3, "CONDITIONAL": 2, "DIRECT": 1}
 
 
 def _extract_group_with_llm(
@@ -642,8 +901,10 @@ def _extract_group_with_llm(
     stage_meta: Optional[Dict[str, Any]],
     llm: Any,
     bus: Any,
+    group_sql_contexts: Optional[List[Dict[str, Any]]] = None,
+    is_sac_script: bool = False,
 ) -> None:
-    """按规划好的逻辑阶段带着全局上下文调用受控 LLM 提炼纯业务解释，并回填主实证与元数据。"""
+    """按规划好的逻辑阶段带着全局上下文与真实 SQL 细节调用受控 LLM 提炼纯业务解释，并回填主实证与元数据。"""
     agg_stmt_kinds = sorted(
         {
             str((ev.internal_locator or {}).get("statement_kind") or "SELECT")
@@ -691,6 +952,9 @@ def _extract_group_with_llm(
             "dedup_grain_hint": next((e.dedup_grain_hint for e in group_evs if e.dedup_grain_hint), ""),
         },
     }
+    merged_sql_ctx = _merge_group_sql_contexts(group_sql_contexts)
+    if merged_sql_ctx:
+        payload["sql_logic_context"] = merged_sql_ctx
     if stage_meta is not None:
         payload["code_plan"] = {
             "business_overview": (code_plan or {}).get("business_overview") or sanitize_business_text(banner),
@@ -711,15 +975,25 @@ def _extract_group_with_llm(
     if code_plan and code_plan.get("business_overview"):
         plan_locator_fields["business_overview"] = code_plan["business_overview"][:160]
 
+    if is_sac_script:
+        instruction = (
+            "结合 code_plan 中的整套逻辑业务主线、本阶段职能分工及上游衔接关系，以及 sql_logic_context 真实 SQL 细节、AST 摘要与业务注释，"
+            "用通俗纯中文还原当前逻辑阶段实际做了什么、包含哪些业务规则与口径解释。"
+            "保持 deterministic_draft 已有规则准确度，严禁在输出中出现物理表名、字段名（大小写）、SQL 关键字或脚本名。"
+        )
+    else:
+        instruction = (
+            "结合 code_plan 中的整套逻辑业务主线与本阶段职能，严格以 sql_logic_context 中的真实过滤条件、字面量/阈值、"
+            "加减扣减算式、分支判定、合并覆盖键及注释为准，逐项精准还原当前阶段实际已实现的业务规则、计算口径与防重粒度。"
+            "deterministic_draft 仅作兜底参考，切勿保留空洞泛化套话，更不得虚构代码中不存在的条件；"
+            "严禁在输出中出现任何物理表名、字段名（大小写）、SQL 关键字、函数名或脚本名。"
+        )
+
     try:
         args, _trace = call_llm_validated(
             llm,
             "translate_logic_evidence",
-            (
-                "结合 code_plan 中的整套逻辑业务主线、本阶段职能分工及上游衔接关系，以及 AST 结构摘要与业务注释，"
-                "用通俗纯中文还原当前逻辑阶段实际做了什么、包含哪些业务规则与口径解释。"
-                "保持 deterministic_draft 已有规则准确度，严禁出现物理表名、字段名、SQL 或脚本名。"
-            ),
+            instruction,
             payload,
             backoff=(0.2, 0.5),
             bus=bus,
@@ -727,11 +1001,20 @@ def _extract_group_with_llm(
     except BudgetExceededError:
         raise
     except WorkflowError:
-        for ev in group_evs:
+        for idx, ev in enumerate(group_evs):
             ev.internal_locator.update(plan_locator_fields)
+            ev.internal_locator["stage_lead"] = idx == 0
         return
 
     lead = group_evs[0]
+    best_calc = max(
+        (ev.calculation_kind for ev in group_evs),
+        key=lambda k: _CALC_KIND_PRIORITY.get(k, 0),
+        default=lead.calculation_kind,
+    )
+    if _CALC_KIND_PRIORITY.get(best_calc, 0) > _CALC_KIND_PRIORITY.get(lead.calculation_kind, 0):
+        lead.calculation_kind = best_calc
+
     if isinstance(args.get("source_summary"), str) and args["source_summary"].strip():
         lead.source_summary = sanitize_business_text(args["source_summary"])
     if isinstance(args.get("calculation_summary"), str) and args["calculation_summary"].strip():
@@ -742,22 +1025,62 @@ def _extract_group_with_llm(
             or "并行" in args["calculation_summary"]
         ):
             lead.calculation_summary = sanitize_business_text(args["calculation_summary"])
-    if isinstance(args.get("dedup_grain_hint"), str) and args["dedup_grain_hint"].strip() and not lead.dedup_grain_hint:
-        lead.dedup_grain_hint = sanitize_business_text(args["dedup_grain_hint"])
+    if isinstance(args.get("dedup_grain_hint"), str) and args["dedup_grain_hint"].strip():
+        if not is_sac_script or not lead.dedup_grain_hint:
+            lead.dedup_grain_hint = sanitize_business_text(args["dedup_grain_hint"])
 
-    lead.inclusion_predicates = _merge_rule_list(lead.inclusion_predicates, args.get("inclusions"), "LLM_INC")
-    lead.exclusion_predicates = _merge_rule_list(lead.exclusion_predicates, args.get("exclusions"), "LLM_EXC")
-    if isinstance(args.get("branches"), list) and args["branches"]:
-        br_by_title = {b.get("title"): dict(b) for b in lead.branch_cases if b.get("title")}
-        for item in args["branches"]:
-            if not isinstance(item, dict) or not item.get("title"):
-                continue
-            clean_b = {k: sanitize_business_text(str(v)) if isinstance(v, str) else v for k, v in item.items()}
-            br_by_title[clean_b["title"]] = clean_b
-        lead.branch_cases = list(br_by_title.values())
+    replace_generic = not is_sac_script
+    lead.inclusion_predicates = _merge_rule_list(
+        lead.inclusion_predicates,
+        args.get("inclusions"),
+        "LLM_INC",
+        replace=replace_generic,
+    )
+    lead.exclusion_predicates = _merge_rule_list(
+        lead.exclusion_predicates,
+        args.get("exclusions"),
+        "LLM_EXC",
+        replace=replace_generic,
+    )
+    if "branches" in args and isinstance(args["branches"], list):
+        if replace_generic:
+            lead.branch_cases = [
+                {k: sanitize_business_text(str(v)) if isinstance(v, str) else v for k, v in item.items()}
+                for item in args["branches"]
+                if isinstance(item, dict) and item.get("title")
+            ]
+        elif args["branches"]:
+            br_by_title = {b.get("title"): dict(b) for b in lead.branch_cases if b.get("title")}
+            for item in args["branches"]:
+                if not isinstance(item, dict) or not item.get("title"):
+                    continue
+                clean_b = {k: sanitize_business_text(str(v)) if isinstance(v, str) else v for k, v in item.items()}
+                br_by_title[clean_b["title"]] = clean_b
+            lead.branch_cases = list(br_by_title.values())
 
-    for ev in group_evs:
+    if replace_generic and len(group_evs) > 1:
+        for follower in group_evs[1:]:
+            if "inclusions" in args and isinstance(args["inclusions"], list):
+                follower.inclusion_predicates = [
+                    r for r in follower.inclusion_predicates
+                    if not str(r.get("rule_code") or "").startswith("GEN_")
+                ]
+            if "exclusions" in args and isinstance(args["exclusions"], list):
+                follower.exclusion_predicates = [
+                    r for r in follower.exclusion_predicates
+                    if not str(r.get("rule_code") or "").startswith("GEN_")
+                ]
+            if "branches" in args and isinstance(args["branches"], list):
+                follower.branch_cases = [
+                    b for b in follower.branch_cases
+                    if "多情形分类判定分支" not in str(b.get("title") or "")
+                ]
+            if lead.dedup_grain_hint:
+                follower.dedup_grain_hint = ""
+
+    for idx, ev in enumerate(group_evs):
         ev.internal_locator.update(plan_locator_fields)
+        ev.internal_locator["stage_lead"] = idx == 0
         ev.internal_locator["ai_refined"] = True
 
 
@@ -770,8 +1093,9 @@ def plan_and_extract_script_evidences(
     is_sac_script: bool,
     llm: Any,
     bus: Any,
+    step_sql_contexts: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Any]:
-    """多步 SQL Plan-then-Extract：先由 AI 看全局步骤 DAG 分阶段规划，再带阶段上下文逐段提取纯业务实证。"""
+    """多步 SQL Plan-then-Extract：先由 AI 看全局步骤 DAG 分阶段规划，再带阶段上下文与真实 SQL 细节逐段提取纯业务实证。"""
     if llm is None or not evidences:
         return evidences
 
@@ -811,8 +1135,13 @@ def plan_and_extract_script_evidences(
             )
         )
         group_evs = [evidences[i] for i in group_indices]
+        group_sql_contexts = (
+            [step_sql_contexts[i] for i in group_indices if 0 <= i < len(step_sql_contexts)]
+            if step_sql_contexts is not None
+            else None
+        )
         for ev in group_evs:
-            if not is_sac_script or ev.business_domain_hint in {"", "核心业务规则", "核心业务规则与逻辑加工", "通用业务规范"}:
+            if not is_sac_script or ev.business_domain_hint in _GENERIC_CODE_DOMAINS:
                 ev.business_domain_hint = g["business_domain"]
         _extract_group_with_llm(
             banner,
@@ -823,6 +1152,8 @@ def plan_and_extract_script_evidences(
             stage_meta={**g, "upstream_stages": upstream_stages},
             llm=llm,
             bus=bus,
+            group_sql_contexts=group_sql_contexts,
+            is_sac_script=is_sac_script,
         )
         active_indices.extend(group_indices)
 
@@ -838,14 +1169,16 @@ def enrich_script_evidences_with_llm(
     *,
     llm: Any,
     bus: Any,
+    step_sql_contexts: Optional[List[Dict[str, Any]]] = None,
+    is_sac_script: bool = True,
 ) -> None:
     """单步或按域粒度调用受控大模型深度翻译并润色实证规则与业务解释。"""
     if llm is None or not evidences:
         return
 
-    grouped: Dict[str, List[Any]] = {}
-    for ev in evidences:
-        grouped.setdefault(ev.business_domain_hint, []).append(ev)
+    grouped: Dict[str, List[Tuple[int, Any]]] = {}
+    for idx, ev in enumerate(evidences):
+        grouped.setdefault(ev.business_domain_hint, []).append((idx, ev))
 
     clean_comments = [
         sanitize_business_text(c)
@@ -853,7 +1186,13 @@ def enrich_script_evidences_with_llm(
         if c and not detect_technical_jargon(sanitize_business_text(c))
     ][:10]
 
-    for domain, group in grouped.items():
+    for domain, indexed_group in grouped.items():
+        group = [ev for _, ev in indexed_group]
+        group_sql_contexts = (
+            [step_sql_contexts[i] for i, _ in indexed_group if 0 <= i < len(step_sql_contexts)]
+            if step_sql_contexts is not None
+            else None
+        )
         _extract_group_with_llm(
             banner,
             group,
@@ -863,5 +1202,7 @@ def enrich_script_evidences_with_llm(
             stage_meta=None,
             llm=llm,
             bus=bus,
+            group_sql_contexts=group_sql_contexts,
+            is_sac_script=is_sac_script,
         )
 
