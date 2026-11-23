@@ -480,7 +480,7 @@ def _plan_code_structure_with_llm(
                 "1. 用纯中文概述整套处理流程的 business_overview 及主归属业务域 canonical_domain；"
                 "2. 将 0 到 step_count-1 所有步骤不重不漏地归并划分为 1 至 4 个连续且职能清晰的逻辑阶段 chunk_groups"
                 "（stage_role 取 SCOPE_FILTER/BRANCH_LOGIC/CALCULATION/DEDUP_MERGE/OUTPUT_REPORT；仅纯技术准备工作标 IGNORE）；"
-                "3. 若存在多个 canonical_domain_hints，business_domain 应尽量收敛至其中标准业务域，严禁出现表名、字段名、SQL 或脚本名。"
+                "3. 若同一份代码内部存在多个不同的 canonical_domain_hints（如同时包含主报送域与「应报未报漏报风险识别」），不同 draft_domain 的步骤应分别划分为独立阶段，保留各自原本的 draft_domain，严禁出现表名、字段名、SQL 或脚本名。"
             ),
             survey,
             backoff=(0.2, 0.5),
@@ -778,7 +778,8 @@ def plan_and_extract_script_evidences(
         )
         group_evs = [evidences[i] for i in group_indices]
         for ev in group_evs:
-            ev.business_domain_hint = g["business_domain"]
+            if not is_sac_script or ev.business_domain_hint in {"", "核心业务规则", "核心业务规则与逻辑加工", "通用业务规范"}:
+                ev.business_domain_hint = g["business_domain"]
         _extract_group_with_llm(
             banner,
             group_evs,

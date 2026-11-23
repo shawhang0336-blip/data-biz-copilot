@@ -480,3 +480,133 @@ def test_synthesize_business_assets_direct_ai_call_without_llm_arg_fallback_safe
     assert summary["ai_enriched_domains"] == 0
     assert summary["capability_count"] >= 1
     assert session.query(BusinessRuleAssetModel).count() >= 1
+
+
+def test_copilot_tool_topk_scoped_gap_disclosure_and_sac_multidomain_preservation(tmp_path):
+    """验证规则检索 Top-K 限流与排除意图加权、缺口披露去重防串台、以及 SAC 单脚本多域不被覆盖。"""
+    from app.copilot.business_tools import execute_business_tool
+    from app.ingestion.ast_extractor import plan_and_extract_script_evidences
+    from app.infra.contracts import ExtractedLogicEvidence
+    from app.infra.db_tables import BusinessCapabilityModel
+
+    session = make_session()
+    settings = Settings(blob_dir=str(tmp_path / "blobs"))
+    load_builtin_sample_pack(session, settings=settings)
+
+    # 1) 测试多规则场景下 get_business_scope_and_rules 限流 <= 15 且 EXCLUSION 优先靠前
+    cap = session.query(BusinessCapabilityModel).first()
+    assert cap is not None
+    for i in range(20):
+        session.add(
+            BusinessRuleAssetModel(
+                id=f"extra-inc-{i}",
+                capability_id=cap.id,
+                code=f"rule-extra-inc-{i}",
+                title=f"结售汇大额申报常规纳入规则-{i}",
+                rule_category="INCLUSION",
+                business_condition="结售汇金额达到申报门槛",
+                business_action="纳入正常报送",
+                business_rationale="常规测试条款",
+                reconcile_status="VERIFIED",
+                evidence_ids_json=[],
+                clause_ids_json=[],
+                audience="业务",
+                status="DRAFT",
+                current_version=1,
+            )
+        )
+    session.add(
+        BusinessRuleAssetModel(
+            id="extra-exc-priority",
+            capability_id=cap.id,
+            code="rule-extra-exc-priority",
+            title="结售汇特殊测试客户排除规则",
+            rule_category="EXCLUSION",
+            business_condition="属于结售汇测试或豁免客户时排除",
+            business_action="直接排除不予报送",
+            business_rationale="排除意图应优先召回",
+            reconcile_status="VERIFIED",
+            evidence_ids_json=[],
+            clause_ids_json=[],
+            audience="业务",
+            status="DRAFT",
+            current_version=1,
+        )
+    )
+    session.flush()
+
+    scope_res = execute_business_tool(session, "get_business_scope_and_rules", {"topic": "结售汇哪些客户会被排除"})
+    assert len(scope_res["rules"]) <= 15
+    assert scope_res["total_matched"] >= 21
+    assert scope_res["rules"][0]["rule_category"] == "EXCLUSION"
+
+    # 2) check_regulatory_coverage_gap 带 topic 时只披露与该主题相关的问题，不把无关未落地领域强塞到顶部
+    gap_scoped = execute_business_tool(session, "check_regulatory_coverage_gap", {"topic": "联名账户 折算 分歧"})
+    assert "期货期权" not in (gap_scoped.get("disclose_text") or "")
+    assert "应报未报" not in (gap_scoped.get("disclose_text") or "")
+    if gap_scoped.get("disclose"):
+        assert gap_scoped["disclose_kind"] == "divergent"
+
+    # 3) 验证跨多域 SAC 脚本经 plan_and_extract_script_evidences 后仍保留各自确定性域归属
+    ev_main = ExtractedLogicEvidence(
+        logic_fingerprint="fp-sac-multi-0",
+        business_domain_hint="大额与可疑外汇交易报送",
+        target_concept_hint="大额涉外交易圈定",
+        source_summary="圈定大额外汇申报主数据。",
+        inclusion_predicates=[],
+        exclusion_predicates=[],
+        branch_cases=[],
+        calculation_kind="DIRECT",
+        calculation_summary="按原始发生额报送。",
+        dedup_grain_hint="",
+        internal_locator={"script": "SP_SAC_ACCT_AMOUNT.sql", "chunk_index": 0, "statement_kind": "INSERT", "join_count": 1, "source_tables": ["A"], "target_tables": ["B"]},
+    )
+    ev_unrep = ExtractedLogicEvidence(
+        logic_fingerprint="fp-sac-multi-1",
+        business_domain_hint="应报未报漏报风险识别",
+        target_concept_hint="应报未报风险清单",
+        source_summary="生成应报未报漏报风险账户清单并供下游剔除。",
+        inclusion_predicates=[],
+        exclusion_predicates=[],
+        branch_cases=[],
+        calculation_kind="DIRECT",
+        calculation_summary="统计应报未报清单。",
+        dedup_grain_hint="",
+        internal_locator={"script": "SP_SAC_ACCT_AMOUNT.sql", "chunk_index": 1, "statement_kind": "INSERT", "join_count": 1, "source_tables": ["B"], "target_tables": ["C"]},
+    )
+
+    class _BroadSingleDomainPlanLlm:
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            if tool_name == "plan_code_structure":
+                return {
+                    "business_overview": "大额交易圈定与应报未报识别联合处理。",
+                    "canonical_domain": "大额与可疑外汇交易报送",
+                    "chunk_groups": [
+                        {
+                            "group_id": 0,
+                            "stage_title": "整合阶段",
+                            "business_domain": "大额与可疑外汇交易报送",
+                            "stage_role": "SCOPE_FILTER",
+                            "step_indices": [0, 1],
+                            "stage_purpose": "混合阶段",
+                        }
+                    ],
+                }, {"provider": "test", "model": "test"}
+            return {
+                "business_domain": "大额与可疑外汇交易报送",
+                "source_summary": "完成涉外交易圈定及应报未报风险识别处理。",
+                "calculation_summary": "按笔据实传出。",
+            }, {"provider": "test", "model": "test"}
+
+    bus = build_run_bus({"max_llm_calls": 20, "max_retries": 2, "max_total_tokens": 200000})
+    out_evs = plan_and_extract_script_evidences(
+        "SP_SAC_ACCT_AMOUNT.sql",
+        "涉外大额及应报未报统计",
+        [ev_main, ev_unrep],
+        [],
+        is_sac_script=True,
+        llm=_BroadSingleDomainPlanLlm(),
+        bus=bus,
+    )
+    assert out_evs[0].business_domain_hint == "大额与可疑外汇交易报送"
+    assert out_evs[1].business_domain_hint == "应报未报漏报风险识别"

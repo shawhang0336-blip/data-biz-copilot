@@ -5,7 +5,7 @@
 `disclose=True` 与固定披露文本，并在回答正文开头原样呈现，严禁用流畅的业务话术掩盖事实缺失。
 """
 
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, List
 
 DISCLOSURE_TEXT: Dict[str, str] = {
     "unrealized": (
@@ -25,6 +25,17 @@ DISCLOSURE_TEXT: Dict[str, str] = {
         "已有实际系统逻辑支撑，如发现业务理解偏差可通过“优化业务解释”补充完善。"
     ),
 }
+
+
+def format_disclosure_subjects(names: Iterable[str], max_items: int = 5) -> str:
+    """对涉及事项去重并保留顺序，避免长清单与重复项刷屏。"""
+    unique: List[str] = list(dict.fromkeys(str(n).strip() for n in names if str(n or "").strip()))
+    if not unique:
+        return ""
+    head = "、".join(unique[:max_items])
+    if len(unique) > max_items:
+        return f"{head} 等共 {len(unique)} 项"
+    return head
 
 
 def build_disclosure(kind: str, subject: str = "") -> Dict[str, Any]:

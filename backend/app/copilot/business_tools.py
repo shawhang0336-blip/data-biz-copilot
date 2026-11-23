@@ -15,7 +15,7 @@ from app.catalog.views import (
     list_capabilities,
     list_reconcile_ledger,
 )
-from app.copilot.disclosure import build_disclosure
+from app.copilot.disclosure import build_disclosure, format_disclosure_subjects
 from app.policy.dc_bus import sanitize_business_text
 
 BUSINESS_TOOL_SCHEMAS: List[Dict[str, Any]] = [
@@ -78,6 +78,23 @@ def _score_match(query: str, *fields: str) -> int:
     return score
 
 
+def _rule_intent_bonus(topic: str, rule: Dict[str, Any]) -> int:
+    bonus = 0
+    if any(k in topic for k in ("剔除", "排除", "不报", "跳过", "风险清单", "异常")):
+        if rule.get("rule_category") == "EXCLUSION":
+            bonus += 45
+    if any(k in topic for k in ("分支", "差异", "不一致", "分歧", "并行", "冲突")):
+        if rule.get("rule_category") == "BRANCH" or rule.get("reconcile_status") == "DIVERGENT":
+            bonus += 45
+    if any(k in topic for k in ("去重", "防重", "重复", "唯一")):
+        if rule.get("rule_category") == "DEDUP":
+            bonus += 45
+    if any(k in topic for k in ("纳入", "范围", "门槛", "覆盖")):
+        if rule.get("rule_category") == "INCLUSION":
+            bonus += 25
+    return bonus
+
+
 def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if tool_name == "list_covered_businesses":
         caps = list_capabilities(session)
@@ -112,7 +129,7 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
         if not caps:
             out.update(build_disclosure("not_found"))
         elif unrealized:
-            out.update(build_disclosure("unrealized", "、".join(c["name"] for c in unrealized)))
+            out.update(build_disclosure("unrealized", format_disclosure_subjects(c["name"] for c in unrealized)))
         return out
 
     if tool_name == "resolve_business_concept":
@@ -149,17 +166,30 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
         topic = str(args.get("topic") or args.get("query") or "").strip()
         category = args.get("rule_category")
         rules = list_business_rules(session, rule_category=category)
+        total_matched = len(rules)
         if topic:
-            scored = [(r, _score_match(topic, r["title"], r["capability_name"], r["business_condition"], r["business_action"])) for r in rules]
-            max_sc = max((sc for _, sc in scored), default=0)
-            cutoff = max(18, int(max_sc * 0.45)) if max_sc >= 20 else 1
-            filtered = [r for r, sc in sorted(scored, key=lambda x: x[1], reverse=True) if sc >= cutoff]
+            scored = []
+            for r in rules:
+                base_sc = _score_match(topic, r["title"], r["capability_name"], r["business_condition"], r["business_action"])
+                # 仅在命中主题关键词的前提下叠加意图加权，防止无关规则靠类别加分混入
+                total_sc = (base_sc + _rule_intent_bonus(topic, r)) if base_sc > 0 else 0
+                scored.append((r, base_sc, total_sc))
+            max_base = max((b for _, b, _ in scored), default=0)
+            cutoff = max(18, int(max_base * 0.45)) if max_base >= 20 else 1
+            filtered = [r for r, base_sc, _ in sorted(scored, key=lambda x: (x[2], x[1]), reverse=True) if base_sc >= cutoff]
             if filtered:
-                rules = filtered
+                total_matched = len(filtered)
+                rules = filtered[:15]
             elif not any(g in topic for g in ("全部", "所有", "列表")):
+                total_matched = 0
                 rules = []
+            else:
+                rules = rules[:15]
+        else:
+            rules = rules[:15]
         out = {
             "tool": tool_name,
+            "total_matched": total_matched,
             "rules": [
                 {
                     "code": r["code"],
@@ -178,14 +208,17 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
         if not rules:
             out.update(build_disclosure("not_found", topic))
         elif any(r["reconcile_status"] == "UNREALIZED" for r in rules[:6]):
-            out.update(build_disclosure("unrealized", "部分待落地规则"))
+            unreal_names = format_disclosure_subjects(r["title"] for r in rules[:6] if r["reconcile_status"] == "UNREALIZED")
+            out.update(build_disclosure("unrealized", unreal_names or "部分待落地规则"))
         elif any(r["reconcile_status"] == "DIVERGENT" for r in rules[:6]):
-            out.update(build_disclosure("divergent", "分支处理口径分歧"))
+            div_names = format_disclosure_subjects(r["title"] for r in rules[:6] if r["reconcile_status"] == "DIVERGENT")
+            out.update(build_disclosure("divergent", div_names or "分支处理口径分歧"))
         return out
 
     if tool_name == "get_business_caliber_detail":
         metric = str(args.get("metric") or args.get("query") or "").strip()
         calibers = list_business_calibers(session)
+        total_matched = len(calibers)
         if metric:
             scored = [
                 (c, _score_match(metric, c["metric_name"], c["capability_name"], c["business_definition"], " ".join(c["triggers"])))
@@ -195,11 +228,18 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
             cutoff = max(18, int(max_sc * 0.45)) if max_sc >= 20 else 1
             hits = [c for c, sc in sorted(scored, key=lambda x: x[1], reverse=True) if sc >= cutoff]
             if hits:
-                calibers = hits
+                total_matched = len(hits)
+                calibers = hits[:8]
             elif not any(g in metric for g in ("全部", "所有", "列表")):
+                total_matched = 0
                 calibers = []
+            else:
+                calibers = calibers[:8]
+        else:
+            calibers = calibers[:8]
         out = {
             "tool": tool_name,
+            "total_matched": total_matched,
             "calibers": [
                 {
                     "code": c["code"],
@@ -220,10 +260,10 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
         if not calibers:
             out.update(build_disclosure("not_found", metric))
         elif any(c["reconcile_status"] == "DIVERGENT" for c in calibers[:4]):
-            names = "、".join(c["metric_name"] for c in calibers[:4] if c["reconcile_status"] == "DIVERGENT")
+            names = format_disclosure_subjects(c["metric_name"] for c in calibers[:4] if c["reconcile_status"] == "DIVERGENT")
             out.update(build_disclosure("divergent", names))
         elif any(c["reconcile_status"] == "UNREALIZED" for c in calibers[:4]):
-            names = "、".join(c["metric_name"] for c in calibers[:4] if c["reconcile_status"] == "UNREALIZED")
+            names = format_disclosure_subjects(c["metric_name"] for c in calibers[:4] if c["reconcile_status"] == "UNREALIZED")
             out.update(build_disclosure("unrealized", names))
         return out
 
@@ -258,29 +298,47 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
         return out
 
     if tool_name == "check_regulatory_coverage_gap":
+        topic = str(args.get("topic") or args.get("query") or "").strip()
         ledger = list_reconcile_ledger(session)
         divergent = [x for x in ledger["items"] if x["reconcile_status"] == "DIVERGENT"]
         unrealized = [x for x in ledger["items"] if x["reconcile_status"] == "UNREALIZED"]
         verified = [x for x in ledger["items"] if x["reconcile_status"] in {"VERIFIED", "CONSISTENT"}]
+        if topic:
+            divergent = [x for x in divergent if _score_match(topic, x["name"], x["capability_name"], x["summary"]) > 0]
+            unrealized = [x for x in unrealized if _score_match(topic, x["name"], x["capability_name"], x["summary"]) > 0]
+            verified = [x for x in verified if _score_match(topic, x["name"], x["capability_name"], x["summary"]) > 0][:15]
+        else:
+            verified = verified[:15]
         out = {
             "tool": tool_name,
+            "topic": topic,
             "summary": ledger["summary"],
             "verified_items": verified,
-            "divergent_items": divergent,
-            "unrealized_items": unrealized,
+            "divergent_items": divergent[:15],
+            "unrealized_items": unrealized[:15],
         }
-        if unrealized:
-            out.update(build_disclosure("unrealized", "、".join(x["name"] for x in unrealized)))
+        prefers_divergent = bool(topic) and any(k in topic for k in ("分歧", "不一致", "冲突", "并行", "口径"))
+        if prefers_divergent and divergent:
+            out.update(build_disclosure("divergent", format_disclosure_subjects(x["name"] for x in divergent)))
+        elif unrealized:
+            out.update(build_disclosure("unrealized", format_disclosure_subjects(x["name"] for x in unrealized)))
         elif divergent:
-            out.update(build_disclosure("divergent", "、".join(x["name"] for x in divergent)))
+            out.update(build_disclosure("divergent", format_disclosure_subjects(x["name"] for x in divergent)))
         return out
 
     if tool_name == "find_rules_by_business_role":
         role = str(args.get("role") or args.get("audience") or "业务").strip()
-        rules = [r for r in list_business_rules(session) if role in r["audience"]]
-        cals = [c for c in list_business_calibers(session) if role in c["audience"]]
-        out = {"tool": tool_name, "role": role, "rules": rules, "calibers": cals}
-        if not (rules or cals):
+        all_rules = [r for r in list_business_rules(session) if role in r["audience"]]
+        all_cals = [c for c in list_business_calibers(session) if role in c["audience"]]
+        out = {
+            "tool": tool_name,
+            "role": role,
+            "total_matched_rules": len(all_rules),
+            "total_matched_calibers": len(all_cals),
+            "rules": all_rules[:15],
+            "calibers": all_cals[:8],
+        }
+        if not (all_rules or all_cals):
             out.update(build_disclosure("not_found", role))
         return out
 

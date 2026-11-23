@@ -194,6 +194,20 @@ def _collect_disclosures_and_citations(
     seen_disc = set()
     citations: List[Dict[str, Any]] = []
     seen_codes = set()
+    max_citations = 12
+
+    def _append_citation(asset_kind: str, code: str, title: str, reconcile_status: str) -> None:
+        if len(citations) >= max_citations or not code or code in seen_codes:
+            return
+        seen_codes.add(code)
+        citations.append(
+            {
+                "asset_kind": asset_kind,
+                "code": code,
+                "title": title,
+                "reconcile_status": reconcile_status,
+            }
+        )
 
     for out in tool_outputs:
         if out.get("disclose"):
@@ -208,41 +222,11 @@ def _collect_disclosures_and_citations(
                         existing["text"] = text
 
         for cap in (out.get("covered_businesses") or []) + (out.get("unrealized_businesses") or []) + (out.get("capabilities") or []):
-            code = cap.get("code")
-            if code and code not in seen_codes:
-                seen_codes.add(code)
-                citations.append(
-                    {
-                        "asset_kind": "CAPABILITY",
-                        "code": code,
-                        "title": cap["name"],
-                        "reconcile_status": cap.get("coverage_status", "COVERED"),
-                    }
-                )
+            _append_citation("CAPABILITY", str(cap.get("code") or ""), cap["name"], cap.get("coverage_status", "COVERED"))
         for rule in out.get("rules") or []:
-            code = rule.get("code")
-            if code and code not in seen_codes:
-                seen_codes.add(code)
-                citations.append(
-                    {
-                        "asset_kind": "RULE",
-                        "code": code,
-                        "title": rule["title"],
-                        "reconcile_status": rule.get("reconcile_status", "VERIFIED"),
-                    }
-                )
+            _append_citation("RULE", str(rule.get("code") or ""), rule["title"], rule.get("reconcile_status", "VERIFIED"))
         for cal in out.get("calibers") or []:
-            code = cal.get("code")
-            if code and code not in seen_codes:
-                seen_codes.add(code)
-                citations.append(
-                    {
-                        "asset_kind": "CALIBER",
-                        "code": code,
-                        "title": cal["metric_name"],
-                        "reconcile_status": cal.get("reconcile_status", "VERIFIED"),
-                    }
-                )
+            _append_citation("CALIBER", str(cal.get("code") or ""), cal["metric_name"], cal.get("reconcile_status", "VERIFIED"))
     return disclosures, citations
 
 
@@ -271,8 +255,11 @@ def _normalize_planned_tool_args(tool_name: str, raw_args: Any, clean_query: str
             or clean_query
         )
     ) or clean_query
-    if tool_name in {"list_covered_businesses", "check_regulatory_coverage_gap"}:
+    if tool_name == "list_covered_businesses":
         return {}
+    if tool_name == "check_regulatory_coverage_gap":
+        topic_val = sanitize_business_text(str(args.get("topic") or args.get("query") or "")).strip()
+        return {"topic": topic_val} if topic_val else {}
     if tool_name == "get_business_scope_and_rules":
         return {"topic": sanitize_business_text(str(args.get("topic") or fallback_text)) or clean_query}
     if tool_name == "get_business_caliber_detail":
@@ -315,7 +302,8 @@ def _plan_tools_with_llm(
             (
                 "根据业务人员的当前问题、上下文对话与已收录业务域目录，自主规划 1 至 4 步最合适的纯业务查询工具组合。"
                 "参数必须严格匹配参数名：get_business_scope_and_rules 用 topic；get_business_caliber_detail 用 metric；"
-                "resolve_business_concept 用 concept；find_rules_by_business_role 用 role；其余无参数传 {}。"
+                "resolve_business_concept 用 concept；find_rules_by_business_role 用 role；list_covered_businesses 传 {}；"
+                "check_regulatory_coverage_gap 仅当用户问全局未落地/全景盘点时传 {}，针对特定指标/主题一致性核对务必传 {\"topic\": \"主题词\"}。"
                 "严禁出现任何物理表名、字段名、代码或 SQL 关键词。"
             ),
             {
@@ -455,21 +443,31 @@ def ask_business_copilot(
         else:
             route_plan = _route_tools_for_query(clean_query, role_lens)
 
+        is_global_gap_query = any(
+            k in clean_query
+            for k in ("哪些业务", "全景", "盘点", "全部", "所有", "还没", "未落地", "未包含", "缺口", "差距")
+        )
         executed_sigs = set()
         for tool_name, args in route_plan:
-            sig = (tool_name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+            effective_args = dict(args)
+            if tool_name == "check_regulatory_coverage_gap" and not effective_args.get("topic") and not is_global_gap_query:
+                effective_args["topic"] = clean_query
+            sig = (tool_name, json.dumps(effective_args, sort_keys=True, ensure_ascii=False))
             executed_sigs.add(sig)
-            _run_tool_step(tool_name, args)
+            _run_tool_step(tool_name, effective_args)
 
         disclosures, citations = _collect_disclosures_and_citations(tool_outputs)
 
         # 若 AI 规划的工具组合未命中任何资产且未覆盖确定性路由，补齐确定性查询以确保完整依据
         if tool_planned_by_ai and not citations:
             for tool_name, args in _route_tools_for_query(clean_query, role_lens):
-                sig = (tool_name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+                effective_args = dict(args)
+                if tool_name == "check_regulatory_coverage_gap" and not effective_args.get("topic") and not is_global_gap_query:
+                    effective_args["topic"] = clean_query
+                sig = (tool_name, json.dumps(effective_args, sort_keys=True, ensure_ascii=False))
                 if sig not in executed_sigs:
                     executed_sigs.add(sig)
-                    _run_tool_step(tool_name, args)
+                    _run_tool_step(tool_name, effective_args)
             disclosures, citations = _collect_disclosures_and_citations(tool_outputs)
 
         # 再自动调用一次底层实证核验工具，确保所有回答的规则/口径均有清晰支撑定论
@@ -497,7 +495,11 @@ def ask_business_copilot(
             llm_args, _trace = call_llm_validated(
                 active_llm,
                 "compose_business_answer",
-                "结合业务资产与实证校验结论，用通俗纯中文业务语言解释当前系统逻辑是如何处理的以及为什么。严禁出现任何代码、SQL、物理表名或字段名。",
+                (
+                    "结合业务资产与实证校验结论作答，采用「先给 2-3 句明确结论，再分点用短句说明逻辑及原因」的精炼格式"
+                    "（单主题问答建议控制在 400~800 字，全景盘点不超过 1200 字，禁止同义车轱辘重复）；"
+                    "如系统存在多口径分歧或制度未落地需如实点明。严禁出现任何代码、SQL、物理表名或字段名。"
+                ),
                 {
                     "question": clean_query,
                     "role_lens": role_lens,
