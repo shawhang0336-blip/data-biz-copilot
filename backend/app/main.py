@@ -1,0 +1,40 @@
+"""dc_agent FastAPI 极简入口（Layer 7）。"""
+
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.api import register_routers
+from app.infra.config import get_settings
+from app.infra.db import init_db
+from app.infra.llm import close_http_client
+from app.infra.task_runner import task_runner
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    init_db()
+    try:
+        yield
+    finally:
+        task_runner().shutdown(wait=False)
+        close_http_client()
+
+
+def create_app() -> FastAPI:
+    settings = get_settings()
+    app = FastAPI(title=settings.app_name, lifespan=lifespan)
+    origins = [item.strip() for item in settings.cors_origins.split(",") if item.strip()]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins or ["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    register_routers(app)
+    return app
+
+
+app = create_app()
