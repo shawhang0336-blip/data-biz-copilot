@@ -47,6 +47,55 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
         },
         "required": ["answer"],
     },
+    "translate_logic_evidence": {
+        "type": "object",
+        "properties": {
+            "business_domain_hint": {"type": "string"},
+            "target_concept_hint": {"type": "string"},
+            "source_summary": {"type": "string"},
+            "inclusions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "rule_code": {"type": "string"},
+                        "title": {"type": "string"},
+                        "condition": {"type": "string"},
+                        "rationale": {"type": "string"},
+                    },
+                    "required": ["rule_code", "title", "condition", "rationale"],
+                },
+            },
+            "exclusions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "rule_code": {"type": "string"},
+                        "title": {"type": "string"},
+                        "condition": {"type": "string"},
+                        "rationale": {"type": "string"},
+                    },
+                    "required": ["rule_code", "title", "condition", "rationale"],
+                },
+            },
+            "branches": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "condition": {"type": "string"},
+                        "action": {"type": "string"},
+                    },
+                    "required": ["title", "condition", "action"],
+                },
+            },
+            "calculation_summary": {"type": "string"},
+            "dedup_grain_hint": {"type": "string"},
+        },
+        "required": ["business_domain_hint", "target_concept_hint", "source_summary", "calculation_summary"],
+    },
 }
 
 

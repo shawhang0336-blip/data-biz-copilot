@@ -119,6 +119,7 @@ _SAC_BUSINESS_GLOSSARY = (
 _EXEMPT_KEYS = {
     "id",
     "code",
+    "rule_code",
     "capability_id",
     "asset_id",
     "evidence_ids",
@@ -129,6 +130,8 @@ _EXEMPT_KEYS = {
     "reconcile_status",
     "coverage_status",
     "triggers",
+    "ast_features",
+    "statement_kind",
 }
 
 

@@ -52,7 +52,7 @@ body { margin: 0; }
 }
 
 .page-wrap {
-  max-width: 1220px;
+  max-width: 1260px;
   width: 100%;
   margin: 24px auto;
   padding: 0 20px 48px;
@@ -90,6 +90,11 @@ body { margin: 0; }
   font-weight: 600;
 }
 
+.btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .btn-primary {
   background: #2563eb;
   border-color: #2563eb;
@@ -100,6 +105,19 @@ body { margin: 0; }
   background: #059669;
   border-color: #059669;
   color: #fff;
+}
+
+.input,
+select,
+textarea {
+  width: 100%;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  background: #fff;
+  color: #162032;
 }
 
 .badge {
@@ -149,11 +167,85 @@ body { margin: 0; }
   border-color: #0f172a;
 }
 
-.input, textarea, select {
-  width: 100%;
-  padding: 9px 12px;
-  border: 1px solid #cbd5e1;
+.filter-bar {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+  padding: 14px 16px;
+}
+
+.lineage-row {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: #0f766e;
+  background: #f0fdfa;
+  border: 1px solid #99f6e4;
   border-radius: 8px;
+  padding: 7px 10px;
+  margin-top: 8px;
+}
+
+.copilot-layout {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  gap: 16px;
+  align-items: start;
+}
+
+@media (max-width: 860px) {
+  .copilot-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+.session-sidebar {
+  padding: 14px;
+}
+
+.session-item {
+  text-align: left;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+  border-radius: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  color: #162032;
+}
+
+.session-item.active {
+  border-color: #2563eb;
+  background: #eff6ff;
+}
+
+.md-body {
   font-size: 14px;
-  font-family: inherit;
+  line-height: 1.65;
+}
+
+.md-para {
+  margin: 6px 0;
+}
+
+.md-list {
+  margin: 6px 0;
+  padding-left: 20px;
+}
+
+.md-list li {
+  margin: 4px 0;
+}
+
+.inline-code {
+  background: #f1f5f9;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.modal-card {
+  border-color: #2563eb;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
 }

@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.api.common import db_session
-from app.infra.config import DEFAULT_BUDGET, get_budget
+from app.infra.config import DEFAULT_BUDGET, get_budget, get_llm_config, get_settings
 from app.infra.db_tables import EventModel, RunModel, SystemSettingModel
 from app.kernel.bus import global_bus
 from app.kernel.event_log import verify_chain
@@ -25,6 +25,14 @@ class BudgetUpdateRequest(BaseModel):
     max_llm_calls: int = Field(default=120, ge=0, le=2000)
     max_total_tokens: int = Field(default=1500000, ge=0, le=50000000)
     max_elapsed_seconds: int = Field(default=900, ge=0, le=86400)
+
+
+class LlmConfigUpdateRequest(BaseModel):
+    llm_provider: str = Field(default="scripted", min_length=1, max_length=64)
+    llm_base_url: str = Field(default="https://open.bigmodel.cn/api/paas/v4", min_length=1, max_length=500)
+    llm_model: str = Field(default="glm-4-plus", min_length=1, max_length=128)
+    llm_api_key: str = Field(default="", max_length=500)
+    llm_timeout: int = Field(default=120, ge=5, le=600)
 
 
 @router.get("/health")
@@ -95,3 +103,25 @@ def update_budget(req: BudgetUpdateRequest, session: Session = Depends(db_sessio
         row.value_json = data
     session.commit()
     return {"budget": get_budget(session)}
+
+
+@router.get("/settings/llm-config")
+def read_llm_config(session: Session = Depends(db_session)) -> Dict[str, Any]:
+    return {"config": get_llm_config(session, get_settings())}
+
+
+@router.put("/settings/llm-config")
+def update_llm_config(req: LlmConfigUpdateRequest, session: Session = Depends(db_session)) -> Dict[str, Any]:
+    row = session.get(SystemSettingModel, "llm_config")
+    existing = dict(row.value_json or {}) if (row is not None and isinstance(row.value_json, dict)) else {}
+    data = req.model_dump()
+    # 未输入新密钥时保留已有持久化密钥，防止误覆盖清空
+    if not str(data.get("llm_api_key") or "").strip():
+        data["llm_api_key"] = str(existing.get("llm_api_key") or "")
+    if row is None:
+        row = SystemSettingModel(key="llm_config", value_json=data)
+        session.add(row)
+    else:
+        row.value_json = data
+    session.commit()
+    return {"config": get_llm_config(session, get_settings())}

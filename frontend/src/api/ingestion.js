@@ -2,6 +2,7 @@ import { api } from './client.js'
 
 export const listSources = () => api('/api/sources')
 export const loadSamplePack = () => api('/api/sources/load-sample', { method: 'POST' })
+export const loadRealSacPack = () => api('/api/sources/load-sac-real', { method: 'POST' })
 export const triggerSynthesis = () => api('/api/sources/synthesize', { method: 'POST' })
 export const uploadSource = (materialKind, file) => {
   const form = new FormData()

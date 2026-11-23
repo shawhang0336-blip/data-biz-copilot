@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.infra.blob_store import LocalBlobStore
-from app.infra.config import Settings, get_settings
+from app.infra.config import Settings, get_effective_settings, get_settings
 from app.infra.db_tables import (
     BusinessCaliberAssetModel,
     BusinessCapabilityModel,
@@ -19,7 +19,7 @@ from app.infra.db_tables import (
     RunModel,
     SourceMaterialModel,
 )
-from app.infra.llm import call_llm_validated
+from app.infra.llm import RealDesignLlm, call_llm_validated
 from app.kernel.event_log import append_event
 from app.kernel.run import create_run as kernel_create_run
 from app.ingestion.builtin_pack import (
@@ -46,6 +46,37 @@ def _ensure_business_clean(bus, tool_name: str, payload: Dict[str, Any], allowed
     return payload
 
 
+def _resolve_optional_llm(session: Session, settings: Settings, explicit_llm: Any = None) -> Any:
+    if explicit_llm is not None:
+        return explicit_llm
+    eff = get_effective_settings(session, settings)
+    if eff.llm_provider != "scripted" and eff.llm_api_key:
+        return RealDesignLlm(eff)
+    return None
+
+
+def _match_relevant_clauses(
+    rule_text: str,
+    clauses: List[RegulatoryClauseModel],
+    allowed_kinds: set,
+) -> List[str]:
+    """基于关键词重合度将每条规则精确关联到对应制度条款，而非把全领域条款全部挂载。"""
+    candidates = [c for c in clauses if c.clause_kind in allowed_kinds] or list(clauses)
+    if not candidates:
+        return []
+    tokens = [w for w in re.findall(r"[\u4e00-\u9fff]{2,}", rule_text) if len(w) >= 2]
+    scored = []
+    for c in candidates:
+        hay = f"{c.clause_title} {c.business_requirement}"
+        hits = sum(1 for t in tokens if t in hay)
+        if hits > 0:
+            scored.append((c.id, hits))
+    if scored:
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [cid for cid, _ in scored[:3]]
+    return [c.id for c in candidates[:2]]
+
+
 def ingest_material(
     session: Session,
     *,
@@ -54,6 +85,7 @@ def ingest_material(
     file_type: str,
     content: bytes,
     settings: Optional[Settings] = None,
+    llm: Any = None,
 ) -> SourceMaterialModel:
     """并发安全地摄入监管制度文档或代码逻辑源，并提取条款或隐身底层实证。"""
     if material_kind not in {"REGULATORY_DOC", "CODE_LOGIC"}:
@@ -108,7 +140,13 @@ def ingest_material(
         material.item_count = len(clauses)
         material.summary = f"已从制度文档提取 {len(clauses)} 条业务规范与口径条款。"
     else:
-        evidences = parse_code_logic(title, content)
+        active_llm = _resolve_optional_llm(session, active_settings, llm)
+        evidences = parse_code_logic(
+            title,
+            content,
+            llm=active_llm,
+            bus=default_bus() if active_llm is not None else None,
+        )
         stored = 0
         for ev in evidences:
             if (
@@ -491,6 +529,9 @@ def synthesize_business_assets(
                 if rc in seen_rule_codes:
                     continue
                 seen_rule_codes.add(rc)
+                matched_clauses = _match_relevant_clauses(
+                    f"{item['title']} {item['condition']}", d_clauses, {"INCLUSION", "CAPABILITY"}
+                )
                 _upsert_rule(
                     session,
                     capability_id=cap_row.id,
@@ -500,9 +541,9 @@ def synthesize_business_assets(
                     business_condition=item["condition"],
                     business_action="满足该条件则纳入当期正式业务处理与报送范围",
                     business_rationale=item["rationale"],
-                    reconcile_status="VERIFIED" if d_clauses else "CONSISTENT",
+                    reconcile_status="VERIFIED" if matched_clauses else "CONSISTENT",
                     evidence_ids=[ev.id],
-                    clause_ids=[c.id for c in d_clauses if c.clause_kind in {"INCLUSION", "CAPABILITY"}],
+                    clause_ids=matched_clauses,
                     audience=audience,
                     bus=bus,
                 )
@@ -515,6 +556,9 @@ def synthesize_business_assets(
                 if rc in seen_rule_codes:
                     continue
                 seen_rule_codes.add(rc)
+                matched_clauses = _match_relevant_clauses(
+                    f"{item['title']} {item['condition']}", d_clauses, {"EXCLUSION"}
+                )
                 _upsert_rule(
                     session,
                     capability_id=cap_row.id,
@@ -524,9 +568,9 @@ def synthesize_business_assets(
                     business_condition=item["condition"],
                     business_action="自动剔除出当期常规报送结果（必要时单列进入风险待办清单）",
                     business_rationale=item["rationale"],
-                    reconcile_status="VERIFIED" if d_clauses else "CONSISTENT",
+                    reconcile_status="VERIFIED" if matched_clauses else "CONSISTENT",
                     evidence_ids=[ev.id],
-                    clause_ids=[c.id for c in d_clauses if c.clause_kind == "EXCLUSION"],
+                    clause_ids=matched_clauses,
                     audience="业务 / 监管报送 / 合规",
                     bus=bus,
                 )
@@ -539,6 +583,9 @@ def synthesize_business_assets(
                     continue
                 seen_rule_codes.add(rc)
                 is_div = "分歧" in item["title"] or ev.calculation_kind == "CONFLICT"
+                matched_clauses = _match_relevant_clauses(
+                    f"{item['title']} {item['condition']}", d_clauses, {"BRANCH", "CALIBER"}
+                )
                 _upsert_rule(
                     session,
                     capability_id=cap_row.id,
@@ -548,9 +595,9 @@ def synthesize_business_assets(
                     business_condition=item["condition"],
                     business_action=item["action"],
                     business_rationale="按业务主体类别或账户属性自动进入差异化处理分支。",
-                    reconcile_status="DIVERGENT" if is_div else ("VERIFIED" if d_clauses else "CONSISTENT"),
+                    reconcile_status="DIVERGENT" if is_div else ("VERIFIED" if matched_clauses else "CONSISTENT"),
                     evidence_ids=[ev.id],
-                    clause_ids=[c.id for c in d_clauses if c.clause_kind in {"BRANCH", "CALIBER"}],
+                    clause_ids=matched_clauses,
                     audience=audience,
                     bus=bus,
                 )
@@ -561,6 +608,9 @@ def synthesize_business_assets(
                 rc = f"rule-{cap_code[4:]}-dedup-{hashlib.md5(ev.dedup_grain_hint.encode('utf-8')).hexdigest()[:6]}"
                 if rc not in seen_rule_codes:
                     seen_rule_codes.add(rc)
+                    matched_clauses = _match_relevant_clauses(
+                        ev.dedup_grain_hint, d_clauses, {"INCLUSION", "CAPABILITY"}
+                    )
                     _upsert_rule(
                         session,
                         capability_id=cap_row.id,
@@ -570,9 +620,9 @@ def synthesize_business_assets(
                         business_condition="同一客户、账户或交易在系统加工过程中出现多条状态记录时",
                         business_action=ev.dedup_grain_hint,
                         business_rationale="保障报送金额与交易笔数准确唯一，防止同一业务被重复计数。",
-                        reconcile_status="VERIFIED" if d_clauses else "CONSISTENT",
+                        reconcile_status="VERIFIED" if matched_clauses else "CONSISTENT",
                         evidence_ids=[ev.id],
-                        clause_ids=[c.id for c in d_clauses if c.clause_kind in {"INCLUSION", "CAPABILITY"}],
+                        clause_ids=matched_clauses,
                         audience=audience,
                         bus=bus,
                     )

@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.copilot.business_tools import execute_business_tool
 from app.copilot.disclosure import build_disclosure
-from app.infra.config import Settings, get_settings
+from app.infra.config import Settings, get_effective_settings, get_settings
 from app.infra.db_tables import CopilotMessageModel, CopilotSessionModel
 from app.infra.llm import RealDesignLlm, call_llm_validated
 from app.kernel.event_log import _SessionRLock, bind_session_lock
@@ -99,9 +99,9 @@ def _deterministic_business_narrative(
                     tag = cat_labels.get(r["rule_category"], "业务规则")
                     lines.append(
                         f"- **【{tag}】{r['title']}**（所属业务：{r['capability_name']}）：\n"
-                        f"  - 业务触发条件：{r['business_condition']}\n"
-                        f"  - 系统处理结论：{r['business_action']}\n"
-                        f"  - 业务合规依据：{r['business_rationale']}"
+                        f"  - 当前逻辑实际执行：{r['business_condition']}\n"
+                        f"  - 对应业务解释与结果：{r['business_action']}\n"
+                        f"  - 业务逻辑成因：{r['business_rationale']}"
                     )
                 sections.append("\n".join(lines))
 
@@ -129,7 +129,7 @@ def _deterministic_business_narrative(
                 f"仅制度提及但系统尚未包含 **{len(un_items)} 项**。"
             ]
             if div_items:
-                lines.append("• **需要业务拍板统一的口径分歧**：")
+                lines.append("• **系统内存在多套并行处理路径的口径差异**：")
                 for d in div_items:
                     lines.append(f"  - {d['name']}：{d['summary']}")
             if un_items:
@@ -252,7 +252,7 @@ def ask_business_copilot(
     if not clean_query:
         raise ValueError("提问内容不能为空")
 
-    active_settings = settings or get_settings()
+    active_settings = get_effective_settings(session, settings or get_settings())
     sid = session_id or str(uuid.uuid4())
     bind_session_lock(session, _get_copilot_lock(sid), "_held_copilot_locks", sid)
 
@@ -335,13 +335,25 @@ def ask_business_copilot(
 
     if active_llm is not None:
         allowed_codes = [c["code"] for c in citations]
+        recent_rows = (
+            session.query(CopilotMessageModel)
+            .filter(CopilotMessageModel.session_id == sid, CopilotMessageModel.id != user_msg.id)
+            .order_by(CopilotMessageModel.created_at.desc())
+            .limit(6)
+            .all()
+        )
+        recent_history = [
+            {"role": m.role, "content": m.content[:400]}
+            for m in reversed(recent_rows)
+        ]
         llm_args, _trace = call_llm_validated(
             active_llm,
             "compose_business_answer",
-            "结合业务资产与实证校验结论，用通俗纯中文业务语言回答业务人员问题。严禁出现任何代码、SQL、物理表名或字段名。",
+            "结合业务资产与实证校验结论，用通俗纯中文业务语言解释当前系统逻辑是如何处理的以及为什么。严禁出现任何代码、SQL、物理表名或字段名。",
             {
                 "question": clean_query,
                 "role_lens": role_lens,
+                "recent_history": recent_history,
                 "tool_outputs": tool_outputs,
                 "backing_verdicts": backing_verdicts,
                 "disclosures": disclosures,

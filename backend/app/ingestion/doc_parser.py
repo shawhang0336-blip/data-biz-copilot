@@ -262,8 +262,33 @@ def _clean_section_title(raw_title: str) -> str:
     return t or "业务规范条款"
 
 
+def _infer_doc_tier(filename: str) -> str:
+    """区分宏观规划/政策宣贯类文件与可直接核对数据落地的制度规范。"""
+    fn = filename or ""
+    if any(k in fn for k in ("实施方案", "实施意见", "试点", "答记者问", "废止清单", "处罚通报", "会议文章")):
+        return "MACRO_POLICY"
+    return "ACTIONABLE_SPEC"
+
+
+def _is_actionable_macro_clause(title: str, body: str) -> bool:
+    """对宏观政策文件只保留与报送数据、合规口径、系统监测直接相关的条款，过滤纯党建/人才/绿色/基建条文。"""
+    text = f"{title} {body}"
+    data_keywords = (
+        "一表通", "互联网贷款", "信贷资产转让", "数字人民币", "大额交易", "可疑交易",
+        "监管报表", "监管数据", "EAST", "漏报", "错报", "数据质量", "统计", "报送",
+    )
+    non_data_noise = (
+        "人才体系", "乡村振兴", "绿色金融", "绿色数据中心", "东数西算", "量子计算",
+        "揭榜挂帅", "无障碍", "适老", "组织保障", "同业科技输出", "区域协同", "先进制造业",
+    )
+    if any(n in title for n in non_data_noise) and "一表通" not in text and "报送" not in title:
+        return False
+    return any(k in text for k in data_keywords)
+
+
 def parse_regulatory_document(filename: str, content: bytes) -> List[ExtractedClause]:
     """将监管或业务制度文档确定性拆分为结构化业务条款（自动解析并剥离 frontmatter 与网页导航噪音）。"""
+    doc_tier = _infer_doc_tier(filename)
     raw_text = _extract_raw_text(filename, content)
     meta, text = _split_frontmatter(raw_text)
 
@@ -334,6 +359,8 @@ def parse_regulatory_document(filename: str, content: bytes) -> List[ExtractedCl
 
     clauses: List[ExtractedClause] = []
     for idx, sec in enumerate(sections):
+        if doc_tier == "MACRO_POLICY" and not _is_actionable_macro_clause(sec["title"], sec["body"]):
+            continue
         kind = _infer_clause_kind(sec["title"], sec["body"], meta=meta)
         domain = _infer_domain(sec["chapter"], sec["title"], sec["body"], meta=meta)
         audience = meta.get("audience") or _infer_audience(f"{sec['title']} {sec['body']}")
@@ -348,7 +375,12 @@ def parse_regulatory_document(filename: str, content: bytes) -> List[ExtractedCl
                 business_requirement=sec["body"],
                 audience=audience,
                 metrics_mentioned=_extract_metrics_mentioned(f"{sec['title']} {sec['body']}"),
-                source_locator={"filename": filename, "section_index": idx, "chapter": sec["chapter"]},
+                source_locator={
+                    "filename": filename,
+                    "section_index": idx,
+                    "chapter": sec["chapter"],
+                    "doc_tier": doc_tier,
+                },
             )
         )
     return clauses

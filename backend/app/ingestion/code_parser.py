@@ -10,9 +10,14 @@
 
 import hashlib
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.infra.contracts import ExtractedLogicEvidence
+from app.ingestion.ast_extractor import (
+    extract_sql_ast_skeleton,
+    synthesize_generic_business_semantics,
+    translate_evidence_with_llm,
+)
 
 
 def _unwrap_execute_immediate(sql_text: str) -> str:
@@ -150,6 +155,19 @@ def _is_housekeeping_chunk(stmt: str, targets: List[str]) -> bool:
         if not any(op in upper for op in ("INSERT ", "MERGE ", "SELECT ")):
             return True
     return False
+
+
+_SAC_CUES = (
+    "SAC", "EAST", "GRCKFHZ", "DGKHXXB", "JGXXB", "SXXXB", "JGDEJSH", "LARGEFUNDS",
+    "UNREPORT", "应报未报", "漏报", "DFVLOC", "DEALAMOUNT", "ACCOUNTBALAN", "KHHZH",
+    "DDACMSP", "HSMSMP", "GLACMSP", "分户账", "联名账户", "JOINT_BAL", "大额", "可疑",
+    "外汇", "统括", "TDACMSP", "IPACMSP", "EPACMSP", "VALID_FLAG",
+)
+
+
+def _is_known_sac_logic(filename: str, banner: str, comments: List[str], targets: List[str], chunk: str) -> bool:
+    blob = " ".join([filename, banner, *comments, *targets, chunk]).upper()
+    return any(cue in blob for cue in _SAC_CUES)
 
 
 def _infer_domain_and_concept(
@@ -513,7 +531,7 @@ def _translate_branches(domain: str, chunk: str, comments: List[str]) -> List[Di
         _add_branch(
             "跨境联名账户余额分歧处理分支",
             "针对跨境联名账户余额，逻辑中同时存在按约定持有比例拆分与全额归入主申报人两种不同处理路径",
-            "存在多口径并行实现，需业务人员进一步签字拍板统一口径",
+            "目前两套口径在系统中并行存在，对外解释需如实说明各自适用的折算条件",
         )
     if domain == "对公客户信息与境内外身份监管报送":
         if "CHN" in upper and "TWN" in upper and "CUST_NAM_EN" in upper:
@@ -539,7 +557,7 @@ def _translate_branches(domain: str, chunk: str, comments: List[str]) -> List[Di
             _add_branch(
                 "机构大额结售汇交易对手总账账号与异常户名分歧分支",
                 "当交易对手账号前 18 位命中内部总账科目时仅截取前 18 位并改用对方行号作为对手名称；部分渠道当对手户名为 0 时改取开户行名称，而其余普通渠道按原对手户名上报",
-                "存在普通交易对手与内部总账/异常缺省兜底并行口径，需业务确认统一对外解释",
+                "并列揭示普通交易对手与内部总账/异常兜底两种实际逻辑，便于业务理解差异来源",
             )
         if "GTRF" in upper or "GTE" in upper:
             _add_branch(
@@ -634,8 +652,14 @@ def _parse_schema_ddl_by_domain(filename: str, text: str) -> List[ExtractedLogic
     return evidences
 
 
-def parse_code_logic(filename: str, content: bytes) -> List[ExtractedLogicEvidence]:
-    """把 SQL / 存储过程代码切块并静默提炼为纯业务语义的底层实证清单。"""
+def parse_code_logic(
+    filename: str,
+    content: bytes,
+    *,
+    llm: Any = None,
+    bus: Any = None,
+) -> List[ExtractedLogicEvidence]:
+    """把 SQL / 存储过程代码切块并结合 sqlglot AST 静默提炼为纯业务语义的底层实证清单。"""
     text = content.decode("utf-8", errors="replace")
     if filename.upper() == "SAC_TABLE_SCHEMAS.SQL" or (
         text.upper().count("CREATE TABLE") >= 10 and text.upper().count("CREATE OR REPLACE") == 0
@@ -653,17 +677,35 @@ def parse_code_logic(filename: str, content: bytes) -> List[ExtractedLogicEviden
         if _is_housekeeping_chunk(stmt, targets):
             continue
         comments = _extract_comments(stmt)
-        domain, concept = _infer_domain_and_concept(filename, stmt, comments, targets, banner=banner)
-        inclusions, exclusions = _translate_predicates(domain, stmt, comments)
-        branches = _translate_branches(domain, stmt, comments)
-        calc_kind, calc_summary = _translate_calculations(domain, stmt, comments)
-        dedup_hint = _translate_dedup(stmt)
-        source_summary = next((c for c in comments if "程序描述" in c or "业务说明" in c or "任务描述" in c), "")
-        if not source_summary and banner:
-            source_summary = banner
-        if not source_summary:
-            source_summary = f"支撑「{concept}」处理的第 {idx + 1} 项底层逻辑环节。"
-        source_summary = re.sub(r"^(?:程序描述|业务说明|任务描述|程序名称)[：:\s]*", "", source_summary).strip()
+        skeleton = extract_sql_ast_skeleton(stmt)
+        merged_targets = list(dict.fromkeys(targets + (skeleton.get("target_tables") or []) + (skeleton.get("source_tables") or [])))
+
+        if _is_known_sac_logic(filename, banner, comments, merged_targets, stmt):
+            domain, concept = _infer_domain_and_concept(filename, stmt, comments, merged_targets, banner=banner)
+            inclusions, exclusions = _translate_predicates(domain, stmt, comments)
+            branches = _translate_branches(domain, stmt, comments)
+            calc_kind, calc_summary = _translate_calculations(domain, stmt, comments)
+            dedup_hint = _translate_dedup(stmt)
+            source_summary = next((c for c in comments if "程序描述" in c or "业务说明" in c or "任务描述" in c), "")
+            if not source_summary and banner:
+                source_summary = banner
+            if not source_summary:
+                source_summary = f"支撑「{concept}」处理的第 {idx + 1} 项底层逻辑环节。"
+            source_summary = re.sub(r"^(?:程序描述|业务说明|任务描述|程序名称)[：:\s]*", "", source_summary).strip()
+        else:
+            generic = synthesize_generic_business_semantics(skeleton, comments, filename)
+            if llm is not None and bus is not None:
+                generic = translate_evidence_with_llm(skeleton, comments, generic, llm=llm, bus=bus)
+            domain = generic["business_domain_hint"]
+            concept = generic["target_concept_hint"]
+            inclusions = generic["inclusions"]
+            exclusions = generic["exclusions"]
+            branches = generic["branches"]
+            calc_kind = generic["calculation_kind"]
+            calc_summary = generic["calculation_summary"]
+            dedup_hint = generic["dedup_grain_hint"]
+            source_summary = generic["source_summary"]
+
         fingerprint = hashlib.sha256(f"{filename}:{idx}:{stmt}".encode("utf-8")).hexdigest()
         evidences.append(
             ExtractedLogicEvidence(
@@ -681,7 +723,12 @@ def parse_code_logic(filename: str, content: bytes) -> List[ExtractedLogicEviden
                     "script": filename,
                     "chunk_index": idx,
                     "start_line": start_line,
-                    "physical_objects": targets,
+                    "physical_objects": merged_targets,
+                    "target_tables": skeleton.get("target_tables") or [],
+                    "source_tables": skeleton.get("source_tables") or [],
+                    "ast_parsed": bool(skeleton.get("ast_parsed")),
+                    "statement_kind": skeleton.get("statement_kind", "UNKNOWN"),
+                    "join_count": skeleton.get("join_count", 0),
                 },
             )
         )

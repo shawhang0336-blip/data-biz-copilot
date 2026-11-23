@@ -13,6 +13,7 @@ from app.infra.db_tables import (
     BusinessCaliberAssetModel,
     BusinessCapabilityModel,
     BusinessRuleAssetModel,
+    LogicEvidenceModel,
     RegulatoryClauseModel,
     SourceMaterialModel,
 )
@@ -82,8 +83,50 @@ def list_source_materials(session: Session) -> List[Dict[str, Any]]:
     ]
 
 
+def _compute_business_lineage(session: Session) -> Dict[str, Dict[str, List[str]]]:
+    """依据底层实证读写表拓扑计算纯业务层面的上下游业务板块流向（绝不向外返回任何表名）。"""
+    evidences = session.query(LogicEvidenceModel).all()
+    writers: Dict[str, List[str]] = {}
+    readers: Dict[str, List[str]] = {}
+    for ev in evidences:
+        loc = ev.internal_locator_json or {}
+        dom = ev.business_domain_hint
+        tgt_tbls = [str(t).upper() for t in (loc.get("target_tables") or []) if t]
+        src_tbls = [str(t).upper() for t in (loc.get("source_tables") or []) if t]
+        if not tgt_tbls and not src_tbls:
+            objs = [str(t).upper() for t in (loc.get("physical_objects") or []) if t]
+            if objs:
+                tgt_tbls = [objs[0]]
+                src_tbls = objs[1:]
+        for t in tgt_tbls:
+            writers.setdefault(t, [])
+            if dom not in writers[t]:
+                writers[t].append(dom)
+        for t in src_tbls:
+            readers.setdefault(t, [])
+            if dom not in readers[t]:
+                readers[t].append(dom)
+
+    upstream: Dict[str, List[str]] = {}
+    downstream: Dict[str, List[str]] = {}
+    for tbl, w_domains in writers.items():
+        r_domains = readers.get(tbl, [])
+        for w in w_domains:
+            for r in r_domains:
+                if w == r:
+                    continue
+                downstream.setdefault(w, [])
+                if r not in downstream[w]:
+                    downstream[w].append(r)
+                upstream.setdefault(r, [])
+                if w not in upstream[r]:
+                    upstream[r].append(w)
+    return {"upstream": upstream, "downstream": downstream}
+
+
 def list_capabilities(session: Session) -> List[Dict[str, Any]]:
     rows = session.query(BusinessCapabilityModel).order_by(BusinessCapabilityModel.name.asc()).all()
+    lineage = _compute_business_lineage(session)
     return [
         {
             "id": r.id,
@@ -98,6 +141,8 @@ def list_capabilities(session: Session) -> List[Dict[str, Any]]:
             "confirmed_count": r.confirmed_count,
             "logic_backing_count": len(r.evidence_ids_json or []),
             "clause_backing_count": len(r.clause_ids_json or []),
+            "upstream_businesses": lineage["upstream"].get(r.name, []),
+            "downstream_businesses": lineage["downstream"].get(r.name, []),
             "status": r.status,
             "current_version": r.current_version,
         }
