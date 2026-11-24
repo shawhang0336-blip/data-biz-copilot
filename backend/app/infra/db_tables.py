@@ -1,8 +1,9 @@
-"""统一 ORM 表模型定义（基础设施层 Layer 0，11 张核心表）。
+"""统一 ORM 表模型定义（基础设施层 Layer 0，12 张核心表）。
 
 分为三组：
 1. 内核运行时账本与系统设置：`RunModel` / `EventModel` / `SystemSettingModel`；
-2. 双源接入与底层隐身实证库：`SourceMaterialModel` / `RegulatoryClauseModel` / `LogicEvidenceModel`；
+2. 双源接入、异步批任务与底层隐身实证库：`IngestionJobModel` / `SourceMaterialModel` /
+   `RegulatoryClauseModel` / `LogicEvidenceModel`；
 3. 纯业务资产层与 Copilot 会话：`BusinessCapabilityModel` / `BusinessRuleAssetModel` /
    `BusinessCaliberAssetModel` / `AssetRevisionModel` / `CopilotSessionModel` / `CopilotMessageModel`。
 """
@@ -62,6 +63,37 @@ class SystemSettingModel(Base):
 # =============================================================================
 
 
+class IngestionJobModel(Base):
+    """千级脚本异步批处理接入任务台账（断点续跑、分层统计与实时进度源）。"""
+
+    __tablename__ = "ingestion_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(36), index=True)
+    name: Mapped[str] = mapped_column(String(255), default="")
+    # UPLOAD_BATCH | ZIP_ARCHIVE | LOCAL_DIR
+    source_mode: Mapped[str] = mapped_column(String(32), default="UPLOAD_BATCH")
+    # SCANNING | READY_REVIEW | RUNNING | PAUSED_BUDGET | CANCELLED | COMPLETED | FAILED
+    status: Mapped[str] = mapped_column(String(32), index=True, default="SCANNING")
+    # STAGING | STATIC_SCAN | TIER2_PARSE | TIER1_PARSE | TEMPLATE_CLONE | SYNTHESIZING | DONE
+    current_phase: Mapped[str] = mapped_column(String(32), default="STAGING")
+    total_files: Mapped[int] = mapped_column(Integer, default=0)
+    tier1_count: Mapped[int] = mapped_column(Integer, default=0)
+    tier2_count: Mapped[int] = mapped_column(Integer, default=0)
+    tier3_count: Mapped[int] = mapped_column(Integer, default=0)
+    template_clone_count: Mapped[int] = mapped_column(Integer, default=0)
+    completed_count: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    llm_calls_used: Mapped[int] = mapped_column(Integer, default=0)
+    tokens_used: Mapped[int] = mapped_column(Integer, default=0)
+    elapsed_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    config_json: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    error_summary: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class SourceMaterialModel(Base):
     __tablename__ = "source_materials"
 
@@ -72,9 +104,21 @@ class SourceMaterialModel(Base):
     file_type: Mapped[str] = mapped_column(String(16))
     sha256: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     blob_uri: Mapped[str] = mapped_column(String(255))
+    # PENDING | STATIC_INDEXED | PARSING | PARSED | SKIPPED_AI | FAILED（兼容旧 INGESTED）
     status: Mapped[str] = mapped_column(String(32), index=True, default="INGESTED")
     summary: Mapped[str] = mapped_column(Text, default="")
     item_count: Mapped[int] = mapped_column(Integer, default=0)
+    batch_job_id: Mapped[Optional[str]] = mapped_column(String(36), index=True, nullable=True)
+    relative_path: Mapped[str] = mapped_column(String(512), default="")
+    # TIER_1_CORE | TIER_2_UPSTREAM | TIER_3_SKIP_AI
+    tier: Mapped[str] = mapped_column(String(32), index=True, default="TIER_1_CORE")
+    tier_override: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    skip_reason: Mapped[str] = mapped_column(String(64), default="")
+    ast_template_hash: Mapped[str] = mapped_column(String(64), index=True, default="")
+    template_master_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    target_tables_json: Mapped[List[str]] = mapped_column(JSON, default=list)
+    source_tables_json: Mapped[List[str]] = mapped_column(JSON, default=list)
+    error_message: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

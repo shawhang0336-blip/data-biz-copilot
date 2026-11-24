@@ -323,12 +323,21 @@ class BudgetLimits:
 class BudgetExceededError(RuntimeError):
     """成本或步数超出 BudgetLimits 时抛出的内核级熔断异常。"""
 
-    def __init__(self, metric: str, used: Any, limit: Any, snapshot: Dict[str, Any]) -> None:
+    def __init__(
+        self,
+        metric: str,
+        used: Any,
+        limit: Any,
+        snapshot: Dict[str, Any],
+        *,
+        run_id: Optional[str] = None,
+    ) -> None:
         super().__init__(f"执行预算超限（{metric}={used}，上限={limit}），内核已触发熔断。")
         self.metric = metric
         self.used = used
         self.limit = limit
         self.snapshot = snapshot
+        self.run_id = run_id
 
 
 class BudgetGuard:
@@ -462,7 +471,7 @@ class BudgetGuard:
                     "snapshot": snap,
                 },
             )
-        raise BudgetExceededError(metric, used, limit, snap)
+        raise BudgetExceededError(metric, used, limit, snap, run_id=self.run_id)
 
     def begin_call(self, bus: Optional[Bus] = None) -> None:
         """在锁内原子校验预算并预占一次在途 LLM 调用名额，防止并发突破上限。"""

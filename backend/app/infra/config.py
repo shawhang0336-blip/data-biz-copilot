@@ -12,10 +12,12 @@ OPERATOR_PLACEHOLDER = "业务确认人"
 
 DEFAULT_BUDGET: Dict[str, int] = {
     "max_retries": 3,
-    "max_llm_concurrency": 4,
-    "max_llm_calls": 240,
-    "max_total_tokens": 3000000,
-    "max_elapsed_seconds": 900,
+    "max_llm_concurrency": 6,
+    "max_llm_rpm": 60,
+    "max_calls_per_script": 8,
+    "max_llm_calls": 2400,
+    "max_total_tokens": 20000000,
+    "max_elapsed_seconds": 7200,
 }
 
 

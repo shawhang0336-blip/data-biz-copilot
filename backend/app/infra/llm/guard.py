@@ -3,13 +3,14 @@
 from contextlib import contextmanager
 import contextvars
 import random
+import re
 import time
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import httpx
 
-from app.infra.errors import WorkflowError
-from app.infra.llm.client import LlmTimeoutError
+from app.infra.errors import ProviderAuthOrBillingError, WorkflowError
+from app.infra.llm.client import LlmTimeoutError, llm_rate_limiter, notify_llm_rate_limited, set_cancellation_provider
 
 _ACTIVE_BUS: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar("dc_active_llm_bus", default=None)
 _ACTIVE_CANCEL: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar("dc_active_llm_cancel", default=None)
@@ -23,6 +24,13 @@ _NO_TOOL_CALL_HINT = (
 )
 
 _TRANSIENT_HTTP_MARKERS = ("LLM HTTP 429", "LLM HTTP 500", "LLM HTTP 502", "LLM HTTP 503", "LLM HTTP 504")
+_FATAL_BILLING_MARKERS = (
+    "LLM HTTP 401",
+    "LLM HTTP 402",
+    "LLM HTTP 403",
+    "Insufficient Balance",
+    "invalid_api_key",
+)
 _TRANSIENT_TRANSPORT_MARKERS = (
     "ConnectError",
     "ConnectTimeout",
@@ -41,6 +49,9 @@ def current_llm_bus() -> Optional[Any]:
 
 def current_cancellation() -> Optional[Any]:
     return _ACTIVE_CANCEL.get()
+
+
+set_cancellation_provider(current_cancellation)
 
 
 @contextmanager
@@ -118,10 +129,14 @@ def call_llm_validated(
     cancellation = _ACTIVE_CANCEL.get()
     validate_fn = validator if validator is not None else (lambda args: args)
 
-    max_total = max(1, transient_attempts) + max(1, validation_attempts)
+    max_transient = max(1, transient_attempts)
+    max_total = max_transient + max(1, validation_attempts)
+    rate_limit_bonus = 2
     reserved_calls = 0
+    attempt = 0
     try:
-        for attempt in range(1, max_total + 1):
+        while attempt < (max_total + (rate_limit_bonus if "LLM HTTP 429" in last_error else 0)):
+            attempt += 1
             if cancellation is not None and hasattr(cancellation, "raise_if_cancelled"):
                 cancellation.raise_if_cancelled()
             if active_bus is not None and hasattr(active_bus, "begin_llm_call"):
@@ -210,7 +225,12 @@ def call_llm_validated(
                     continue
                 transient_used += 1
                 last_kind = kind
-                if transient_used >= transient_attempts:
+                is_429 = "LLM HTTP 429" in last_error
+                if is_429 and llm_rate_limiter().cooldown_remaining() <= 0.0:
+                    m_ra = re.search(r"retry_after=([0-9]+(?:\.[0-9]+)?)", last_error)
+                    notify_llm_rate_limited(float(m_ra.group(1)) if m_ra else None)
+                limit_transient = transient_attempts + (rate_limit_bonus if is_429 else 0)
+                if transient_used >= limit_transient:
                     break
                 backoff_wait(wait_steps, transient_used, cancellation=cancellation)
             except (ValueError, KeyError) as exc:
@@ -224,6 +244,11 @@ def call_llm_validated(
         if reserved_calls and active_bus is not None and hasattr(active_bus, "end_llm_calls"):
             active_bus.end_llm_calls(reserved_calls)
 
+    if last_kind == "model_error" and any(m.lower() in last_error.lower() for m in _FATAL_BILLING_MARKERS):
+        raise ProviderAuthOrBillingError(
+            f"{tool_name} 调用失败（{last_kind}）：{last_error}",
+            context={"tool_name": tool_name, "error_kind": last_kind},
+        )
     raise WorkflowError(
         f"{tool_name} 调用失败（{last_kind}）：{last_error}",
         context={"tool_name": tool_name, "error_kind": last_kind, "retried": transient_used > 1},

@@ -661,6 +661,8 @@ def parse_code_logic(
     *,
     llm: Any = None,
     bus: Any = None,
+    execution_mode: str = "full",
+    upstream_context: Optional[List[Dict[str, Any]]] = None,
 ) -> List[ExtractedLogicEvidence]:
     """把 SQL / 存储过程代码切块并结合 sqlglot AST 静默提炼为纯业务语义的底层实证清单。"""
     text = content.decode("utf-8", errors="replace")
@@ -748,8 +750,21 @@ def parse_code_logic(
         evidences.append(ev)
         step_sql_contexts.append(dict(skeleton.get("logic_details") or {}))
 
-    if llm is not None and bus is not None and evidences:
-        if len(evidences) >= 2:
+    if execution_mode != "static_only" and llm is not None and bus is not None and evidences:
+        if execution_mode == "lite":
+            enrich_script_evidences_with_llm(
+                filename,
+                banner,
+                evidences,
+                comments_pool,
+                llm=llm,
+                bus=bus,
+                step_sql_contexts=step_sql_contexts,
+                is_sac_script=any_sac,
+                upstream_context=upstream_context,
+                lite_mode=True,
+            )
+        elif len(evidences) >= 2:
             evidences = plan_and_extract_script_evidences(
                 filename,
                 banner,
@@ -759,6 +774,7 @@ def parse_code_logic(
                 llm=llm,
                 bus=bus,
                 step_sql_contexts=step_sql_contexts,
+                upstream_context=upstream_context,
             )
         elif not any_sac and single_generic_info is not None:
             sk, cm, gen = single_generic_info
@@ -769,6 +785,7 @@ def parse_code_logic(
                 llm=llm,
                 bus=bus,
                 sql_context=step_sql_contexts[0],
+                upstream_context=upstream_context,
             )
             ev0 = evidences[0]
             ev0.business_domain_hint = translated["business_domain_hint"]
@@ -792,5 +809,6 @@ def parse_code_logic(
                 bus=bus,
                 step_sql_contexts=step_sql_contexts,
                 is_sac_script=any_sac,
+                upstream_context=upstream_context,
             )
     return evidences

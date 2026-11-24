@@ -13,6 +13,7 @@ from app.infra.db_tables import (
     BusinessCapabilityModel,
     BusinessRuleAssetModel,
 )
+from app.infra.retrieval import invalidate_bm25_caches
 from app.policy.dc_bus import detect_technical_jargon
 
 
@@ -108,6 +109,7 @@ def update_business_rule(
     )
     _sync_capability_confirmed_count(session, row.capability_id)
     session.commit()
+    invalidate_bm25_caches()
     return row
 
 
@@ -143,6 +145,7 @@ def confirm_business_rule(
     )
     _sync_capability_confirmed_count(session, row.capability_id)
     session.commit()
+    invalidate_bm25_caches()
     return row
 
 
@@ -193,6 +196,7 @@ def update_business_caliber(
     )
     _sync_capability_confirmed_count(session, row.capability_id)
     session.commit()
+    invalidate_bm25_caches()
     return row
 
 
@@ -228,4 +232,5 @@ def confirm_business_caliber(
     )
     _sync_capability_confirmed_count(session, row.capability_id)
     session.commit()
+    invalidate_bm25_caches()
     return row

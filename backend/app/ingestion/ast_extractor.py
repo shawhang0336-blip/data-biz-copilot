@@ -526,6 +526,35 @@ def synthesize_generic_business_semantics(
     }
 
 
+def _sanitize_upstream_context(
+    upstream_context: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """清洗上游加工环节传来的业务摘要，确保绝不把物理表名或字段名混入下游翻译负载。"""
+    if not upstream_context:
+        return []
+    cleaned: List[Dict[str, Any]] = []
+    for item in upstream_context[:6]:
+        if not isinstance(item, dict):
+            continue
+        stage = sanitize_business_text(str(item.get("stage_topic") or "前置加工环节")).strip()[:40]
+        summary = sanitize_business_text(str(item.get("business_summary") or "")).strip()[:140]
+        rules = [
+            sanitize_business_text(str(r)).strip()[:100]
+            for r in (item.get("key_rules") or [])[:4]
+            if str(r).strip()
+        ]
+        rules = [r for r in rules if r]
+        if not summary and not rules:
+            continue
+        entry: Dict[str, Any] = {"stage_topic": stage or "前置加工环节"}
+        if summary:
+            entry["business_summary"] = summary
+        if rules:
+            entry["key_rules"] = rules
+        cleaned.append(entry)
+    return cleaned
+
+
 def translate_evidence_with_llm(
     skeleton: Dict[str, Any],
     comments: List[str],
@@ -534,11 +563,13 @@ def translate_evidence_with_llm(
     llm: Any,
     bus: Any,
     sql_context: Optional[Dict[str, Any]] = None,
+    upstream_context: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """若配置了真实 LLM，把 AST 逻辑细节、结构特征与注释交给模型精准翻译为纯业务表达并经 Bus 门禁拦截。"""
     if llm is None:
         return fallback_evidence
     clean_context = _clean_sql_logic_context(sql_context if sql_context is not None else skeleton.get("logic_details"))
+    clean_upstream = _sanitize_upstream_context(upstream_context)
     payload: Dict[str, Any] = {
         "ast_features": {
             "statement_kind": skeleton.get("statement_kind"),
@@ -558,12 +589,20 @@ def translate_evidence_with_llm(
     }
     if clean_context:
         payload["sql_logic_context"] = clean_context
+    if clean_upstream:
+        payload["upstream_business_context"] = clean_upstream
 
+    upstream_hint = (
+        "同时结合 upstream_business_context 中上游前置加工已执行的纳入、剔除与口径处理背景，补全端到端业务规则；"
+        if clean_upstream
+        else ""
+    )
     args, _trace = call_llm_validated(
         llm,
         "translate_logic_evidence",
         (
             "请仔细核对 sql_logic_context 中的真实过滤条件、字面量/阈值、加减乘除/扣减算式、分支条件、合并覆盖匹配键及开发注释，"
+            f"{upstream_hint}"
             "用通俗纯中文逐项如实还原代码已经实现的业务纳入规则、剔除规则、分类分支、计算公式与去重合并粒度。"
             "若 deterministic_draft.business_domain_hint 已是具体业务主题名（非占位词），请原样沿用不要无故加括号或改写近义词；"
             "deterministic_draft 的其余字段仅作兜底参考，切勿照搬泛化套话，更不得凭空编造未出现在代码中的规则；"
@@ -903,6 +942,8 @@ def _extract_group_with_llm(
     bus: Any,
     group_sql_contexts: Optional[List[Dict[str, Any]]] = None,
     is_sac_script: bool = False,
+    upstream_context: Optional[List[Dict[str, Any]]] = None,
+    lite_mode: bool = False,
 ) -> None:
     """按规划好的逻辑阶段带着全局上下文与真实 SQL 细节调用受控 LLM 提炼纯业务解释，并回填主实证与元数据。"""
     agg_stmt_kinds = sorted(
@@ -955,6 +996,9 @@ def _extract_group_with_llm(
     merged_sql_ctx = _merge_group_sql_contexts(group_sql_contexts)
     if merged_sql_ctx:
         payload["sql_logic_context"] = merged_sql_ctx
+    clean_upstream = _sanitize_upstream_context(upstream_context)
+    if clean_upstream:
+        payload["upstream_business_context"] = clean_upstream
     if stage_meta is not None:
         payload["code_plan"] = {
             "business_overview": (code_plan or {}).get("business_overview") or sanitize_business_text(banner),
@@ -966,24 +1010,33 @@ def _extract_group_with_llm(
         }
 
     plan_locator_fields = {
-        "plan_stage": "PLAN_THEN_EXTRACT" if stage_meta is not None else "SINGLE_STAGE",
+        "plan_stage": "TIER2_LITE" if lite_mode else ("PLAN_THEN_EXTRACT" if stage_meta is not None else "SINGLE_STAGE"),
         "plan_applied": code_plan is not None,
     }
+    if lite_mode:
+        plan_locator_fields["tier"] = "TIER_2_UPSTREAM"
     if stage_meta is not None:
         plan_locator_fields["stage_title"] = stage_meta["stage_title"]
         plan_locator_fields["stage_role"] = stage_meta["stage_role"]
     if code_plan and code_plan.get("business_overview"):
         plan_locator_fields["business_overview"] = code_plan["business_overview"][:160]
 
+    upstream_clause = (
+        "结合 upstream_business_context 中上游前置加工已执行的前置剔除与口径处理背景，"
+        if clean_upstream
+        else ""
+    )
     if is_sac_script:
         instruction = (
             "结合 code_plan 中的整套逻辑业务主线、本阶段职能分工及上游衔接关系，以及 sql_logic_context 真实 SQL 细节、AST 摘要与业务注释，"
+            f"{upstream_clause}"
             "用通俗纯中文还原当前逻辑阶段实际做了什么、包含哪些业务规则与口径解释。"
             "保持 deterministic_draft 已有规则准确度，严禁在输出中出现物理表名、字段名（大小写）、SQL 关键字或脚本名。"
         )
     else:
         instruction = (
             "结合 code_plan 中的整套逻辑业务主线与本阶段职能，严格以 sql_logic_context 中的真实过滤条件、字面量/阈值、"
+            f"{upstream_clause}"
             "加减扣减算式、分支判定、合并覆盖键及注释为准，逐项精准还原当前阶段实际已实现的业务规则、计算口径与防重粒度。"
             "deterministic_draft 仅作兜底参考，切勿保留空洞泛化套话，更不得虚构代码中不存在的条件；"
             "严禁在输出中出现任何物理表名、字段名（大小写）、SQL 关键字、函数名或脚本名。"
@@ -1094,6 +1147,7 @@ def plan_and_extract_script_evidences(
     llm: Any,
     bus: Any,
     step_sql_contexts: Optional[List[Dict[str, Any]]] = None,
+    upstream_context: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Any]:
     """多步 SQL Plan-then-Extract：先由 AI 看全局步骤 DAG 分阶段规划，再带阶段上下文与真实 SQL 细节逐段提取纯业务实证。"""
     if llm is None or not evidences:
@@ -1154,6 +1208,7 @@ def plan_and_extract_script_evidences(
             bus=bus,
             group_sql_contexts=group_sql_contexts,
             is_sac_script=is_sac_script,
+            upstream_context=upstream_context,
         )
         active_indices.extend(group_indices)
 
@@ -1171,20 +1226,43 @@ def enrich_script_evidences_with_llm(
     bus: Any,
     step_sql_contexts: Optional[List[Dict[str, Any]]] = None,
     is_sac_script: bool = True,
+    upstream_context: Optional[List[Dict[str, Any]]] = None,
+    lite_mode: bool = False,
 ) -> None:
     """单步或按域粒度调用受控大模型深度翻译并润色实证规则与业务解释。"""
     if llm is None or not evidences:
         return
-
-    grouped: Dict[str, List[Tuple[int, Any]]] = {}
-    for idx, ev in enumerate(evidences):
-        grouped.setdefault(ev.business_domain_hint, []).append((idx, ev))
 
     clean_comments = [
         sanitize_business_text(c)
         for c in dict.fromkeys(comments_pool)
         if c and not detect_technical_jargon(sanitize_business_text(c))
     ][:10]
+
+    if lite_mode:
+        dominant_domain = next(
+            (ev.business_domain_hint for ev in evidences if ev.business_domain_hint not in _GENERIC_CODE_DOMAINS),
+            evidences[0].business_domain_hint,
+        )
+        _extract_group_with_llm(
+            banner,
+            evidences,
+            clean_comments,
+            domain=dominant_domain,
+            code_plan=None,
+            stage_meta=None,
+            llm=llm,
+            bus=bus,
+            group_sql_contexts=step_sql_contexts,
+            is_sac_script=is_sac_script,
+            upstream_context=upstream_context,
+            lite_mode=True,
+        )
+        return
+
+    grouped: Dict[str, List[Tuple[int, Any]]] = {}
+    for idx, ev in enumerate(evidences):
+        grouped.setdefault(ev.business_domain_hint, []).append((idx, ev))
 
     for domain, indexed_group in grouped.items():
         group = [ev for _, ev in indexed_group]
@@ -1204,5 +1282,6 @@ def enrich_script_evidences_with_llm(
             bus=bus,
             group_sql_contexts=group_sql_contexts,
             is_sac_script=is_sac_script,
+            upstream_context=upstream_context,
         )
 

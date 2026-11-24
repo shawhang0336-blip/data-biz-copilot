@@ -4,8 +4,9 @@
 中的物理表名、字段名或 SQL 语句，只呈现业务表述与实证支撑状态。
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.infra.db_tables import (
@@ -17,7 +18,7 @@ from app.infra.db_tables import (
     RegulatoryClauseModel,
     SourceMaterialModel,
 )
-from app.infra.retrieval import infer_regulatory_regime
+from app.infra.retrieval import infer_regulatory_regime, invalidate_bm25_caches
 from app.infra.taxonomy import (
     FINANCIAL_SUBJECT_THEMES,
     infer_financial_theme,
@@ -150,6 +151,29 @@ def _caliber_to_dict(
     }
 
 
+def get_catalog_cache_signature(session: Session, kind: str) -> Tuple[Any, ...]:
+    """返回轻量级资产版本号签名（行数 + 最近更新时间），用于安全驱动内存 BM25 缓存。"""
+    bind_id = id(session.get_bind())
+    if kind == "cap":
+        cnt, max_ts = session.query(
+            func.count(BusinessCapabilityModel.id),
+            func.max(BusinessCapabilityModel.updated_at),
+        ).one()
+    elif kind == "rule":
+        cnt, max_ts = session.query(
+            func.count(BusinessRuleAssetModel.id),
+            func.max(BusinessRuleAssetModel.updated_at),
+        ).one()
+    elif kind == "caliber":
+        cnt, max_ts = session.query(
+            func.count(BusinessCaliberAssetModel.id),
+            func.max(BusinessCaliberAssetModel.updated_at),
+        ).one()
+    else:
+        return (bind_id, kind, 0, "")
+    return (bind_id, kind, int(cnt or 0), max_ts.isoformat() if max_ts else "")
+
+
 def list_source_materials(session: Session) -> List[Dict[str, Any]]:
     rows = session.query(SourceMaterialModel).order_by(SourceMaterialModel.created_at.desc()).all()
     return [
@@ -159,8 +183,13 @@ def list_source_materials(session: Session) -> List[Dict[str, Any]]:
             "material_kind": r.material_kind,
             "file_type": r.file_type,
             "status": r.status,
+            "tier": getattr(r, "tier", "TIER_1_CORE") or "TIER_1_CORE",
+            "skip_reason": getattr(r, "skip_reason", "") or "",
+            "batch_job_id": getattr(r, "batch_job_id", None),
+            "relative_path": getattr(r, "relative_path", "") or r.title,
             "summary": r.summary,
             "item_count": r.item_count,
+            "error_message": getattr(r, "error_message", "") or "",
             "created_at": r.created_at.isoformat() if r.created_at else None,
         }
         for r in rows

@@ -38,12 +38,24 @@ def _apply(state: RunState, kind: str, payload: Dict[str, Any]) -> RunState:
     payload = payload or {}
     if kind == "RUN_CREATED":
         return replace(state, status="RUNNING", current_node="created", when="always")
+    if kind == "BATCH_SCANNED":
+        return replace(state, status="READY_REVIEW", current_node="static_scan", result_json=payload)
+    if kind == "BATCH_STARTED":
+        return replace(state, status="RUNNING", current_node="parse_batch", result_json=payload)
+    if kind == "BATCH_CHECKPOINT":
+        return replace(state, status="RUNNING", current_node=str(payload.get("phase") or "parse_batch"), result_json=payload)
+    if kind == "BATCH_PAUSED":
+        return replace(state, status="PAUSED_BUDGET", current_node="paused", result_json=payload)
+    if kind == "BATCH_COMPLETED":
+        return replace(state, status="COMPLETED", current_node="completed", result_json=payload)
     if kind == "SOURCES_PARSED":
         return replace(state, status="RUNNING", current_node="parse_sources", result_json=payload)
     if kind == "EVIDENCE_ALIGNED":
         return replace(state, status="RUNNING", current_node="align_evidence", result_json=payload)
     if kind == "ASSETS_SYNTHESIZED":
         return replace(state, status="COMPLETED", current_node="published", result_json=payload.get("summary") or payload)
+    if kind == "RUN_CANCELLED":
+        return replace(state, status="CANCELLED", current_node="cancelled", result_json=payload)
     if kind == "RUN_FAILED":
         return replace(state, status="FAILED", current_node="failed", result_json=payload)
     return state

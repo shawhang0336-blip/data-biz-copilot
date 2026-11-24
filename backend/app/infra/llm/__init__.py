@@ -3,9 +3,13 @@
 from .client import (
     LlmTimeoutError,
     RealDesignLlm,
+    TokenBucketRateLimiter,
     close_http_client,
     configure_llm_concurrency,
+    configure_llm_rate_limit,
     llm_call_semaphore,
+    llm_rate_limiter,
+    notify_llm_rate_limited,
 )
 from .guard import (
     DEFAULT_BACKOFF_SECONDS,
@@ -27,14 +31,18 @@ __all__ = [
     "LlmTimeoutError",
     "RealDesignLlm",
     "TOOL_SCHEMAS",
+    "TokenBucketRateLimiter",
     "backoff_wait",
     "call_llm_validated",
     "close_http_client",
     "configure_llm_concurrency",
+    "configure_llm_rate_limit",
     "current_cancellation",
     "current_llm_bus",
     "llm_call_semaphore",
     "llm_execution_scope",
+    "llm_rate_limiter",
+    "notify_llm_rate_limited",
     "submit_with_context",
     "tool_prompt_preamble",
 ]

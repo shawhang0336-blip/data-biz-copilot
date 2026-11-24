@@ -290,3 +290,22 @@ def build_run_bus(
         guard = BudgetGuard(BudgetLimits.from_dict(budget), run_id=run_id)
         guard.attach(bus)
     return bus
+
+
+def build_script_child_bus(
+    max_calls: int = 8,
+    *,
+    max_elapsed_seconds: int = 300,
+    parent: Optional[Bus] = None,
+    script_tag: Optional[str] = None,
+) -> Bus:
+    """为千级批处理中的单个脚本构造隔离子总线：单脚本超限只跳过本脚本，不误杀整批。"""
+    bus = default_bus(parent=parent)
+    limits = BudgetLimits(
+        max_llm_calls=max(1, int(max_calls)) if max_calls and int(max_calls) > 0 else None,
+        max_total_tokens=None,
+        max_elapsed_seconds=float(max_elapsed_seconds) if max_elapsed_seconds > 0 else None,
+    )
+    guard = BudgetGuard(limits, run_id=script_tag)
+    guard.attach(bus)
+    return bus

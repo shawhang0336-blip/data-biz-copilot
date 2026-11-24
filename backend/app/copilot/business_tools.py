@@ -5,18 +5,19 @@
 - 遇到未落地（UNREALIZED）、口径分歧（DIVERGENT）或无匹配时强制附带 `disclose` 披露标识。
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
 from app.catalog.views import (
+    get_catalog_cache_signature,
     list_business_calibers,
     list_business_rules,
     list_capabilities,
     list_reconcile_ledger,
 )
 from app.copilot.disclosure import build_disclosure, format_disclosure_subjects
-from app.infra.retrieval import bm25_score_documents, infer_regulatory_regime
+from app.infra.retrieval import get_or_build_bm25_index, infer_regulatory_regime
 from app.infra.taxonomy import detect_query_financial_themes, normalize_financial_theme
 from app.policy.dc_bus import sanitize_business_text
 
@@ -75,6 +76,7 @@ def _rank_by_bm25(
     *,
     field_weights: Dict[str, float],
     extractor,
+    cache_key: Optional[Tuple[Any, ...]] = None,
     min_ratio: float = 0.35,
     min_floor: float = 0.25,
 ) -> List[Dict[str, Any]]:
@@ -82,7 +84,13 @@ def _rank_by_bm25(
         return items
     docs = [extractor(item) for item in items]
     regimes = [str(item.get("regime") or "通用监管") for item in items]
-    scores = bm25_score_documents(query, docs, field_weights=field_weights, regimes=regimes)
+    index = get_or_build_bm25_index(
+        cache_key,
+        docs,
+        fields=tuple(field_weights.keys()),
+        regimes=regimes,
+    )
+    scores = index.score(query, field_weights=field_weights)
     max_sc = max(scores, default=0.0)
     if max_sc <= 0.0:
         return []
@@ -171,6 +179,7 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
             query,
             caps,
             field_weights={"name": 2.6, "regime": 1.6, "sub_domains": 1.6, "subject_themes": 1.4, "description": 1.2, "scope_summary": 1.0},
+            cache_key=(get_catalog_cache_signature(session, "cap"), "resolve_caps"),
             extractor=lambda c: {
                 "name": c["name"],
                 "regime": c.get("regime", "通用监管"),
@@ -184,6 +193,7 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
             query,
             rules,
             field_weights={"title": 2.4, "sub_domain": 1.8, "subject_theme": 1.6, "capability_name": 1.5, "regime": 1.4, "business_condition": 1.1, "business_action": 1.0},
+            cache_key=(get_catalog_cache_signature(session, "rule"), "resolve_rules"),
             extractor=lambda r: {
                 "title": r["title"],
                 "sub_domain": r.get("sub_domain", ""),
@@ -198,6 +208,7 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
             query,
             calibers,
             field_weights={"metric_name": 2.8, "triggers": 2.0, "sub_domain": 1.7, "subject_theme": 1.5, "regime": 1.4, "business_definition": 1.0},
+            cache_key=(get_catalog_cache_signature(session, "caliber"), "resolve_cals"),
             extractor=lambda c: {
                 "metric_name": c["metric_name"],
                 "triggers": " ".join(c["triggers"]),
@@ -252,20 +263,28 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
                 for r in rules
             ]
             regimes = [str(r.get("regime") or "通用监管") for r in rules]
-            base_scores = bm25_score_documents(
-                topic,
-                docs,
-                field_weights={
-                    "title": 2.5,
-                    "sub_domain": 1.8,
-                    "subject_theme": 1.7,
-                    "capability_name": 1.6,
-                    "regime": 1.5,
-                    "business_condition": 1.2,
-                    "business_action": 1.0,
-                },
-                regimes=regimes,
+            fw = {
+                "title": 2.5,
+                "sub_domain": 1.8,
+                "subject_theme": 1.7,
+                "capability_name": 1.6,
+                "regime": 1.5,
+                "business_condition": 1.2,
+                "business_action": 1.0,
+            }
+            scope_cache_key = (
+                get_catalog_cache_signature(session, "rule"),
+                "scope_rules",
+                category or "",
+                explicit_sub_domain,
+                tuple(sorted(target_themes)) if theme_scoped else (),
             )
+            base_scores = get_or_build_bm25_index(
+                scope_cache_key,
+                docs,
+                fields=tuple(fw.keys()),
+                regimes=regimes,
+            ).score(topic, field_weights=fw)
             max_base = max(base_scores, default=0.0)
             cutoff = max(0.25, max_base * 0.42) if max_base > 0.0 else 0.25
             scored = [
@@ -353,6 +372,12 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
                     "regime": 1.5,
                     "business_definition": 1.0,
                 },
+                cache_key=(
+                    get_catalog_cache_signature(session, "caliber"),
+                    "cal_detail",
+                    explicit_sub_domain,
+                    tuple(sorted(target_themes)) if theme_scoped else (),
+                ),
                 extractor=lambda c: {
                     "metric_name": c["metric_name"],
                     "triggers": " ".join(c["triggers"]),

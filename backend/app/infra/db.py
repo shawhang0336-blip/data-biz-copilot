@@ -45,11 +45,26 @@ class Base(DeclarativeBase):
 
 
 def ensure_schema_columns(bind_engine: Any = None) -> None:
-    """幂等为已有 SQLite / 关系库表补齐双维分类新增列（零破坏旧数据）。"""
+    """幂等为已有 SQLite / 关系库表补齐双维分类与千级脚本批任务扩展列（零破坏旧数据）。"""
     target_engine = bind_engine or engine
     insp = inspect(target_engine)
     existing_tables = set(insp.get_table_names())
     migrations = (
+        (
+            "source_materials",
+            (
+                ("batch_job_id", "VARCHAR(36)"),
+                ("relative_path", "VARCHAR(512) DEFAULT ''"),
+                ("tier", "VARCHAR(32) DEFAULT 'TIER_1_CORE'"),
+                ("tier_override", "VARCHAR(32)"),
+                ("skip_reason", "VARCHAR(64) DEFAULT ''"),
+                ("ast_template_hash", "VARCHAR(64) DEFAULT ''"),
+                ("template_master_id", "VARCHAR(36)"),
+                ("target_tables_json", "JSON"),
+                ("source_tables_json", "JSON"),
+                ("error_message", "TEXT DEFAULT ''"),
+            ),
+        ),
         (
             "business_rule_assets",
             (

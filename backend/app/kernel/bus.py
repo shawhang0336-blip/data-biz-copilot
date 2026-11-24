@@ -156,24 +156,38 @@ class Bus:
             return self._budget_guard
 
     def check_budget(self) -> None:
-        """触发当前总线挂载的预算检查；未挂载时为空操作。"""
+        """触发当前总线及父总线挂载的预算检查；未挂载时为空操作。"""
+        if self._parent is not None:
+            self._parent.check_budget()
         guard = self.budget_guard
         if guard is not None and hasattr(guard, "check"):
             guard.check(self)
 
     def begin_llm_call(self) -> None:
-        """在并发派发 LLM 前原子校验预算并预占在途名额；兼容仅有 check() 的守卫。"""
+        """在并发派发 LLM 前原子级联校验父/子预算并预占在途名额；子预算失败时自动回滚父预占。"""
+        parent = self._parent
+        parent_reserved = False
+        if parent is not None:
+            parent.begin_llm_call()
+            parent_reserved = True
         guard = self.budget_guard
-        if guard is not None and hasattr(guard, "begin_call"):
-            guard.begin_call(self)
-        elif guard is not None and hasattr(guard, "check"):
-            guard.check(self)
+        try:
+            if guard is not None and hasattr(guard, "begin_call"):
+                guard.begin_call(self)
+            elif guard is not None and hasattr(guard, "check"):
+                guard.check(self)
+        except Exception:
+            if parent_reserved and parent is not None:
+                parent.end_llm_calls(1)
+            raise
 
     def end_llm_calls(self, count: int = 1) -> None:
-        """归还已完成或异常退出的在途 LLM 调用名额。"""
+        """归还已完成或异常退出的在途 LLM 调用名额，并级联归还父总线名额。"""
         guard = self.budget_guard
         if guard is not None and hasattr(guard, "end_calls"):
             guard.end_calls(count)
+        if self._parent is not None:
+            self._parent.end_llm_calls(count)
 
     def add_adjudicator(self, fn: Adjudicator) -> "Bus":
         with self._lock:

@@ -7,3 +7,11 @@ class WorkflowError(RuntimeError):
     def __init__(self, message: str, *, context: Optional[Dict[str, Any]] = None) -> None:
         super().__init__(message)
         self.context = context or {}
+
+
+class ProviderAuthOrBillingError(RuntimeError):
+    """上游大模型账户鉴权失效或余额不足（HTTP 401/402/403），需暂停批任务而非单步吞没降级。"""
+
+    def __init__(self, message: str, *, context: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.context = context or {}

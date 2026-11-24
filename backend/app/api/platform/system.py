@@ -21,10 +21,12 @@ router = APIRouter(tags=["platform"])
 
 class BudgetUpdateRequest(BaseModel):
     max_retries: int = Field(default=3, ge=1, le=20)
-    max_llm_concurrency: int = Field(default=4, ge=1, le=16)
-    max_llm_calls: int = Field(default=120, ge=0, le=2000)
-    max_total_tokens: int = Field(default=1500000, ge=0, le=50000000)
-    max_elapsed_seconds: int = Field(default=900, ge=0, le=86400)
+    max_llm_concurrency: int = Field(default=6, ge=1, le=16)
+    max_llm_rpm: int = Field(default=60, ge=0, le=600)
+    max_calls_per_script: int = Field(default=8, ge=1, le=30)
+    max_llm_calls: int = Field(default=2400, ge=0, le=20000)
+    max_total_tokens: int = Field(default=20000000, ge=0, le=200000000)
+    max_elapsed_seconds: int = Field(default=7200, ge=0, le=86400)
 
 
 class LlmConfigUpdateRequest(BaseModel):

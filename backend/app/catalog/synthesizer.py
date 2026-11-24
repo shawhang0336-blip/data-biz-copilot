@@ -3,7 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import uuid
 
 from sqlalchemy.exc import IntegrityError
@@ -21,7 +21,7 @@ from app.infra.db_tables import (
     SourceMaterialModel,
 )
 from app.infra.errors import WorkflowError
-from app.infra.retrieval import infer_regulatory_regime, tokenize_for_search
+from app.infra.retrieval import infer_regulatory_regime, invalidate_bm25_caches, tokenize_for_search
 from app.infra.taxonomy import (
     FINANCIAL_SUBJECT_THEMES,
     infer_financial_theme,
@@ -611,13 +611,62 @@ def _safe_rule_slug(raw_code: str, prefix: str) -> str:
     return slug
 
 
+def _deduplicate_domain_evidences(
+    d_evs: List[LogicEvidenceModel],
+) -> Tuple[List[LogicEvidenceModel], List[str]]:
+    """对同域实证执行模板克隆折叠与结构指纹去重，并返回完整底层实证 ID 列表供审计统计。"""
+    all_ev_ids = [e.id for e in d_evs]
+    canonical: List[LogicEvidenceModel] = []
+    seen_sigs = set()
+    ordered = sorted(
+        d_evs,
+        key=lambda e: (
+            1 if (e.internal_locator_json or {}).get("is_template_clone") else 0,
+            e.id,
+        ),
+    )
+    for ev in ordered:
+        loc = ev.internal_locator_json or {}
+        if loc.get("is_template_clone") and canonical:
+            continue
+        inc_sig = tuple(
+            sorted(
+                (str(x.get("title") or ""), str(x.get("condition") or ""))
+                for x in (ev.inclusion_predicates_json or [])
+                if isinstance(x, dict)
+            )
+        )
+        exc_sig = tuple(
+            sorted(
+                (str(x.get("title") or ""), str(x.get("condition") or ""))
+                for x in (ev.exclusion_predicates_json or [])
+                if isinstance(x, dict)
+            )
+        )
+        br_sig = tuple(
+            sorted(str(x.get("title") or "") for x in (ev.branch_cases_json or []) if isinstance(x, dict))
+        )
+        sig = (
+            str(ev.target_concept_hint or ""),
+            inc_sig,
+            exc_sig,
+            br_sig,
+            str(ev.calculation_kind or ""),
+        )
+        if sig in seen_sigs:
+            continue
+        seen_sigs.add(sig)
+        canonical.append(ev)
+    return canonical, all_ev_ids
+
+
 def _build_domain_draft(
     domain_name: str,
     d_clauses: List[RegulatoryClauseModel],
-    d_evs: List[LogicEvidenceModel],
+    raw_d_evs: List[LogicEvidenceModel],
 ) -> Dict[str, Any]:
     """根据单一业务域的监管条款与底层代码实证，构建纯业务确定性资产草案。"""
-    ev_ids = [e.id for e in d_evs]
+    d_evs, ev_ids = _deduplicate_domain_evidences(raw_d_evs)
     cl_ids = [c.id for c in d_clauses]
     has_conflict = any(e.calculation_kind == "CONFLICT" for e in d_evs)
 
@@ -1349,8 +1398,12 @@ def synthesize_business_assets(
     *,
     settings: Optional[Settings] = None,
     llm: Any = None,
+    target_domains: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    """将底层代码实证与监管制度条款自动碰撞对齐，生成纯业务语言四大资产层并落哈希链账本。"""
+    """将底层代码实证与监管制度条款自动碰撞对齐，生成纯业务语言四大资产层并落哈希链账本。
+
+    支持传 `target_domains` 仅增量重算变更域（保留其他域已有资产与人工确认状态）。
+    """
     active_settings = get_effective_settings(session, settings or get_settings())
     active_llm = _resolve_optional_llm(session, active_settings, llm)
     budget = get_budget(session)
@@ -1359,14 +1412,24 @@ def synthesize_business_assets(
 
     run: RunModel = kernel_create_run(session, "dc_asset_synthesis", initial_node="created", bus=bus)
     clauses = session.query(RegulatoryClauseModel).all()
-    evidences = session.query(LogicEvidenceModel).all()
+    raw_evidences = session.query(LogicEvidenceModel).all()
+    # 默认隔离已被下游核心报送吸收的 Tier 2 中间加工实证，防止在业务版图中生成上百个中间垃圾域
+    evidences = [
+        ev
+        for ev in raw_evidences
+        if not (
+            isinstance(ev.internal_locator_json, dict)
+            and ev.internal_locator_json.get("tier") == "TIER_2_UPSTREAM"
+            and ev.internal_locator_json.get("absorbed_by_downstream") is True
+        )
+    ]
 
     append_event(
         session,
         run,
         "SOURCES_PARSED",
         "parse_sources",
-        {"clause_count": len(clauses), "evidence_count": len(evidences)},
+        {"clause_count": len(clauses), "evidence_count": len(evidences), "raw_evidence_count": len(raw_evidences)},
         bus=bus,
     )
 
@@ -1407,27 +1470,31 @@ def synthesize_business_assets(
             domain_evidences[target_domain] = []
         domain_evidences[target_domain].append(ev)
 
+    target_set = {str(d).strip() for d in target_domains if str(d).strip()} if target_domains else set()
+    selected_domains = [d for d in domains_order if d in target_set] if target_set else list(domains_order)
+
     append_event(
         session,
         run,
         "EVIDENCE_ALIGNED",
         "align_evidence",
         {
-            "domains": domains_order,
-            "covered_domains": [d for d in domains_order if domain_evidences[d]],
-            "unrealized_domains": [d for d in domains_order if not domain_evidences[d]],
+            "domains": selected_domains,
+            "incremental": bool(target_set),
+            "covered_domains": [d for d in selected_domains if domain_evidences[d]],
+            "unrealized_domains": [d for d in selected_domains if not domain_evidences[d]],
         },
         bus=bus,
     )
 
     drafts = [
         _build_domain_draft(domain_name, domain_clauses[domain_name], domain_evidences[domain_name])
-        for domain_name in domains_order
+        for domain_name in selected_domains
     ]
 
     ai_enriched_domains = 0
     if active_llm is not None and drafts:
-        workers = max(1, min(6, int(budget.get("max_llm_concurrency", 4))))
+        workers = max(1, min(8, int(budget.get("max_llm_concurrency", 4))))
         with llm_execution_scope(bus=bus):
             if len(drafts) == 1:
                 drafts[0], ok = _refine_domain_with_llm(drafts[0], llm=active_llm, bus=bus)
@@ -1443,10 +1510,6 @@ def synthesize_business_assets(
                         drafts[idx], ok = fut.result()
                         if ok:
                             ai_enriched_domains += 1
-
-    cap_total = 0
-    rule_total = 0
-    caliber_total = 0
 
     for draft in drafts:
         cap_payload = draft["capability"]
@@ -1465,7 +1528,6 @@ def synthesize_business_assets(
             confirmed_count=0,
             bus=bus,
         )
-        cap_total += 1
         cap_rule_count = 0
         cap_caliber_count = 0
 
@@ -1477,7 +1539,6 @@ def synthesize_business_assets(
                 **rule_draft,
             )
             cap_rule_count += 1
-            rule_total += 1
 
         for cal_draft in draft["calibers"]:
             _upsert_caliber(
@@ -1487,7 +1548,6 @@ def synthesize_business_assets(
                 **cal_draft,
             )
             cap_caliber_count += 1
-            caliber_total += 1
 
         confirmed_rules = (
             session.query(BusinessRuleAssetModel)
@@ -1504,11 +1564,17 @@ def synthesize_business_assets(
         cap_row.confirmed_count = confirmed_rules + confirmed_cals
         session.flush()
 
+    cap_total = session.query(BusinessCapabilityModel).count()
+    rule_total = session.query(BusinessRuleAssetModel).count()
+    caliber_total = session.query(BusinessCaliberAssetModel).count()
+
     summary = {
         "run_id": run.id,
         "capability_count": cap_total,
         "rule_count": rule_total,
         "caliber_count": caliber_total,
+        "incremental": bool(target_set),
+        "synthesized_domains": selected_domains,
         "ai_enabled": active_llm is not None,
         "llm_model": _resolve_llm_model_name(active_llm, active_settings),
         "ai_enriched_domains": ai_enriched_domains,
@@ -1522,6 +1588,7 @@ def synthesize_business_assets(
         bus=bus,
     )
     session.commit()
+    invalidate_bm25_caches()
     return summary
 
 

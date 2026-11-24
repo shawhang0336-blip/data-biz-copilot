@@ -26,9 +26,37 @@ export const STATUS_LABELS = {
 export const BUDGET_LABELS = {
   max_retries: '门禁拦截最大重述次数',
   max_llm_concurrency: '模型并发调用上限',
-  max_llm_calls: '单轮问答最大调用次数',
+  max_llm_rpm: '每分钟最大调用频率（RPM）',
+  max_calls_per_script: '单份逻辑源调用保护上限',
+  max_llm_calls: '批任务/单轮累计调用上限',
   max_total_tokens: '单任务累计 Token 上限',
   max_elapsed_seconds: '单次解析/问答超时秒数',
+}
+
+export const TIER_LABELS = {
+  TIER_1_CORE: { label: '核心报送逻辑（深度解析）', tone: 'green' },
+  TIER_2_UPSTREAM: { label: '上游加工依赖（精简并透传）', tone: 'blue' },
+  TIER_3_SKIP_AI: { label: '辅助或重复项（免模型跳过）', tone: 'slate' },
+}
+
+export const BATCH_JOB_STATUS_LABELS = {
+  SCANNING: { label: '静态预扫描中', tone: 'blue' },
+  READY_REVIEW: { label: '待确认分层', tone: 'purple' },
+  RUNNING: { label: '后台异步解析中', tone: 'blue' },
+  PAUSED_BUDGET: { label: '触达预算已暂停（支持续跑）', tone: 'amber' },
+  CANCELLED: { label: '已手动中止', tone: 'slate' },
+  COMPLETED: { label: '批任务已完成', tone: 'green' },
+  FAILED: { label: '存在中断或异常项', tone: 'amber' },
+}
+
+export const SKIP_REASON_LABELS = {
+  BACKUP_FILE: '历史备份或归档文件',
+  PURE_DDL: '结构定义类文件（无业务规则）',
+  HOUSEKEEPING_LOG: '运维日志登记过程',
+  ODS_PASSTHROUGH: '原样同步透传（无加工条件）',
+  TEMPLATE_CLONE: '同构模板零成本复用主规范',
+  ORPHAN_INTERMEDIATE: '无报送下游依赖的孤立中间过程',
+  MANUAL_SKIP: '人工设定跳过解析',
 }
 
 export const FINANCIAL_SUBJECT_THEMES = [
