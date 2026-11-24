@@ -1,4 +1,4 @@
-"""统一 ORM 表模型定义（基础设施层 Layer 0，12 张核心表）。
+"""统一 ORM 表模型定义（基础设施层 Layer 0，13 张核心表）。
 
 分为三组：
 1. 内核运行时账本与系统设置：`RunModel` / `EventModel` / `SystemSettingModel`；
