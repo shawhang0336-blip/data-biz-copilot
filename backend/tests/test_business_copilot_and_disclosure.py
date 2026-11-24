@@ -8,9 +8,11 @@ from app.copilot.business_tools import BUSINESS_TOOL_SCHEMAS, execute_business_t
 from app.copilot.disclosure import DISCLOSURE_TEXT
 from app.infra.config import Settings
 from app.infra.llm import call_llm_validated
+from app.main import create_app
 from app.policy.dc_bus import default_bus, detect_technical_jargon
+from fastapi.testclient import TestClient
 
-from .helpers import make_session
+from .helpers import make_session, make_wal_db
 
 
 def test_all_seven_business_tools_return_pure_business_language(tmp_path):
@@ -47,6 +49,7 @@ def test_all_seven_business_tools_return_pure_business_language(tmp_path):
     code = res_scope["rules"][0]["code"]
     res_back = execute_business_tool(session, "verify_implementation_backing", {"asset_codes": [code]})
     assert res_back["verdicts"][0]["logic_backing_count"] >= 1
+    assert isinstance(res_back["verdicts"][0].get("processing_steps"), list)
     assert detect_technical_jargon(json.dumps(res_back, ensure_ascii=False)) == []
 
 
@@ -132,3 +135,40 @@ def test_bus_de_jargon_and_citation_adjudicators_intercept_llm_hallucinations(tm
     # 验证通过 ask_business_copilot 主链驱动也能自动收敛
     res = ask_business_copilot(session, "我们的逻辑里面已经包含了哪些业务？", llm=LeakingThenCleanLlm())
     assert res["verification"]["de_jargon_passed"] is True
+
+
+def test_copilot_stream_endpoint_emits_steps_and_result(tmp_path, monkeypatch):
+    engine, session_factory = make_wal_db(tmp_path, "stream")
+    with session_factory() as s:
+        load_builtin_sample_pack(s, settings=Settings(blob_dir=str(tmp_path / "blobs")))
+        s.commit()
+
+    monkeypatch.setattr("app.api.copilot.chat.SessionLocal", session_factory)
+    monkeypatch.setattr("app.infra.config.get_settings", lambda: Settings(blob_dir=str(tmp_path / "blobs")))
+
+    app = create_app()
+    events = []
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/api/copilot/ask/stream",
+            json={"query": "我们的逻辑里面已经包含了哪些业务？", "role_lens": "业务"},
+        ) as resp:
+            assert resp.status_code == 200
+            for line in resp.iter_lines():
+                if line.startswith("data:"):
+                    events.append(json.loads(line[5:].strip()))
+
+    engine.dispose()
+    step_events = [e for e in events if e.get("type") == "step"]
+    meta_events = [e for e in events if e.get("type") == "meta"]
+    delta_events = [e for e in events if e.get("type") == "answer_delta"]
+    result_events = [e for e in events if e.get("type") == "result"]
+    assert any(e.get("id") == "plan" and e.get("status") == "done" for e in step_events)
+    assert any(e.get("id") == "compose" and e.get("status") == "done" for e in step_events)
+    assert len(meta_events) == 1
+    assert len(delta_events) > 1
+    streamed_body = "".join(e.get("delta", "") for e in delta_events)
+    assert "大额与可疑外汇交易报送" in streamed_body
+    assert len(result_events) == 1
+    assert "大额与可疑外汇交易报送" in result_events[0]["data"]["answer"]

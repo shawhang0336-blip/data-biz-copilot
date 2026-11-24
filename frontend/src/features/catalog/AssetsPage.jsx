@@ -1,12 +1,15 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import { useOutletContext } from 'react-router-dom'
 import {
   editCaliber,
   editRule,
   getAssetBacking,
   getPanorama,
 } from '../../api/catalog.js'
+import { AlertIcon, CheckCircleIcon, CloseIcon, FilterIcon, SearchIcon } from '../../utils/icons.jsx'
 import {
   COVERAGE_LABELS,
+  EDIT_FIELD_LABELS,
   FINANCIAL_SUBJECT_THEMES,
   FINANCIAL_SUBJECT_THEME_DESCRIPTIONS,
   RECONCILE_LABELS,
@@ -15,7 +18,19 @@ import {
   formatBadge,
 } from '../../utils/labels.js'
 
+const PAGE_SIZE = 20
+
+const DOT_TONE_CLASS = {
+  green: 'dot-green',
+  amber: 'dot-amber',
+  blue: 'dot-blue',
+  slate: 'dot-slate',
+}
+
 export default function AssetsPage() {
+  const outletContext = useOutletContext() || {}
+  const { refreshStats } = outletContext
+
   const [data, setData] = useState(null)
   const [tab, setTab] = useState('capabilities')
   const [capViewMode, setCapViewMode] = useState('vertical')
@@ -26,24 +41,94 @@ export default function AssetsPage() {
   const [themeFilter, setThemeFilter] = useState('')
   const [catFilter, setCatFilter] = useState('')
   const [recFilter, setRecFilter] = useState('')
+  const [showMoreFilters, setShowMoreFilters] = useState(false)
+  const [page, setPage] = useState(1)
+
   const [editing, setEditing] = useState(null)
+  const [drawerItem, setDrawerItem] = useState(null)
   const [backing, setBacking] = useState(null)
+  const [backingLoading, setBackingLoading] = useState(false)
   const [error, setError] = useState('')
   const [note, setNote] = useState('')
 
   const reload = async () => {
     try {
       setData(await getPanorama())
+      if (refreshStats) refreshStats()
     } catch (e) {
       setError(e.message)
     }
   }
 
-  useEffect(() => { reload() }, [])
+  useEffect(() => {
+    reload()
+  }, [])
+
+  useEffect(() => {
+    setPage(1)
+  }, [tab, search, regimeFilter, capFilter, subDomainFilter, themeFilter, catFilter, recFilter])
+
+  useEffect(() => {
+    if (!editing && !drawerItem) return undefined
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        if (editing) setEditing(null)
+        else if (drawerItem) {
+          setDrawerItem(null)
+          setBacking(null)
+        }
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [editing, drawerItem])
+
+  const openDetailDrawer = async (kind, row) => {
+    setError('')
+    setDrawerItem({ kind, row })
+    setBacking(null)
+    setBackingLoading(true)
+    try {
+      setBacking(await getAssetBacking(row.code))
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setBackingLoading(false)
+    }
+  }
+
+  const closeDetailDrawer = () => {
+    setDrawerItem(null)
+    setBacking(null)
+  }
+
+  const openEditForRule = (r) => {
+    setEditing({
+      kind: 'RULE',
+      row: r,
+      changes: {
+        business_condition: r.business_condition,
+        business_action: r.business_action,
+        business_rationale: r.business_rationale,
+      },
+    })
+  }
+
+  const openEditForCaliber = (c) => {
+    setEditing({
+      kind: 'CALIBER',
+      row: c,
+      changes: {
+        formula_summary: c.formula_summary,
+        distinction_notes: c.distinction_notes,
+      },
+    })
+  }
 
   const handleSaveEdit = async () => {
     if (!editing) return
-    setError(''); setNote('')
+    setError('')
+    setNote('')
     try {
       if (editing.kind === 'RULE') {
         await editRule(editing.row.id, {
@@ -61,16 +146,8 @@ export default function AssetsPage() {
         })
       }
       setEditing(null)
-      setNote('业务解释已保存（系统门禁已确认不含任何技术黑话或表字段名称）')
+      setNote('业务释义已更新并同步至知识底座')
       await reload()
-    } catch (e) {
-      setError(e.message)
-    }
-  }
-
-  const inspectBacking = async (code) => {
-    try {
-      setBacking(await getAssetBacking(code))
     } catch (e) {
       setError(e.message)
     }
@@ -145,8 +222,11 @@ export default function AssetsPage() {
     })
   }, [data, regimeFilter, capFilter, subDomainFilter, themeFilter, recFilter, qLower])
 
+  const reconcileAll = data?.reconcile?.items || []
+  const reconcileSummary = data?.reconcile?.summary || {}
+
   const filteredReconcile = useMemo(() => {
-    return (data?.reconcile?.items || []).filter((item) => {
+    return reconcileAll.filter((item) => {
       if (regimeFilter && item.regime !== regimeFilter) return false
       if (capFilter && item.capability_name !== capFilter) return false
       if (subDomainFilter && item.sub_domain !== subDomainFilter) return false
@@ -158,7 +238,7 @@ export default function AssetsPage() {
       }
       return true
     })
-  }, [data, regimeFilter, capFilter, subDomainFilter, themeFilter, recFilter, qLower])
+  }, [reconcileAll, regimeFilter, capFilter, subDomainFilter, themeFilter, recFilter, qLower])
 
   const stats = data?.stats || {}
   const hasAnyFilter = Boolean(search || regimeFilter || capFilter || subDomainFilter || themeFilter || catFilter || recFilter)
@@ -172,120 +252,83 @@ export default function AssetsPage() {
     setRecFilter('')
   }
 
+  const activeRows = tab === 'rules' ? filteredRules : tab === 'calibers' ? filteredCalibers : filteredReconcile
+  const totalPages = Math.max(1, Math.ceil(activeRows.length / PAGE_SIZE))
+  const safePage = Math.min(page, totalPages)
+  const pagedRows = activeRows.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE)
+
   return (
     <div>
-      <div className="card">
-        <h2>第二步：业务逻辑全景与双维业务解释中心</h2>
-        <p style={{ color: '#475569', fontSize: 13, marginTop: 4 }}>
-          纵轴按「监管体系 → 一级业务域 → 二级子专题」逐层钻取对账，横轴按「金融十大主题」跨报表拉通查看同一业务对象的口径规范。
-        </p>
-        <div className="grid-4" style={{ marginTop: 12 }}>
-          <div className="card" style={{ marginBottom: 0 }}><strong>{stats.capability_count || 0}</strong><div>已识别一级业务域</div></div>
-          <div className="card" style={{ marginBottom: 0 }}><strong>{stats.covered_capabilities || 0}</strong><div>系统逻辑已涵盖板块</div></div>
-          <div className="card" style={{ marginBottom: 0 }}><strong>{stats.rule_count || 0}</strong><div>纳入 / 剔除 / 分支规则</div></div>
-          <div className="card" style={{ marginBottom: 0 }}><strong>{stats.caliber_count || 0}</strong><div>业务指标口径卡</div></div>
+      <div className="page-header">
+        <div>
+          <h1 className="page-title">业务资产</h1>
+          <p className="page-subtitle">
+            按监管体系、一级业务域与金融十大主题统一查阅、核对与补充业务规则与指标口径。
+          </p>
         </div>
-        {note && <p style={{ color: '#047857', marginTop: 10, fontWeight: 600 }}>{note}</p>}
-        {error && <p style={{ color: '#b91c1c', marginTop: 10 }}>{error}</p>}
       </div>
 
-      <div className="tabs">
-        <button className={`tab-btn ${tab === 'capabilities' ? 'active' : ''}`} onClick={() => setTab('capabilities')}>
-          1. 双维业务版图（{capabilities.length}）
-        </button>
-        <button className={`tab-btn ${tab === 'rules' ? 'active' : ''}`} onClick={() => setTab('rules')}>
-          2. 逻辑与业务解释（{filteredRules.length}）
-        </button>
-        <button className={`tab-btn ${tab === 'calibers' ? 'active' : ''}`} onClick={() => setTab('calibers')}>
-          3. 指标口径解释（{filteredCalibers.length}）
-        </button>
-        <button className={`tab-btn ${tab === 'reconcile' ? 'active' : ''}`} onClick={() => setTab('reconcile')}>
-          4. 制度 vs 逻辑差异对照（{filteredReconcile.length}）
-        </button>
+      <div className="stat-strip">
+        <div className="stat-cell">
+          <div className="stat-cell-label">一级业务域</div>
+          <div className="stat-cell-value">{stats.capability_count || 0}</div>
+        </div>
+        <div className="stat-cell">
+          <div className="stat-cell-label">已覆盖板块</div>
+          <div className="stat-cell-value">{stats.covered_capabilities || 0}</div>
+        </div>
+        <div className="stat-cell">
+          <div className="stat-cell-label">处理规则</div>
+          <div className="stat-cell-value">{stats.rule_count || 0}</div>
+        </div>
+        <div className="stat-cell">
+          <div className="stat-cell-label">指标口径</div>
+          <div className="stat-cell-value">{stats.caliber_count || 0}</div>
+        </div>
       </div>
 
-      {tab !== 'capabilities' && (
-        <div className="card filter-bar">
-          <input
-            className="input"
-            placeholder="搜索规则标题、子专题、主题或口径解释…"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            style={{ flex: '2 1 200px' }}
-          />
-          <select value={regimeFilter} onChange={(e) => setRegimeFilter(e.target.value)} style={{ flex: '1 1 130px' }}>
-            <option value="">全部监管体系</option>
-            {regimeOptions.map((reg) => (
-              <option key={reg} value={reg}>{reg}</option>
-            ))}
-          </select>
-          <select
-            value={capFilter}
-            onChange={(e) => {
-              setCapFilter(e.target.value)
-              setSubDomainFilter('')
-            }}
-            style={{ flex: '1 1 190px' }}
-          >
-            <option value="">全部一级业务域</option>
-            {capabilityNames.map((n) => (
-              <option key={n} value={n}>{n}</option>
-            ))}
-          </select>
-          <select value={subDomainFilter} onChange={(e) => setSubDomainFilter(e.target.value)} style={{ flex: '1 1 160px' }}>
-            <option value="">全部二级子专题</option>
-            {subDomainOptions.map((sd) => (
-              <option key={sd} value={sd}>{sd}</option>
-            ))}
-          </select>
-          <select value={themeFilter} onChange={(e) => setThemeFilter(e.target.value)} style={{ flex: '1 1 150px' }}>
-            <option value="">全部金融十大主题</option>
-            {FINANCIAL_SUBJECT_THEMES.map((th) => (
-              <option key={th} value={th}>{th}</option>
-            ))}
-          </select>
-          {tab === 'rules' && (
-            <select value={catFilter} onChange={(e) => setCatFilter(e.target.value)} style={{ flex: '1 1 130px' }}>
-              <option value="">全部规则类型</option>
-              {Object.entries(RULE_CATEGORY_LABELS).map(([k, v]) => (
-                <option key={k} value={k}>{v}</option>
-              ))}
-            </select>
-          )}
-          <select value={recFilter} onChange={(e) => setRecFilter(e.target.value)} style={{ flex: '1 1 150px' }}>
-            <option value="">全部对照状态</option>
-            {Object.entries(RECONCILE_LABELS).map(([k, v]) => (
-              <option key={k} value={k}>{v.label}</option>
-            ))}
-          </select>
-          {hasAnyFilter && (
-            <button className="btn" onClick={clearAllFilters}>
-              清空筛选
-            </button>
-          )}
-        </div>
-      )}
+      {note && <div className="alert-banner success" style={{ marginBottom: 14 }}>{note}</div>}
+      {error && <div className="alert-banner error" style={{ marginBottom: 14 }}>{error}</div>}
+
+      <div className="underline-tabs">
+        <button type="button" className={`underline-tab ${tab === 'capabilities' ? 'active' : ''}`} onClick={() => setTab('capabilities')}>
+          业务版图（{capabilities.length}）
+        </button>
+        <button type="button" className={`underline-tab ${tab === 'rules' ? 'active' : ''}`} onClick={() => setTab('rules')}>
+          处理规则（{filteredRules.length}）
+        </button>
+        <button type="button" className={`underline-tab ${tab === 'calibers' ? 'active' : ''}`} onClick={() => setTab('calibers')}>
+          指标口径（{filteredCalibers.length}）
+        </button>
+        <button type="button" className={`underline-tab ${tab === 'reconcile' ? 'active' : ''}`} onClick={() => setTab('reconcile')}>
+          制度对照（{filteredReconcile.length}）
+        </button>
+      </div>
 
       {tab === 'capabilities' && (
         <div>
-          <div className="card" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
-            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <div className="toolbar-row" style={{ justifyContent: 'space-between' }}>
+            <div className="segment-control" style={{ display: 'inline-flex' }}>
               <button
-                className={`btn ${capViewMode === 'vertical' ? 'btn-primary' : ''}`}
+                type="button"
+                className={`segment-btn ${capViewMode === 'vertical' ? 'active' : ''}`}
                 onClick={() => setCapViewMode('vertical')}
               >
-                纵轴视图：体系 → 一级业务域 → 二级子专题
+                按业务域
               </button>
               <button
-                className={`btn ${capViewMode === 'theme' ? 'btn-primary' : ''}`}
+                type="button"
+                className={`segment-btn ${capViewMode === 'theme' ? 'active' : ''}`}
                 onClick={() => setCapViewMode('theme')}
               >
-                横轴视图：金融十大主题跨表全景
+                按金融十大主题
               </button>
             </div>
+
             {capViewMode === 'vertical' && (
-              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              <div className="pill-row">
                 <button
+                  type="button"
                   className={`pill-chip ${regimeFilter === '' ? 'active' : ''}`}
                   onClick={() => setRegimeFilter('')}
                 >
@@ -294,6 +337,7 @@ export default function AssetsPage() {
                 {regimeOptions.map((reg) => (
                   <button
                     key={reg}
+                    type="button"
                     className={`pill-chip ${regimeFilter === reg ? 'active' : ''}`}
                     onClick={() => setRegimeFilter(reg)}
                   >
@@ -305,29 +349,33 @@ export default function AssetsPage() {
           </div>
 
           {capViewMode === 'vertical' ? (
-            <div className="grid-2">
+            <div className="domain-grid">
               {visibleCapabilities.map((c) => {
                 const cov = formatBadge(COVERAGE_LABELS, c.coverage_status)
+                const subDomains = c.sub_domains || []
+                const shownSubs = subDomains.slice(0, 4)
+                const extraSubCount = Math.max(0, subDomains.length - 4)
                 return (
-                  <div key={c.id} className="card">
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
-                      <div>
-                        <span className="badge badge-blue" style={{ marginBottom: 6, marginRight: 6 }}>{c.regime || '通用监管'}</span>
-                        <h3 style={{ margin: '0 0 6px' }}>{c.name}</h3>
+                  <div key={c.id} className="domain-card">
+                    <div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                        <span className="tag tag-blue">{c.regime || '通用监管'}</span>
+                        <span className="status-inline">
+                          <span className={`dot ${DOT_TONE_CLASS[cov.tone] || 'dot-slate'}`} />
+                          <span>{cov.label}</span>
+                        </span>
                       </div>
-                      <span className={`badge badge-${cov.tone}`} style={{ whiteSpace: 'nowrap' }}>{cov.label}</span>
+                      <h3 style={{ margin: '0 0 6px', fontSize: 15.5 }}>{c.name}</h3>
+                      <p className="domain-desc">{c.description}</p>
                     </div>
-                    <p style={{ fontSize: 14, color: '#334155', margin: '8px 0' }}>{c.description}</p>
-                    <p style={{ fontSize: 13, color: '#475569', margin: '6px 0' }}>
-                      <strong>逻辑覆盖与加工要点：</strong>{c.scope_summary}
-                    </p>
-                    {(c.sub_domains || []).length > 0 && (
-                      <div style={{ marginTop: 8 }}>
-                        <div style={{ fontSize: 12, color: '#475569', fontWeight: 600 }}>二级子专题下钻：</div>
-                        <div className="pill-row">
-                          {c.sub_domains.map((sd) => (
+
+                    <div>
+                      {shownSubs.length > 0 && (
+                        <div className="pill-row" style={{ marginBottom: 10 }}>
+                          {shownSubs.map((sd) => (
                             <button
                               key={sd.name}
+                              type="button"
                               className="pill-chip"
                               onClick={() => {
                                 setRegimeFilter('')
@@ -340,84 +388,54 @@ export default function AssetsPage() {
                               {sd.name} ({sd.rule_count + sd.caliber_count})
                             </button>
                           ))}
+                          {extraSubCount > 0 && (
+                            <span className="tag">+{extraSubCount}</span>
+                          )}
                         </div>
+                      )}
+
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingTop: 10, borderTop: '1px solid #f1f5f9' }}>
+                        <span style={{ fontSize: 12, color: '#64748b' }}>
+                          规则 {c.rule_count} · 口径 {c.caliber_count} · 实证 {c.logic_backing_count}
+                        </span>
+                        <button
+                          type="button"
+                          className="link-btn"
+                          onClick={() => {
+                            setCapFilter(c.name)
+                            setSubDomainFilter('')
+                            setThemeFilter('')
+                            setTab('rules')
+                          }}
+                        >
+                          查看规则 →
+                        </button>
                       </div>
-                    )}
-                    {(c.subject_themes || []).length > 0 && (
-                      <div className="pill-row" style={{ marginTop: 8 }}>
-                        {c.subject_themes.map((th) => (
-                          <button
-                            key={th}
-                            className="badge badge-teal"
-                            style={{ border: 'none', cursor: 'pointer' }}
-                            onClick={() => {
-                              setRegimeFilter('')
-                              setCapFilter(c.name)
-                              setSubDomainFilter('')
-                              setThemeFilter(th)
-                              setTab('rules')
-                            }}
-                          >
-                            #{th}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                    {((c.upstream_businesses || []).length > 0 || (c.downstream_businesses || []).length > 0) && (
-                      <div className="lineage-row">
-                        {(c.upstream_businesses || []).length > 0 && (
-                          <span><strong>上游依赖业务：</strong>{c.upstream_businesses.join('、')}</span>
-                        )}
-                        {(c.downstream_businesses || []).length > 0 && (
-                          <span><strong>流向下游业务：</strong>{c.downstream_businesses.join('、')}</span>
-                        )}
-                      </div>
-                    )}
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 12, gap: 8, flexWrap: 'wrap' }}>
-                      <span style={{ fontSize: 12, color: '#64748b' }}>
-                        规则 {c.rule_count} 条 · 口径 {c.caliber_count} 项 · 底层逻辑实证 {c.logic_backing_count} 处 · 面向：{c.audience}
-                      </span>
-                      <button
-                        className="btn"
-                        onClick={() => {
-                          setCapFilter(c.name)
-                          setSubDomainFilter('')
-                          setThemeFilter('')
-                          setTab('rules')
-                        }}
-                      >
-                        查看该板块规则与业务解释
-                      </button>
                     </div>
                   </div>
                 )
               })}
             </div>
           ) : (
-            <div className="grid-2">
+            <div className="domain-grid">
               {themeMatrix.map((item) => (
-                <div key={item.theme} className="card">
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-                    <h3 style={{ margin: 0 }}>{item.theme}</h3>
-                    <span className="badge badge-teal">
-                      规则 {item.rule_count} · 口径 {item.caliber_count} · 跨 {item.capability_count} 域
-                    </span>
-                  </div>
-                  <p style={{ fontSize: 13, color: '#475569', margin: '8px 0' }}>
-                    {FINANCIAL_SUBJECT_THEME_DESCRIPTIONS[item.theme] || ''}
-                  </p>
-                  {(item.capabilities || []).length > 0 ? (
-                    <div className="pill-row">
-                      {item.capabilities.map((capName) => (
-                        <span key={capName} className="badge badge-slate">{capName}</span>
-                      ))}
+                <div key={item.theme} className="domain-card">
+                  <div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                      <h3 style={{ margin: 0, fontSize: 15.5 }}>{item.theme}</h3>
+                      <span className="tag">跨 {item.capability_count} 域</span>
                     </div>
-                  ) : (
-                    <p style={{ fontSize: 12, color: '#94a3b8' }}>当前已接入材料暂未沉淀该主题资产</p>
-                  )}
-                  <div style={{ marginTop: 12 }}>
+                    <p className="domain-desc">
+                      {FINANCIAL_SUBJECT_THEME_DESCRIPTIONS[item.theme] || ''}
+                    </p>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingTop: 10, borderTop: '1px solid #f1f5f9' }}>
+                    <span style={{ fontSize: 12, color: '#64748b' }}>
+                      规则 {item.rule_count} · 口径 {item.caliber_count}
+                    </span>
                     <button
-                      className="btn"
+                      type="button"
+                      className="link-btn"
                       disabled={item.rule_count + item.caliber_count === 0}
                       onClick={() => {
                         setRegimeFilter('')
@@ -427,7 +445,7 @@ export default function AssetsPage() {
                         setTab('rules')
                       }}
                     >
-                      跨报表查看「{item.theme}」全部规则
+                      查看规则 →
                     </button>
                   </div>
                 </div>
@@ -437,144 +455,619 @@ export default function AssetsPage() {
         </div>
       )}
 
-      {tab === 'rules' && filteredRules.map((r) => {
-        const rec = formatBadge(RECONCILE_LABELS, r.reconcile_status)
-        const st = formatBadge(STATUS_LABELS, r.status)
-        return (
-          <div key={r.id} className="card">
-            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                <span className="badge badge-blue">{RULE_CATEGORY_LABELS[r.rule_category] || r.rule_category}</span>
-                {r.regime && <span className="badge badge-slate">{r.regime}</span>}
-                {r.sub_domain && <span className="badge badge-purple">{r.sub_domain}</span>}
-                {r.subject_theme && <span className="badge badge-teal">{r.subject_theme}</span>}
-                <strong>{r.title}</strong>
-                <span style={{ fontSize: 12, color: '#64748b' }}>（{r.capability_name}）</span>
-              </div>
-              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                <span className={`badge badge-${rec.tone}`}>{rec.label}</span>
-                <span className={`badge badge-${st.tone}`}>{st.label}</span>
-              </div>
+      {(tab === 'rules' || tab === 'calibers') && (
+        <>
+          <div className="toolbar-row">
+            <div style={{ position: 'relative', flex: '2 1 220px' }}>
+              <SearchIcon
+                size={14}
+                style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: '#94a3b8' }}
+              />
+              <input
+                className="input"
+                style={{ paddingLeft: 30 }}
+                placeholder="搜索名称、业务域或口径说明…"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+              />
             </div>
-            <p style={{ fontSize: 14, marginTop: 10 }}><strong>当前逻辑实际执行：</strong>{r.business_condition}</p>
-            <p style={{ fontSize: 14 }}><strong>对应业务处理结果：</strong>{r.business_action}</p>
-            <p style={{ fontSize: 13, color: '#475569' }}><strong>业务含义解释：</strong>{r.business_rationale}</p>
-            <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-              <button
-                className="btn"
-                onClick={() => setEditing({
-                  kind: 'RULE',
-                  row: r,
-                  changes: {
-                    business_condition: r.business_condition,
-                    business_action: r.business_action,
-                    business_rationale: r.business_rationale,
-                  },
-                })}
-              >
-                补充 / 优化业务解释
+            <select
+              value={capFilter}
+              onChange={(e) => {
+                setCapFilter(e.target.value)
+                setSubDomainFilter('')
+              }}
+              style={{ flex: '1 1 170px', maxWidth: 230 }}
+            >
+              <option value="">全部一级业务域</option>
+              {capabilityNames.map((n) => (
+                <option key={n} value={n}>{n}</option>
+              ))}
+            </select>
+            {tab === 'rules' && (
+              <select value={catFilter} onChange={(e) => setCatFilter(e.target.value)} style={{ flex: '1 1 130px', maxWidth: 160 }}>
+                <option value="">全部类型</option>
+                {Object.entries(RULE_CATEGORY_LABELS).map(([k, v]) => (
+                  <option key={k} value={k}>{v}</option>
+                ))}
+              </select>
+            )}
+            <select value={recFilter} onChange={(e) => setRecFilter(e.target.value)} style={{ flex: '1 1 140px', maxWidth: 180 }}>
+              <option value="">全部状态</option>
+              {Object.entries(RECONCILE_LABELS).map(([k, v]) => (
+                <option key={k} value={k}>{v.label}</option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => setShowMoreFilters((v) => !v)}
+            >
+              <FilterIcon size={13} />
+              <span>{showMoreFilters ? '收起筛选' : '更多筛选'}</span>
+            </button>
+            {hasAnyFilter && (
+              <button type="button" className="link-btn" onClick={clearAllFilters}>
+                重置
               </button>
-              <button className="btn btn-primary" onClick={() => inspectBacking(r.code)}>查看制度对照与逻辑支撑 ({r.logic_backing_count})</button>
-            </div>
+            )}
           </div>
-        )
-      })}
 
-      {tab === 'calibers' && filteredCalibers.map((c) => {
-        const rec = formatBadge(RECONCILE_LABELS, c.reconcile_status)
-        const st = formatBadge(STATUS_LABELS, c.status)
-        return (
-          <div key={c.id} className="card">
-            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                {c.regime && <span className="badge badge-slate">{c.regime}</span>}
-                {c.sub_domain && <span className="badge badge-purple">{c.sub_domain}</span>}
-                {c.subject_theme && <span className="badge badge-teal">{c.subject_theme}</span>}
-                <strong>{c.metric_name}</strong>
-                <span style={{ fontSize: 12, color: '#64748b' }}>（{c.capability_name}）</span>
-              </div>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <span className={`badge badge-${rec.tone}`}>{rec.label}</span>
-                <span className={`badge badge-${st.tone}`}>{st.label}</span>
-              </div>
+          {showMoreFilters && (
+            <div className="toolbar-secondary">
+              <select value={regimeFilter} onChange={(e) => setRegimeFilter(e.target.value)} style={{ flex: '1 1 150px' }}>
+                <option value="">全部监管体系</option>
+                {regimeOptions.map((reg) => (
+                  <option key={reg} value={reg}>{reg}</option>
+                ))}
+              </select>
+              <select value={subDomainFilter} onChange={(e) => setSubDomainFilter(e.target.value)} style={{ flex: '1 1 170px' }}>
+                <option value="">全部二级子专题</option>
+                {subDomainOptions.map((sd) => (
+                  <option key={sd} value={sd}>{sd}</option>
+                ))}
+              </select>
+              <select value={themeFilter} onChange={(e) => setThemeFilter(e.target.value)} style={{ flex: '1 1 170px' }}>
+                <option value="">全部金融十大主题</option>
+                {FINANCIAL_SUBJECT_THEMES.map((th) => (
+                  <option key={th} value={th}>{th}</option>
+                ))}
+              </select>
             </div>
-            <p style={{ fontSize: 14, marginTop: 8 }}><strong>业务定义：</strong>{c.business_definition}</p>
-            <p style={{ fontSize: 14 }}><strong>系统实际计算口径：</strong>{c.formula_summary}</p>
-            <p style={{ fontSize: 13, color: '#475569' }}><strong>易混口径提醒：</strong>{c.distinction_notes}</p>
-            {c.conflict_notes && <div className="disclosure-box">{c.conflict_notes}</div>}
-            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-              <button
-                className="btn"
-                onClick={() => setEditing({
-                  kind: 'CALIBER',
-                  row: c,
-                  changes: { formula_summary: c.formula_summary, distinction_notes: c.distinction_notes },
-                })}
-              >
-                补充 / 优化口径解释
+          )}
+        </>
+      )}
+
+      {tab === 'rules' && (
+        <div className="table-card">
+          <div className="table-scroll">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>规则名称与所属业务</th>
+                  <th style={{ width: 100 }}>类型</th>
+                  <th style={{ width: 150 }}>对照状态</th>
+                  <th style={{ width: 110 }} className="num-col">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pagedRows.length === 0 ? (
+                  <tr>
+                    <td colSpan={4} style={{ textAlign: 'center', padding: '28px 14px', color: '#64748b' }}>
+                      未找到符合筛选条件的处理规则
+                    </td>
+                  </tr>
+                ) : (
+                  pagedRows.map((r) => {
+                    const rec = formatBadge(RECONCILE_LABELS, r.reconcile_status)
+                    return (
+                      <tr key={r.id} className="clickable" onClick={() => openDetailDrawer('RULE', r)}>
+                        <td>
+                          <div className="table-title-main">{r.title}</div>
+                          <div className="table-title-sub">
+                            {[r.capability_name, r.sub_domain, r.subject_theme].filter(Boolean).join(' · ')}
+                          </div>
+                        </td>
+                        <td>
+                          <span className="tag">{RULE_CATEGORY_LABELS[r.rule_category] || r.rule_category}</span>
+                        </td>
+                        <td>
+                          <span className="status-inline">
+                            <span className={`dot ${DOT_TONE_CLASS[rec.tone] || 'dot-slate'}`} />
+                            <span>{rec.label}</span>
+                          </span>
+                        </td>
+                        <td className="num-col" onClick={(e) => e.stopPropagation()}>
+                          <button type="button" className="link-btn" onClick={() => openDetailDrawer('RULE', r)}>
+                            详情
+                          </button>
+                          <span style={{ margin: '0 8px', color: '#cbd5e1' }}>|</span>
+                          <button type="button" className="link-btn" onClick={() => openEditForRule(r)}>
+                            编辑
+                          </button>
+                        </td>
+                      </tr>
+                    )
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+          <div className="pagination-bar">
+            <span>共 {filteredRules.length} 条规则 · 第 {safePage} / {totalPages} 页</span>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button type="button" className="btn btn-sm" disabled={safePage <= 1} onClick={() => setPage((p) => Math.max(1, p - 1))}>
+                上一页
               </button>
-              <button className="btn btn-primary" onClick={() => inspectBacking(c.code)}>查看依据</button>
+              <button type="button" className="btn btn-sm" disabled={safePage >= totalPages} onClick={() => setPage((p) => Math.min(totalPages, p + 1))}>
+                下一页
+              </button>
             </div>
           </div>
-        )
-      })}
+        </div>
+      )}
+
+      {tab === 'calibers' && (
+        <div className="table-card">
+          <div className="table-scroll">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>指标名称与业务定义</th>
+                  <th style={{ width: 140 }}>金融主题</th>
+                  <th style={{ width: 150 }}>对照状态</th>
+                  <th style={{ width: 110 }} className="num-col">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pagedRows.length === 0 ? (
+                  <tr>
+                    <td colSpan={4} style={{ textAlign: 'center', padding: '28px 14px', color: '#64748b' }}>
+                      未找到符合筛选条件的指标口径
+                    </td>
+                  </tr>
+                ) : (
+                  pagedRows.map((c) => {
+                    const rec = formatBadge(RECONCILE_LABELS, c.reconcile_status)
+                    return (
+                      <tr key={c.id} className="clickable" onClick={() => openDetailDrawer('CALIBER', c)}>
+                        <td>
+                          <div className="table-title-main">{c.metric_name}</div>
+                          <div className="table-title-sub">
+                            {c.capability_name}{c.business_definition ? ` · ${c.business_definition}` : ''}
+                          </div>
+                        </td>
+                        <td>
+                          <span className="tag">{c.subject_theme || '未归类'}</span>
+                        </td>
+                        <td>
+                          <span className="status-inline">
+                            <span className={`dot ${DOT_TONE_CLASS[rec.tone] || 'dot-slate'}`} />
+                            <span>{rec.label}</span>
+                          </span>
+                        </td>
+                        <td className="num-col" onClick={(e) => e.stopPropagation()}>
+                          <button type="button" className="link-btn" onClick={() => openDetailDrawer('CALIBER', c)}>
+                            详情
+                          </button>
+                          <span style={{ margin: '0 8px', color: '#cbd5e1' }}>|</span>
+                          <button type="button" className="link-btn" onClick={() => openEditForCaliber(c)}>
+                            编辑
+                          </button>
+                        </td>
+                      </tr>
+                    )
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+          <div className="pagination-bar">
+            <span>共 {filteredCalibers.length} 项口径 · 第 {safePage} / {totalPages} 页</span>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button type="button" className="btn btn-sm" disabled={safePage <= 1} onClick={() => setPage((p) => Math.max(1, p - 1))}>
+                上一页
+              </button>
+              <button type="button" className="btn btn-sm" disabled={safePage >= totalPages} onClick={() => setPage((p) => Math.min(totalPages, p + 1))}>
+                下一页
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {tab === 'reconcile' && (
-        <div className="card">
-          {filteredReconcile.map((item) => {
-            const rec = formatBadge(RECONCILE_LABELS, item.reconcile_status)
-            return (
-              <div key={item.code} style={{ padding: '10px 0', borderBottom: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', gap: 12 }}>
-                <div>
-                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
-                    {item.regime && <span className="badge badge-slate">{item.regime}</span>}
-                    {item.sub_domain && <span className="badge badge-purple">{item.sub_domain}</span>}
-                    {item.subject_theme && <span className="badge badge-teal">{item.subject_theme}</span>}
-                    <strong>{item.name}</strong>
-                    <span style={{ color: '#64748b', fontSize: 12 }}>({item.capability_name})</span>
-                  </div>
-                  <div style={{ fontSize: 13, color: '#475569', marginTop: 4 }}>{item.summary}</div>
-                </div>
-                <span className={`badge badge-${rec.tone}`} style={{ alignSelf: 'center', whiteSpace: 'nowrap' }}>{rec.label}</span>
+        <>
+          <div className="toolbar-row" style={{ justifyContent: 'space-between' }}>
+            <div className="pill-row">
+              <button
+                type="button"
+                className={`pill-chip ${recFilter === '' ? 'active' : ''}`}
+                onClick={() => setRecFilter('')}
+              >
+                全部 ({reconcileAll.length})
+              </button>
+              <button
+                type="button"
+                className={`pill-chip ${recFilter === 'DIVERGENT' ? 'active' : ''}`}
+                onClick={() => setRecFilter('DIVERGENT')}
+              >
+                口径差异 ({reconcileSummary.DIVERGENT || 0})
+              </button>
+              <button
+                type="button"
+                className={`pill-chip ${recFilter === 'UNREALIZED' ? 'active' : ''}`}
+                onClick={() => setRecFilter('UNREALIZED')}
+              >
+                尚未包含 ({reconcileSummary.UNREALIZED || 0})
+              </button>
+              <button
+                type="button"
+                className={`pill-chip ${recFilter === 'VERIFIED' ? 'active' : ''}`}
+                onClick={() => setRecFilter('VERIFIED')}
+              >
+                已验证一致 ({(reconcileSummary.VERIFIED || 0) + (reconcileSummary.CONSISTENT || 0)})
+              </button>
+            </div>
+
+            <div style={{ position: 'relative', flex: '1 1 220px', maxWidth: 320 }}>
+              <SearchIcon
+                size={14}
+                style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: '#94a3b8' }}
+              />
+              <input
+                className="input"
+                style={{ paddingLeft: 30 }}
+                placeholder="搜索对账事项名称或摘要…"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+              />
+            </div>
+          </div>
+
+          <div className="table-card">
+            <div className="table-scroll">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>对账事项与所属业务</th>
+                    <th>对照摘要</th>
+                    <th style={{ width: 150 }}>对照状态</th>
+                    <th style={{ width: 90 }} className="num-col">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pagedRows.length === 0 ? (
+                    <tr>
+                      <td colSpan={4} style={{ textAlign: 'center', padding: '28px 14px', color: '#64748b' }}>
+                        未找到符合条件的制度对照记录
+                      </td>
+                    </tr>
+                  ) : (
+                    pagedRows.map((item) => {
+                      const rec = formatBadge(RECONCILE_LABELS, item.reconcile_status)
+                      return (
+                        <tr key={item.code} className="clickable" onClick={() => openDetailDrawer('RECONCILE', item)}>
+                          <td>
+                            <div className="table-title-main">{item.name}</div>
+                            <div className="table-title-sub">
+                              {[item.capability_name, item.sub_domain].filter(Boolean).join(' · ')}
+                            </div>
+                          </td>
+                          <td>
+                            <div className="table-title-sub" style={{ WebkitLineClamp: 2 }}>{item.summary}</div>
+                          </td>
+                          <td>
+                            <span className="status-inline">
+                              <span className={`dot ${DOT_TONE_CLASS[rec.tone] || 'dot-slate'}`} />
+                              <span>{rec.label}</span>
+                            </span>
+                          </td>
+                          <td className="num-col">
+                            <button
+                              type="button"
+                              className="link-btn"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                openDetailDrawer('RECONCILE', item)
+                              }}
+                            >
+                              查看依据
+                            </button>
+                          </td>
+                        </tr>
+                      )
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+            <div className="pagination-bar">
+              <span>共 {filteredReconcile.length} 项对照 · 第 {safePage} / {totalPages} 页</span>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button type="button" className="btn btn-sm" disabled={safePage <= 1} onClick={() => setPage((p) => Math.max(1, p - 1))}>
+                  上一页
+                </button>
+                <button type="button" className="btn btn-sm" disabled={safePage >= totalPages} onClick={() => setPage((p) => Math.min(totalPages, p + 1))}>
+                  下一页
+                </button>
               </div>
-            )
-          })}
-        </div>
+            </div>
+          </div>
+        </>
       )}
 
       {editing && (
-        <div className="card modal-card">
-          <h3>补充 / 优化业务解释（门禁自动校验，禁止输入代码或表名）</h3>
-          {Object.entries(editing.changes).map(([k, v]) => (
-            <div key={k} style={{ marginBottom: 10 }}>
-              <textarea
-                rows={3}
-                value={v}
-                onChange={(e) => setEditing({ ...editing, changes: { ...editing.changes, [k]: e.target.value } })}
-              />
+        <div
+          className="modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-label="编辑业务释义"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setEditing(null)
+          }}
+        >
+          <div className="modal-dialog">
+            <div className="modal-header">
+              <div>
+                <h3 style={{ margin: 0, fontSize: 16 }}>补充 / 优化业务释义</h3>
+                <div style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>
+                  请使用纯业务语言描述，保存前系统将自动校验口径规范
+                </div>
+              </div>
+              <button type="button" className="icon-btn" onClick={() => setEditing(null)} aria-label="关闭弹窗">
+                <CloseIcon size={18} />
+              </button>
             </div>
-          ))}
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button className="btn btn-primary" onClick={handleSaveEdit}>保存业务解释</button>
-            <button className="btn" onClick={() => setEditing(null)}>取消</button>
+            <div className="modal-body">
+              {Object.entries(editing.changes).map(([k, v]) => (
+                <div key={k} style={{ marginBottom: 14 }}>
+                  <label className="form-label">{EDIT_FIELD_LABELS[k] || k}</label>
+                  <textarea
+                    rows={3}
+                    value={v}
+                    onChange={(e) => setEditing({ ...editing, changes: { ...editing.changes, [k]: e.target.value } })}
+                  />
+                </div>
+              ))}
+            </div>
+            <div className="modal-footer">
+              <button type="button" className="btn" onClick={() => setEditing(null)}>取消</button>
+              <button type="button" className="btn btn-primary" onClick={handleSaveEdit}>保存释义</button>
+            </div>
           </div>
         </div>
       )}
 
-      {backing && (
-        <div className="card modal-card" style={{ borderColor: '#059669' }}>
-          <h3>制度对照与系统逻辑实证：{backing.title}</h3>
-          <p>底层系统逻辑交叉实证环节数：<strong>{backing.logic_backing_count}</strong> 处（物理表名、字段与代码行号已隔离隐藏）</p>
-          {(backing.clause_references || []).length === 0 ? (
-            <p style={{ fontSize: 13, color: '#64748b' }}>暂无对应制度原文条款，该规则由底层系统处理逻辑直接还原生成。</p>
-          ) : (
-            (backing.clause_references || []).map((cl, i) => (
-              <div key={i} style={{ fontSize: 13, marginBottom: 8, padding: 8, background: '#f8fafc', borderRadius: 6 }}>
-                <strong>[{cl.chapter}] {cl.clause_title}：</strong>{cl.requirement}
+      {drawerItem && (
+        <div
+          className="drawer-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-label="业务资产详情"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) closeDetailDrawer()
+          }}
+        >
+          <aside className="drawer-panel">
+            <div className="drawer-header">
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
+                  <span className="tag tag-blue">
+                    {drawerItem.kind === 'RULE' ? '处理规则' : drawerItem.kind === 'CALIBER' ? '指标口径' : '制度对照'}
+                  </span>
+                  {drawerItem.row.reconcile_status && (() => {
+                    const rec = formatBadge(RECONCILE_LABELS, drawerItem.row.reconcile_status)
+                    return (
+                      <span className="status-inline">
+                        <span className={`dot ${DOT_TONE_CLASS[rec.tone] || 'dot-slate'}`} />
+                        <span>{rec.label}</span>
+                      </span>
+                    )
+                  })()}
+                  {drawerItem.row.status && (
+                    <span className="tag">{formatBadge(STATUS_LABELS, drawerItem.row.status).label}</span>
+                  )}
+                </div>
+                <h3 style={{ margin: 0, fontSize: 16, lineHeight: 1.4 }}>
+                  {drawerItem.row.title || drawerItem.row.metric_name || drawerItem.row.name}
+                </h3>
+                <div style={{ fontSize: 12, color: '#64748b', marginTop: 4 }}>
+                  {[drawerItem.row.capability_name, drawerItem.row.sub_domain, drawerItem.row.subject_theme]
+                    .filter(Boolean)
+                    .join(' · ')}
+                </div>
               </div>
-            ))
-          )}
-          <button className="btn" onClick={() => setBacking(null)}>关闭</button>
+              <button type="button" className="icon-btn" onClick={closeDetailDrawer} aria-label="关闭抽屉">
+                <CloseIcon size={18} />
+              </button>
+            </div>
+
+            <div className="drawer-body">
+              {drawerItem.kind === 'RULE' && (
+                <>
+                  <div className="drawer-detail-block">
+                    <div className="drawer-detail-label">当前逻辑实际执行</div>
+                    <div className="drawer-detail-text">{drawerItem.row.business_condition}</div>
+                  </div>
+                  <div className="drawer-detail-block">
+                    <div className="drawer-detail-label">对应业务处理结果</div>
+                    <div className="drawer-detail-text">{drawerItem.row.business_action}</div>
+                  </div>
+                  <div className="drawer-detail-block">
+                    <div className="drawer-detail-label">业务含义解释</div>
+                    <div className="drawer-detail-text">{drawerItem.row.business_rationale}</div>
+                  </div>
+                </>
+              )}
+
+              {drawerItem.kind === 'CALIBER' && (
+                <>
+                  <div className="drawer-detail-block">
+                    <div className="drawer-detail-label">业务定义</div>
+                    <div className="drawer-detail-text">{drawerItem.row.business_definition}</div>
+                  </div>
+                  <div className="drawer-detail-block">
+                    <div className="drawer-detail-label">系统实际计算口径</div>
+                    <div className="drawer-detail-text">{drawerItem.row.formula_summary}</div>
+                  </div>
+                  {drawerItem.row.distinction_notes && (
+                    <div className="drawer-detail-block">
+                      <div className="drawer-detail-label">易混口径提醒</div>
+                      <div className="drawer-detail-text">{drawerItem.row.distinction_notes}</div>
+                    </div>
+                  )}
+                </>
+              )}
+
+              {drawerItem.kind === 'RECONCILE' && (
+                <div className="drawer-detail-block">
+                  <div className="drawer-detail-label">对照摘要</div>
+                  <div className="drawer-detail-text">{drawerItem.row.summary}</div>
+                </div>
+              )}
+
+              {backingLoading && (
+                <div className="sub-card" style={{ fontSize: 13, color: '#64748b' }}>
+                  正在调取制度对照与系统实证…
+                </div>
+              )}
+
+              {backing && (
+                <>
+                  <div className="evidence-stat-box">
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 7, color: '#0f766e', fontWeight: 700, fontSize: 13.5 }}>
+                      <CheckCircleIcon size={16} />
+                      <span>系统运行实证：已关联 {backing.logic_backing_count ?? 0} 处核验记录</span>
+                    </div>
+                    <p style={{ margin: '6px 0 0', fontSize: 12.5, color: '#115e59', lineHeight: 1.55 }}>
+                      该业务口径已结合制度文档与系统实际运行规则完成交叉比对。
+                    </p>
+                  </div>
+
+                  {backing.conflict_notes && (
+                    <div className="disclosure-box">
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700, marginBottom: 4 }}>
+                        <AlertIcon size={15} />
+                        <span>口径差异说明</span>
+                      </div>
+                      <div>{backing.conflict_notes}</div>
+                    </div>
+                  )}
+
+                  {(backing.processing_steps || []).length > 0 && (
+                    <div style={{ marginTop: 14 }}>
+                      <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8 }}>
+                        系统实际加工步骤（{backing.processing_steps.length} 个核心环节）
+                      </div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                        {backing.processing_steps.map((st, idx) => (
+                          <React.Fragment key={idx}>
+                          {st.flow_label && (idx === 0 || backing.processing_steps[idx - 1].flow_label !== st.flow_label) && (
+                            <div className="process-flow-title">{st.flow_label}</div>
+                          )}
+                          <div className="process-step-card">
+                            <div className="process-step-head">
+                              <span className="process-step-badge">{st.order ? `第 ${st.order} 步` : `环节 ${idx + 1}`}{st.stage_role_label ? ` · ${st.stage_role_label}` : ''}</span>
+                              <span style={{ fontWeight: 700, fontSize: 13, color: '#0f172a' }}>{st.stage}</span>
+                            </div>
+                            {st.flow_summary && (
+                              <div style={{ fontSize: 12.5, color: '#334155', lineHeight: 1.6, marginTop: 6 }}>
+                                {st.flow_summary}
+                              </div>
+                            )}
+                            <div className="process-kv-list">
+                              {(st.inclusions || []).map((inc, i) => (
+                                <div key={`inc-${i}`} className="process-kv-row">
+                                  <span className="process-kv-key">纳入</span>
+                                  <span>{inc}</span>
+                                </div>
+                              ))}
+                              {(st.exclusions || []).map((exc, i) => (
+                                <div key={`exc-${i}`} className="process-kv-row">
+                                  <span className="process-kv-key warn">剔除</span>
+                                  <span>{exc}</span>
+                                </div>
+                              ))}
+                              {(st.branches || []).map((br, i) => (
+                                <div key={`br-${i}`} className="process-kv-row">
+                                  <span className="process-kv-key info">分支</span>
+                                  <span>{br}</span>
+                                </div>
+                              ))}
+                              {st.calculation && (
+                                <div className="process-kv-row">
+                                  <span className="process-kv-key">计算</span>
+                                  <span>{st.calculation}</span>
+                                </div>
+                              )}
+                              {st.dedup && (
+                                <div className="process-kv-row">
+                                  <span className="process-kv-key">去重</span>
+                                  <span>{st.dedup}</span>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                          </React.Fragment>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <div style={{ marginTop: 14 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8 }}>
+                      对应制度原文条款（{(backing.clause_references || []).length} 条）
+                    </div>
+                    {(backing.clause_references || []).length === 0 ? (
+                      <div className="sub-card" style={{ fontSize: 13, color: '#64748b' }}>
+                        暂无对应制度原文条款，该规则由系统实际处理逻辑梳理生成。
+                      </div>
+                    ) : (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                        {backing.clause_references.map((cl, i) => (
+                          <div key={i} className="sub-card">
+                            <div style={{ fontSize: 12.5, fontWeight: 700, color: '#1e40af', marginBottom: 4 }}>
+                              {cl.chapter ? `[${cl.chapter}] ` : ''}{cl.clause_title}
+                            </div>
+                            <div style={{ fontSize: 13, color: '#334155', lineHeight: 1.6 }}>
+                              {cl.requirement}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="drawer-footer">
+              <div>
+                {drawerItem.kind === 'RULE' && (
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    onClick={() => openEditForRule(drawerItem.row)}
+                  >
+                    编辑业务释义
+                  </button>
+                )}
+                {drawerItem.kind === 'CALIBER' && (
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    onClick={() => openEditForCaliber(drawerItem.row)}
+                  >
+                    编辑口径释义
+                  </button>
+                )}
+              </div>
+              <button type="button" className="btn btn-sm btn-primary" onClick={closeDetailDrawer}>
+                关闭
+              </button>
+            </div>
+          </aside>
         </div>
       )}
     </div>

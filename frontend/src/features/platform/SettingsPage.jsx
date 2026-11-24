@@ -2,6 +2,9 @@ import React, { useEffect, useState } from 'react'
 import { getBudget, getLlmConfig, updateBudget, updateLlmConfig } from '../../api/platform.js'
 import { BUDGET_LABELS } from '../../utils/labels.js'
 
+const CONCURRENCY_KEYS = ['max_llm_concurrency', 'max_llm_rpm', 'max_retries', 'max_elapsed_seconds']
+const QUOTA_KEYS = ['max_calls_per_script', 'max_llm_calls', 'max_total_tokens']
+
 export default function SettingsPage() {
   const [budget, setBudget] = useState(null)
   const [llmCfg, setLlmCfg] = useState(null)
@@ -15,38 +18,57 @@ export default function SettingsPage() {
   }, [])
 
   const handleSaveBudget = async () => {
-    setSaved(''); setError('')
+    setSaved('')
+    setError('')
     try {
       const res = await updateBudget(budget)
       setBudget(res.budget)
-      setSaved('执行预算设置已更新')
+      setSaved('运行预算设置已更新')
     } catch (e) {
       setError(e.message)
     }
   }
 
   const handleSaveLlm = async () => {
-    setLlmSaved(''); setError('')
+    setLlmSaved('')
+    setError('')
     try {
       const res = await updateLlmConfig(llmCfg)
       setLlmCfg(res.config)
-      setLlmSaved('大模型语义翻译与问答配置已保存（将受去技术化门禁保护后生效）')
+      setLlmSaved('大模型服务配置已保存')
     } catch (e) {
       setError(e.message)
     }
   }
 
   return (
-    <div>
+    <div className="settings-column">
+      <div className="page-header">
+        <div>
+          <h1 className="page-title">系统配置</h1>
+          <p className="page-subtitle">
+            配置大模型服务端点、并发频率限制与任务额度保护，保障材料解析与智能问答稳定可控。
+          </p>
+        </div>
+      </div>
+
       <div className="card">
-        <h2>大模型语义理解与翻译配置</h2>
-        <p style={{ color: '#475569', fontSize: 14 }}>
-          当面对陌生 SQL 代码逻辑或自然语言提问时，可切换为 OpenAI 兼容大模型执行“代码 AST → 纯业务中文”受控翻译（受 Bus 门禁校验）。
-        </p>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, flexWrap: 'wrap', marginBottom: 14 }}>
+          <div>
+            <h2 style={{ margin: 0, fontSize: 16 }}>大模型服务配置</h2>
+            <p style={{ color: '#64748b', fontSize: 13, margin: '4px 0 0' }}>
+              可选择离线确定性引擎或接入 OpenAI 兼容大模型执行业务口径提炼与智能问答。
+            </p>
+          </div>
+          <button type="button" className="btn btn-primary btn-sm" onClick={handleSaveLlm} disabled={!llmCfg}>
+            保存模型配置
+          </button>
+        </div>
+
         {llmCfg && (
-          <div className="grid-2" style={{ marginTop: 12 }}>
+          <div className="grid-2">
             <div>
-              <label style={{ fontSize: 13, fontWeight: 600 }}>运行模式</label>
+              <label className="form-label">运行模式</label>
               <select
                 value={llmCfg.llm_provider}
                 onChange={(e) => setLlmCfg({ ...llmCfg, llm_provider: e.target.value })}
@@ -58,7 +80,7 @@ export default function SettingsPage() {
               </select>
             </div>
             <div>
-              <label style={{ fontSize: 13, fontWeight: 600 }}>模型名称（Model）</label>
+              <label className="form-label">模型名称（Model）</label>
               <input
                 className="input"
                 value={llmCfg.llm_model}
@@ -66,7 +88,7 @@ export default function SettingsPage() {
               />
             </div>
             <div>
-              <label style={{ fontSize: 13, fontWeight: 600 }}>接口地址（Base URL）</label>
+              <label className="form-label">接口地址（Base URL）</label>
               <input
                 className="input"
                 value={llmCfg.llm_base_url}
@@ -74,7 +96,7 @@ export default function SettingsPage() {
               />
             </div>
             <div>
-              <label style={{ fontSize: 13, fontWeight: 600 }}>API Key</label>
+              <label className="form-label">API Key</label>
               <input
                 className="input"
                 type="password"
@@ -84,7 +106,7 @@ export default function SettingsPage() {
               />
             </div>
             <div>
-              <label style={{ fontSize: 13, fontWeight: 600 }}>单次调用超时秒数</label>
+              <label className="form-label">单次调用超时（秒）</label>
               <input
                 className="input"
                 type="number"
@@ -94,35 +116,57 @@ export default function SettingsPage() {
             </div>
           </div>
         )}
-        <div style={{ marginTop: 14 }}>
-          <button className="btn btn-primary" onClick={handleSaveLlm} disabled={!llmCfg}>保存模型配置</button>
-        </div>
-        {llmSaved && <p style={{ color: '#047857', marginTop: 10, fontWeight: 600 }}>{llmSaved}</p>}
+        {llmSaved && <div className="alert-banner success">{llmSaved}</div>}
       </div>
 
       <div className="card">
-        <h2>运行预算与治理门禁设置</h2>
-        <p style={{ color: '#475569', fontSize: 14 }}>控制并发处理规模与智能调用成本上限，保障解析与问答稳定可控。</p>
-        {budget && (
-          <div className="grid-2" style={{ marginTop: 12 }}>
-            {Object.entries(budget).map(([k, v]) => (
-              <div key={k}>
-                <label style={{ fontSize: 13, fontWeight: 600 }}>{BUDGET_LABELS[k] || k}</label>
-                <input
-                  className="input"
-                  type="number"
-                  value={v}
-                  onChange={(e) => setBudget({ ...budget, [k]: Number(e.target.value) })}
-                />
-              </div>
-            ))}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, flexWrap: 'wrap', marginBottom: 8 }}>
+          <div>
+            <h2 style={{ margin: 0, fontSize: 16 }}>运行预算与并发控制</h2>
+            <p style={{ color: '#64748b', fontSize: 13, margin: '4px 0 0' }}>
+              控制批处理并发规模、请求频率与单任务资源消耗上限。
+            </p>
           </div>
-        )}
-        <div style={{ marginTop: 14 }}>
-          <button className="btn btn-primary" onClick={handleSaveBudget} disabled={!budget}>保存预算设置</button>
+          <button type="button" className="btn btn-primary btn-sm" onClick={handleSaveBudget} disabled={!budget}>
+            保存预算设置
+          </button>
         </div>
-        {saved && <p style={{ color: '#047857', marginTop: 10 }}>{saved}</p>}
-        {error && <p style={{ color: '#b91c1c', marginTop: 10 }}>{error}</p>}
+
+        {budget && (
+          <>
+            <div className="section-subhead">并发与频率限制</div>
+            <div className="grid-2">
+              {CONCURRENCY_KEYS.filter((k) => k in budget).map((k) => (
+                <div key={k}>
+                  <label className="form-label">{BUDGET_LABELS[k] || k}</label>
+                  <input
+                    className="input"
+                    type="number"
+                    value={budget[k]}
+                    onChange={(e) => setBudget({ ...budget, [k]: Number(e.target.value) })}
+                  />
+                </div>
+              ))}
+            </div>
+
+            <div className="section-subhead">任务额度保护</div>
+            <div className="grid-2">
+              {QUOTA_KEYS.filter((k) => k in budget).map((k) => (
+                <div key={k}>
+                  <label className="form-label">{BUDGET_LABELS[k] || k}</label>
+                  <input
+                    className="input"
+                    type="number"
+                    value={budget[k]}
+                    onChange={(e) => setBudget({ ...budget, [k]: Number(e.target.value) })}
+                  />
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+        {saved && <div className="alert-banner success">{saved}</div>}
+        {error && <div className="alert-banner error">{error}</div>}
       </div>
     </div>
   )

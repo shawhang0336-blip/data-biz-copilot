@@ -347,3 +347,90 @@ class RealDesignLlm:
             "arguments": arguments,
         }
         return arguments, trace
+
+    def stream_text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        on_delta: Callable[[str], None],
+        timeout: Optional[int] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """流式输出纯中文业务文本，逐 token 回调 `on_delta`。"""
+        if timeout is None:
+            timeout = self.settings.llm_timeout
+        started_at = time.monotonic()
+        request_json: Dict[str, Any] = {
+            "model": self.settings.llm_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0,
+            "max_tokens": 4096,
+            "stream": True,
+        }
+        if self.settings.llm_thinking:
+            request_json["thinking"] = {"type": self.settings.llm_thinking}
+        base_url = self.settings.llm_base_url.rstrip("/")
+        url = f"{base_url}/chat/completions"
+        headers = {"Authorization": f"Bearer {self.settings.llm_api_key}"}
+        active_cancel = _cancel_provider() if _cancel_provider is not None else None
+        _rate_limiter.acquire(cancellation=active_cancel)
+
+        chunks = []
+        try:
+            with llm_call_semaphore():
+                with _get_http_client().stream(
+                    "POST", url, headers=headers, json=request_json, timeout=timeout
+                ) as response:
+                    if response.is_error:
+                        raw_err = response.read().decode("utf-8", errors="ignore")
+                        elapsed = round(time.monotonic() - started_at, 2)
+                        retry_after = (
+                            _parse_retry_after(response.headers.get("Retry-After"))
+                            if getattr(response, "status_code", None) == 429 and hasattr(response, "headers")
+                            else None
+                        )
+                        if getattr(response, "status_code", None) == 429:
+                            notify_llm_rate_limited(retry_after)
+                        raise RuntimeError(
+                            f"LLM stream HTTP {response.status_code}: {raw_err[:240]}; elapsed={elapsed}s"
+                        )
+                    for raw_line in response.iter_lines():
+                        if not raw_line:
+                            continue
+                        line = raw_line.strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if not data_str or data_str == "[DONE]":
+                            if data_str == "[DONE]":
+                                break
+                            continue
+                        try:
+                            pkt = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        choices = pkt.get("choices") or []
+                        if not choices or not isinstance(choices[0], dict):
+                            continue
+                        delta_obj = choices[0].get("delta") or {}
+                        piece = delta_obj.get("content")
+                        if piece:
+                            chunks.append(piece)
+                            on_delta(piece)
+        except httpx.TimeoutException as exc:
+            elapsed = round(time.monotonic() - started_at, 2)
+            raise LlmTimeoutError(f"{type(exc).__name__} after {elapsed}s") from exc
+        except httpx.HTTPError as exc:
+            elapsed = round(time.monotonic() - started_at, 2)
+            raise RuntimeError(f"{type(exc).__name__} after {elapsed}s") from exc
+
+        full_text = "".join(chunks)
+        trace = {
+            "provider": self.settings.llm_provider,
+            "model": self.settings.llm_model,
+            "elapsed_seconds": round(time.monotonic() - started_at, 2),
+            "stream": True,
+        }
+        return full_text, trace

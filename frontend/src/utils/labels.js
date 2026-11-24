@@ -85,6 +85,31 @@ export const FINANCIAL_SUBJECT_THEME_DESCRIPTIONS = {
   风控与合规管控: '复核审批门禁、测试/演练与应报未报剔除、防重及幂等控制',
 }
 
+export const ROLE_LENS_OPTIONS = [
+  { value: '业务', label: '业务人员', shortLabel: '业务' },
+  { value: '监管报送', label: '监管报送', shortLabel: '监管报送' },
+  { value: '合规', label: '合规审计', shortLabel: '合规' },
+  { value: '财务核算', label: '财务核算', shortLabel: '财务核算' },
+]
+
+export const TOOL_DISPLAY_LABELS = {
+  list_covered_businesses: '盘点已涵盖业务板块',
+  resolve_business_concept: '映射业务概念与主题',
+  get_business_scope_and_rules: '检索纳入剔除与分支规则',
+  get_business_caliber_detail: '查询业务指标口径',
+  verify_implementation_backing: '交叉核验系统实证',
+  check_regulatory_coverage_gap: '排查制度覆盖与差异缺口',
+  find_rules_by_business_role: '按角色视角筛选规则',
+}
+
+export const EDIT_FIELD_LABELS = {
+  business_condition: '当前逻辑实际执行',
+  business_action: '对应业务处理结果',
+  business_rationale: '业务含义解释',
+  formula_summary: '系统实际计算口径',
+  distinction_notes: '易混口径提醒',
+}
+
 export function formatBadge(map, value) {
   return map[value] || { label: value || '未知', tone: 'slate' }
 }

@@ -10,11 +10,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from app.catalog.views import (
+    get_asset_evidence_ids_map,
     get_catalog_cache_signature,
     list_business_calibers,
     list_business_rules,
     list_capabilities,
     list_reconcile_ledger,
+    summarize_processing_flow,
 )
 from app.copilot.disclosure import build_disclosure, format_disclosure_subjects
 from app.infra.retrieval import get_or_build_bm25_index, infer_regulatory_regime
@@ -437,11 +439,23 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
         codes = args.get("asset_codes") or []
         rules_by_code = {r["code"]: r for r in list_business_rules(session)}
         cals_by_code = {c["code"]: c for c in list_business_calibers(session)}
+        ev_map = get_asset_evidence_ids_map(session, list(codes))
+        seen_flow_sigs = set()
         verdicts: List[Dict[str, Any]] = []
         for code in codes:
             item = rules_by_code.get(code) or cals_by_code.get(code)
             if not item:
                 continue
+            raw_steps = summarize_processing_flow(session, ev_map.get(code) or [], limit=6)
+            unique_steps = []
+            for st in raw_steps:
+                sig = (st.get("stage", ""), (st.get("flow_summary") or "")[:60])
+                if sig in seen_flow_sigs:
+                    continue
+                seen_flow_sigs.add(sig)
+                unique_steps.append(st)
+                if len(unique_steps) >= 4:
+                    break
             verdicts.append(
                 {
                     "code": code,
@@ -449,6 +463,7 @@ def execute_business_tool(session: Session, tool_name: str, args: Dict[str, Any]
                     "reconcile_status": item["reconcile_status"],
                     "logic_backing_count": item["logic_backing_count"],
                     "clause_backing_count": item["clause_backing_count"],
+                    "processing_steps": unique_steps,
                     "backing_verdict": (
                         f"已获 {item['logic_backing_count']} 处系统底层逻辑链路与 {item['clause_backing_count']} 条制度条款交叉实证"
                         if item["logic_backing_count"] > 0

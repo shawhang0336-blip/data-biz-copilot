@@ -26,6 +26,7 @@ from app.infra.taxonomy import (
     normalize_financial_theme,
     summarize_subject_theme_matrix,
 )
+from app.policy.dc_bus import sanitize_business_text
 
 
 def _compute_capability_regimes(
@@ -468,8 +469,199 @@ def get_asset_panorama(session: Session) -> Dict[str, Any]:
     }
 
 
+def get_asset_evidence_ids_map(session: Session, asset_codes: List[str]) -> Dict[str, List[str]]:
+    """批量查询业务资产编号关联的底层实证 ID 列表。"""
+    clean_codes = [c for c in asset_codes if c]
+    if not clean_codes:
+        return {}
+    out: Dict[str, List[str]] = {}
+    for row in (
+        session.query(BusinessRuleAssetModel.code, BusinessRuleAssetModel.evidence_ids_json)
+        .filter(BusinessRuleAssetModel.code.in_(clean_codes))
+        .all()
+    ):
+        out[row[0]] = list(row[1] or [])
+    for row in (
+        session.query(BusinessCaliberAssetModel.code, BusinessCaliberAssetModel.evidence_ids_json)
+        .filter(BusinessCaliberAssetModel.code.in_(clean_codes))
+        .all()
+    ):
+        out[row[0]] = list(row[1] or [])
+    return out
+
+
+def _clean_flow_items(items: Any, *, max_items: int = 3, is_branch: bool = False) -> List[str]:
+    out: List[str] = []
+    for item in items or []:
+        if is_branch:
+            if isinstance(item, dict):
+                cond = sanitize_business_text(str(item.get("condition") or item.get("title") or "").strip())
+                act = sanitize_business_text(str(item.get("action") or "").strip())
+                text = f"{cond} → {act}" if cond and act else (act or cond)
+            else:
+                text = sanitize_business_text(str(item or "").strip())
+        else:
+            if isinstance(item, dict):
+                text = sanitize_business_text(str(item.get("condition") or item.get("title") or "").strip())
+            else:
+                text = sanitize_business_text(str(item or "").strip())
+        if text and text not in out:
+            out.append(text)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+_STAGE_ROLE_LABELS = {
+    "SCOPE_FILTER": "圈定范围",
+    "BRANCH_LOGIC": "分情况处理",
+    "CALCULATION": "加工计算",
+    "DEDUP_MERGE": "合并去重",
+    "OUTPUT_REPORT": "汇总输出",
+}
+_FLOW_ORDINALS = ["一", "二", "三", "四", "五"]
+
+
+def _evidence_richness(ev: LogicEvidenceModel) -> Tuple[int, bool]:
+    stage_raw = str(ev.target_concept_hint or "")
+    src_raw = str(ev.source_summary or "")
+    calc_raw = str(ev.calculation_summary or "")
+    inc = ev.inclusion_predicates_json or []
+    exc = ev.exclusion_predicates_json or []
+    br = ev.branch_cases_json or []
+    dedup_raw = str(ev.dedup_grain_hint or "").strip()
+    is_ddl = (
+        "数据底座结构" in stage_raw or "台账结构定义" in src_raw or "台账登记结构支撑" in calc_raw
+    ) and not (inc or exc or br or dedup_raw)
+    score = 4 * len(br) + 3 * len(exc) + 2 * len(inc)
+    if dedup_raw:
+        score += 3
+    if calc_raw and "无复杂指标口径改写" not in calc_raw and "台账登记结构支撑" not in calc_raw:
+        score += 2
+    if len(src_raw) > 40:
+        score += 2
+    if is_ddl:
+        score -= 10
+    return score, is_ddl
+
+
+def _merge_unique(target: List[str], items: List[str], max_items: int = 3) -> None:
+    for it in items:
+        if it and it not in target and len(target) < max_items:
+            target.append(it)
+
+
+def summarize_processing_flow(
+    session: Session,
+    evidence_ids: List[str],
+    *,
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    """按真实执行先后顺序提炼去技术化加工步骤：同一加工流程内按代码出现顺序排列，相邻同阶段合并。
+
+    脚本名、块序号、行号仅用于内部排序分组，绝不对外返回，对外只给「加工流程一/二」等中性标签。
+    """
+    clean_ids = [eid for eid in (evidence_ids or []) if eid]
+    if not clean_ids or limit <= 0:
+        return []
+    rows = session.query(LogicEvidenceModel).filter(LogicEvidenceModel.id.in_(clean_ids)).all()
+    if not rows:
+        return []
+
+    scored = {ev.id: _evidence_richness(ev) for ev in rows}
+    has_real = any(not scored[ev.id][1] for ev in rows)
+    usable = [ev for ev in rows if not (has_real and scored[ev.id][1])]
+
+    groups: Dict[str, List[LogicEvidenceModel]] = {}
+    for ev in usable:
+        loc = ev.internal_locator_json or {}
+        key = str(loc.get("script") or ev.material_id or "")
+        groups.setdefault(key, []).append(ev)
+
+    def _order_key(ev: LogicEvidenceModel) -> Tuple[int, int]:
+        loc = ev.internal_locator_json or {}
+        try:
+            ci = int(loc.get("chunk_index"))
+        except (TypeError, ValueError):
+            ci = 10**6
+        try:
+            sl = int(loc.get("start_line"))
+        except (TypeError, ValueError):
+            sl = 10**6
+        return ci, sl
+
+    flows: List[Tuple[int, List[Dict[str, Any]]]] = []
+    for _key, evs in groups.items():
+        evs_sorted = sorted(evs, key=_order_key)
+        stages: List[Dict[str, Any]] = []
+        last_title = None
+        for ev in evs_sorted:
+            loc = ev.internal_locator_json or {}
+            title_raw = str(loc.get("stage_title") or ev.target_concept_hint or ev.business_domain_hint or "").strip()
+            stage = sanitize_business_text(title_raw) or "数据处理环节"
+            flow_summary = sanitize_business_text(str(ev.source_summary or "").strip())
+            calc_raw = str(ev.calculation_summary or "").strip()
+            calc_text = "" if ("无复杂指标口径改写" in calc_raw or "台账登记结构支撑" in calc_raw) else sanitize_business_text(calc_raw)
+            dedup_text = sanitize_business_text(str(ev.dedup_grain_hint or "").strip())
+            inclusions = _clean_flow_items(ev.inclusion_predicates_json, max_items=3)
+            exclusions = _clean_flow_items(ev.exclusion_predicates_json, max_items=3)
+            branches = _clean_flow_items(ev.branch_cases_json, max_items=3, is_branch=True)
+            if not (flow_summary or inclusions or exclusions or branches or calc_text or dedup_text):
+                continue
+            role = str(loc.get("stage_role") or "")
+            if stages and last_title == stage:
+                cur = stages[-1]
+                if len(flow_summary) > len(cur["flow_summary"]):
+                    cur["flow_summary"] = flow_summary
+                _merge_unique(cur["inclusions"], inclusions)
+                _merge_unique(cur["exclusions"], exclusions)
+                _merge_unique(cur["branches"], branches)
+                cur["calculation"] = cur["calculation"] or calc_text
+                cur["dedup"] = cur["dedup"] or dedup_text
+                cur["_score"] += scored[ev.id][0]
+            else:
+                stages.append(
+                    {
+                        "stage": stage,
+                        "flow_summary": flow_summary,
+                        "inclusions": inclusions,
+                        "exclusions": exclusions,
+                        "branches": branches,
+                        "calculation": calc_text,
+                        "dedup": dedup_text,
+                        "stage_role_label": _STAGE_ROLE_LABELS.get(role, "处理环节"),
+                        "_score": scored[ev.id][0],
+                    }
+                )
+                last_title = stage
+        if stages:
+            flows.append((sum(s["_score"] for s in stages), stages))
+
+    flows.sort(key=lambda x: x[0], reverse=True)
+    flows = flows[:2]
+
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for f_idx, (_score, stages) in enumerate(flows):
+        label = f"加工流程{_FLOW_ORDINALS[f_idx] if f_idx < len(_FLOW_ORDINALS) else f_idx + 1}"
+        order = 0
+        for st in stages:
+            sig = (st["stage"], st["flow_summary"][:60])
+            if sig in seen:
+                continue
+            seen.add(sig)
+            order += 1
+            item = {k: v for k, v in st.items() if k != "_score"}
+            item["flow_label"] = label
+            item["order"] = order
+            out.append(item)
+            if len(out) >= limit:
+                return out
+    return out
+
+
 def get_asset_backing_detail(session: Session, asset_code: str) -> Dict[str, Any]:
-    """仅返回业务视角的实证支撑摘要（条款原文 + 已验证逻辑环节数量），绝不暴露代码/表名。"""
+    """仅返回业务视角的实证支撑摘要（条款原文 + 通俗加工步骤 + 实证数量），绝不暴露代码/表名。"""
     rule = session.query(BusinessRuleAssetModel).filter(BusinessRuleAssetModel.code == asset_code).first()
     if rule is not None:
         clauses = (
@@ -492,6 +684,7 @@ def get_asset_backing_detail(session: Session, asset_code: str) -> Dict[str, Any
             "reconcile_status": rule.reconcile_status,
             "status": rule.status,
             "logic_backing_count": len(rule.evidence_ids_json or []),
+            "processing_steps": summarize_processing_flow(session, list(rule.evidence_ids_json or []), limit=8),
             "clause_references": [
                 {"chapter": c.chapter, "clause_title": c.clause_title, "requirement": c.business_requirement}
                 for c in clauses
@@ -517,6 +710,7 @@ def get_asset_backing_detail(session: Session, asset_code: str) -> Dict[str, Any
             "reconcile_status": cal.reconcile_status,
             "status": cal.status,
             "logic_backing_count": len(cal.evidence_ids_json or []),
+            "processing_steps": summarize_processing_flow(session, list(cal.evidence_ids_json or []), limit=8),
             "clause_references": [
                 {"chapter": c.chapter, "clause_title": c.clause_title, "requirement": c.business_requirement}
                 for c in clauses
