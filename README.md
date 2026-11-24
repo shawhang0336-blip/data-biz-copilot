@@ -1,8 +1,10 @@
-# dc_agent（Data Copilot Agent）
+# Data Biz Copilot（`data-biz-copilot`）
+
+> **统一 Data Agent 产品家族**：[`data-rule-studio`](https://github.com/shawhang0336-blip/data-rule-studio)（规则装配与验证） · [`data-biz-copilot`](https://github.com/shawhang0336-blip/data-biz-copilot)（业务资产与制度对账） · [`data-sql-guardian`](https://github.com/shawhang0336-blip/data-sql-guardian)（SQL 优化与发布门禁）
 
 **代码隐身、业务显形** 的企业级监管/业务逻辑资产提取、对齐治理与智能问答工作台。
 
-`dc_agent` 面向银行及金融机构监管报送（`1104` / `EAST 5.0` / `SAFE` / `PLUS` / `一表通` / `人行统计`）与复杂数仓工程场景：一边读入监管/业务制度文档，一边在后台静默解析成百上千份 SQL / 存储过程代码逻辑；物理表名、字段名、SQL 语句与脚本路径被严格封存为底层隐身实证依据，对外只产出 **100% 业务人员可读的纯中文业务资产**，并受 `Bus` 去技术化与实证白名单双重门禁硬性保护。
+`Data Biz Copilot` 面向银行及金融机构监管报送（`1104` / `EAST 5.0` / `SAFE` / `PLUS` / `一表通` / `人行统计`）与复杂数仓工程场景：一边读入监管/业务制度文档，一边在后台静默解析成百上千份 SQL / 存储过程代码逻辑；物理表名、字段名、SQL 语句与脚本路径被严格封存为底层隐身实证依据，对外只产出 **100% 业务人员可读的纯中文业务资产**，并受 `Bus` 去技术化与实证白名单双重门禁硬性保护。
 
 ---
 
@@ -64,7 +66,7 @@ flowchart TD
 - **垂直条线分类**：`监管体系（1104 / EAST / SAFE / PLUS / 一表通 / 人行统计）` → `核心业务域` → `二级业务子专题 sub_domain`（单域约束 2–6 个凝聚专题）
 - **水平跨报表金融十大主题（`subject_theme`）**：`当事人与客户`、`协议与账户`、`交易与事件`、`财务与余额`、`授信与押品`、`机构与组织`、`产品与业务`、`渠道与媒介`、`地域与跨境`、`风控与合规管控`
 
-更多设计细节与层间边界见 [backend/ARCHITECTURE.md](file:///Users/hang/code/dc_agent/backend/ARCHITECTURE.md)。
+更多设计细节与层间边界见 [backend/ARCHITECTURE.md](backend/ARCHITECTURE.md)。
 
 ---
 
@@ -92,11 +94,11 @@ cp .env.example .env
 ```
 
 ### 2. 启动后端（推荐 Python 3.9+）
-复用同级 `dq_agent/.venv` 或使用本地虚拟环境：
+复用同级 `data-rule-studio/.venv` 或使用本地虚拟环境：
 
 ```bash
 cd backend
-../../dq_agent/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8010 --reload
+../../data-rule-studio/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8010 --reload
 ```
 
 ### 3. 启动前端工作台
@@ -114,7 +116,7 @@ npm run dev
 ```bash
 # 后端全量测试（39 项：8 层单向 DAG 隔离 + Phase 0 分流 + 断点续跑 + 限流级联 + 万级 BM25 + 真实 SAC 语料 + 高并发 CAS）
 cd backend
-../../dq_agent/.venv/bin/pytest -v -W error::sqlalchemy.exc.SAWarning
+../../data-rule-studio/.venv/bin/pytest -v -W error::sqlalchemy.exc.SAWarning
 
 # 前端规范审计（四域对称、fetch 严格隔离在 src/api/、纯业务标签无代码黑话）与生产构建
 cd ../frontend

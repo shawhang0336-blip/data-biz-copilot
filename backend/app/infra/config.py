@@ -22,8 +22,8 @@ DEFAULT_BUDGET: Dict[str, int] = {
 
 
 class Settings(BaseSettings):
-    app_name: str = "Data Copilot 业务逻辑资产与智能问答台"
-    database_url: str = f"sqlite:///{ROOT_DIR / 'backend' / 'var' / 'dc_agent.db'}"
+    app_name: str = "Data Biz Copilot — 业务资产与制度对账助手"
+    database_url: str = f"sqlite:///{ROOT_DIR / 'backend' / 'var' / 'data_biz_copilot.db'}"
     blob_dir: str = str(ROOT_DIR / "backend" / "var" / "blobs")
     llm_provider: str = "scripted"
     llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4"

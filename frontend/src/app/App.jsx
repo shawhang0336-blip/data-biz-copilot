@@ -10,7 +10,7 @@ export default function App() {
     <BrowserRouter>
       <div className="app-shell">
         <header className="topbar">
-          <div className="brand">Data Copilot Agent · 业务逻辑资产台</div>
+          <div className="brand">Data Biz Copilot · 业务资产与制度对账助手</div>
           <nav className="nav-links">
             <NavLink to="/sources" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>1. 双源接入</NavLink>
             <NavLink to="/assets" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>2. 业务资产层</NavLink>

@@ -1,4 +1,4 @@
-# dc_agent 后端架构参考（严格 8 层单向 DAG + 千级脚本规模化引擎）
+# Data Biz Copilot 后端架构参考（严格 8 层单向 DAG + 千级脚本规模化引擎）
 
 ## 1. 核心设计哲学：代码隐身，业务显形
 
@@ -10,7 +10,7 @@
 
 ## 2. 严格 8 层单向架构（Layer 0 ~ Layer 7）
 
-低层模块严禁导入任何高层模块；`app/kernel/` 严禁包含任何业务词或上层导入；`app/api/` 四大路由子域严禁交叉导入。上述红线由 [test_architecture_isolation.py](file:///Users/hang/code/dc_agent/backend/tests/test_architecture_isolation.py) 在每次 CI/回归时做 AST 静态扫描强校验。
+低层模块严禁导入任何高层模块；`app/kernel/` 严禁包含任何业务词或上层导入；`app/api/` 四大路由子域严禁交叉导入。上述红线由 [test_architecture_isolation.py](tests/test_architecture_isolation.py) 在每次 CI/回归时做 AST 静态扫描强校验。
 
 | 层级 | 包路径 | 关键模块与核心职责 |
 | :--- | :--- | :--- |

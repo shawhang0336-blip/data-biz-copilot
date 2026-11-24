@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "dc-agent"
+name = "data-biz-copilot"
 version = "0.1.0"
-description = "Data Copilot Agent: dual-source logic & regulatory asset synthesizer and pure-business Q&A workbench"
+description = "Data Biz Copilot: dual-source logic & regulatory asset synthesizer and pure-business Q&A workbench"
 requires-python = ">=3.9"
 dependencies = [
   "fastapi>=0.115,<1",
