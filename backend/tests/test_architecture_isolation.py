@@ -79,3 +79,24 @@ def test_api_routers_do_not_cross_import_other_api_domains():
                     parts = node.module.split(".")
                     if len(parts) >= 3 and parts[2] in domains and parts[2] != domain:
                         raise AssertionError(f"Cross-router import forbidden: {py_file.name} -> {node.module}")
+
+
+def test_policy_membership_and_zero_global_side_effects():
+    policy_files = {p.name for p in (APP_DIR / "policy").iterdir() if not p.name.startswith("__pycache__")}
+    assert policy_files == {"__init__.py", "dc_bus.py", "dc_plan.py"}
+
+    from app.kernel.bus import global_bus
+    from app.kernel.event_log import _DEFAULT_REDUCER
+
+    orig_adj_count = len(global_bus()._adjudicators)  # noqa: SLF001
+    orig_reducer = _DEFAULT_REDUCER
+
+    import app.policy  # noqa: F401
+    import app.policy.dc_plan  # noqa: F401
+    from app.policy import default_bus
+
+    assert len(global_bus()._adjudicators) == orig_adj_count  # noqa: SLF001
+    from app.kernel.event_log import _DEFAULT_REDUCER as after_reducer
+
+    assert after_reducer is orig_reducer
+    assert len(default_bus()._adjudicators) == 2  # noqa: SLF001

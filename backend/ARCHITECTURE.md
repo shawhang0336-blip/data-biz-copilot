@@ -16,7 +16,7 @@
 | :--- | :--- | :--- |
 | **Layer 0** | `app/infra/` | 基础设施层：`db.py`（SQLite WAL / MySQL 连接池与幂等列迁移）、`db_tables.py`（13 张 ORM 核心表）、`blob_store.py`（内容寻址 `LocalBlobStore`）、`config.py`（配置与两级预算）、`errors.py`（`WorkflowError` / `ProviderAuthOrBillingError`）、`task_runner.py`（有界线程池）、`taxonomy.py`（金融十大主题 × 二级子专题）、`retrieval.py`（多监管体系识别、N-gram + Okapi BM25 与万级 `CachedBM25Index`）、`llm/`（`RealDesignLlm`、`TokenBucketRateLimiter`、跨线程 429 冷却、`call_llm_validated` 守卫与 10 个 Tool Schema） |
 | **Layer 1** | `app/kernel/` | ProdAgent 微内核（零上层/业务导入）：`bus.py`（`Bus` 事前裁决、SSE 事后广播、父子预算原子级联与回滚）、`event_log.py`（哈希链账本 `EventModel` 与状态折叠）、`run.py`（`RunContext`、`BudgetGuard`、`CancellationToken`、`submit_run` / `cancel_run` / `recover_interrupted_runs`）、`plan.py`、`scheduler.py`、`interrupt.py` |
-| **Layer 2** | `app/policy/` | 策略配置层：`dc_bus.py`（`de_jargon_adjudicator`、`evidence_backing_adjudicator`、`sanitize_business_text`、`build_run_bus`、`build_script_child_bus`）、`dc_plan.py`（批任务与资产合成状态机 Reducer）、`dc_channels.py` |
+| **Layer 2** | `app/policy/` | 策略配置层：`dc_bus.py`（`de_jargon_adjudicator`、`evidence_backing_adjudicator`、`sanitize_business_text`、`build_run_bus`、`build_script_child_bus`）、`dc_plan.py`（零全局副作用的批任务与合成 Run 事件状态折叠器） |
 | **Layer 3** | `app/ingestion/` | 双源接入与静默解析层：`project_scanner.py`（Phase 0 零模型扫描、归一化 AST 模板指纹聚簇、跨脚本读写表 DAG 与三层分流）、`code_parser.py`（SQL/PLSQL/动态 SQL 切块，支持 `full` / `lite` / `static_only`）、`ast_extractor.py`（`sqlglot` AST 逻辑细节抽取、Plan-then-Extract、脱敏 `upstream_context` 注入）、`doc_parser.py`（PDF/DOCX/XLSX/MD 双阶段制度条款提炼）、`builtin_pack.py` |
 | **Layer 4** | `app/catalog/` | 业务资产合成与批协调层：`batch_ingest.py`（ZIP 安全解压/目录扫描、四波次异步流式调度、主线程逐脚本 SQLite Checkpoint、断点续跑与重启自愈）、`synthesizer.py`（克隆折叠/结构去重/Tier 2 隔离、跨源域对齐、双维分批提炼、`target_domains` 增量合成）、`views.py`（纯业务视图与缓存版本号签名）、`mutations.py`（CAS 乐观锁修改与人工确认 + 缓存失效） |
 | **Layer 5** | `app/copilot/` | 智能问答层：`business_tools.py`（7 个受控纯业务工具 + 跨业务域均衡轮转）、`disclosure.py`（结构化披露器）、`answer_engine.py`（`plan_copilot_tools` → 工具召回 → `compose_business_answer` → 门禁校验与会话持久化） |
@@ -85,7 +85,7 @@
 
 ---
 
-## 7. 自动化测试矩阵（`backend/tests/` 共 39 项）
+## 7. 自动化测试矩阵（`backend/tests/` 共 42 项）
 
 - [test_architecture_isolation.py](tests/test_architecture_isolation.py)：8 层目录、单向 DAG 依赖、`kernel` 零业务引用、API 路由防交叉导入
 - [test_project_scanner_and_dag.py](tests/test_project_scanner_and_dag.py)：Phase 0 备份/DDL/日志/ODS/孤立中间表跳过、30 份同构副本聚簇、血缘环路断环、`lite` 模式与 `upstream_context` 无表名透传

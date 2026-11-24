@@ -101,7 +101,7 @@ data-biz-copilot/
 │   │   ├── catalog/                  # Layer 4: 批协调调度、双源合成、有序加工流程提炼与 CAS 编辑
 │   │   ├── copilot/                  # Layer 5: 7 大受控业务工具、强制披露与流式/兜底问答引擎
 │   │   └── api/                      # Layer 6: 4 域薄路由（platform / ingestion / catalog / copilot）
-│   └── tests/                        # 41 项离线全量测试与 AST 架构隔离守卫
+│   └── tests/                        # 42 项离线全量测试与 AST 架构隔离守卫
 ├── frontend/
 │   ├── src/
 │   │   ├── app/                      # App.jsx（路由装配）、AdminLayout.jsx（后台壳层）
@@ -163,7 +163,7 @@ npm run dev
 ### 4. 运行离线全量测试与架构红线检查（0 外部模型调用）
 
 ```bash
-# 后端全量测试（41 项：8 层单向 DAG 隔离 + Phase 0 分流 + 断点续跑 + 限流级联 + 万级 BM25 + 有序加工流程 + SSE 流式问答 + 真实 SAC 语料 + 高并发 CAS）
+# 后端全量测试（42 项：8 层单向 DAG 隔离 + Phase 0 分流 + 断点续跑 + 限流级联 + 万级 BM25 + 有序加工流程 + SSE 流式问答 + 真实 SAC 语料 + 高并发 CAS）
 cd backend
 ../../data-rule-studio/.venv/bin/pytest -v -W error::sqlalchemy.exc.SAWarning
 
