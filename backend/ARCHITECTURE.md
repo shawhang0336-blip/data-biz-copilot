@@ -78,8 +78,8 @@
 
 ## 6. 前端四域工作台约束（`frontend/src/`）
 
-由 [frontend_audit.test.mjs](file:///Users/hang/code/dc_agent/frontend/tests/frontend_audit.test.mjs) 守护：
-1. `src/features/` 严格保持 4 个目录对称：`ingestion/`（含 [SourcesPage.jsx](file:///Users/hang/code/dc_agent/frontend/src/features/ingestion/SourcesPage.jsx) 与 [BatchJobPanel.jsx](file:///Users/hang/code/dc_agent/frontend/src/features/ingestion/BatchJobPanel.jsx)）、`catalog/`、`copilot/`、`platform/`；
+由 [frontend_audit.test.mjs](../frontend/tests/frontend_audit.test.mjs) 守护：
+1. `src/features/` 严格保持 4 个目录对称：`ingestion/`（含 [SourcesPage.jsx](../frontend/src/features/ingestion/SourcesPage.jsx) 与 [BatchJobPanel.jsx](../frontend/src/features/ingestion/BatchJobPanel.jsx)）、`catalog/`、`copilot/`、`platform/`；
 2. 全部 HTTP 请求严格收敛于 `src/api/`（`api/client.js`、`ingestion.js`、`catalog.js`、`copilot.js`、`platform.js`），组件内严禁出现直接 `fetch(`；
 3. `src/utils/labels.js` 中的所有界面映射标签严禁包含任何 SQL/表名/技术实现黑话。
 
@@ -87,13 +87,13 @@
 
 ## 7. 自动化测试矩阵（`backend/tests/` 共 39 项）
 
-- [test_architecture_isolation.py](file:///Users/hang/code/dc_agent/backend/tests/test_architecture_isolation.py)：8 层目录、单向 DAG 依赖、`kernel` 零业务引用、API 路由防交叉导入
-- [test_project_scanner_and_dag.py](file:///Users/hang/code/dc_agent/backend/tests/test_project_scanner_and_dag.py)：Phase 0 备份/DDL/日志/ODS/孤立中间表跳过、30 份同构副本聚簇、血缘环路断环、`lite` 模式与 `upstream_context` 无表名透传
-- [test_batch_ingest_checkpoint_resume.py](file:///Users/hang/code/dc_agent/backend/tests/test_batch_ingest_checkpoint_resume.py)：逐脚本 Checkpoint、预算暂停与重启后 0 重复续跑、单脚本超限隔离、Zip Slip 恶意压缩包拦截、HTTP 402 余额暂停与批量 API 端到端
-- [test_rate_limiter_and_two_level_budget.py](file:///Users/hang/code/dc_agent/backend/tests/test_rate_limiter_and_two_level_budget.py)：RPM 令牌桶、跨线程 429 冷却与 `CancellationToken` 秒级唤醒、父子 `Bus` 预算级联回滚
-- [test_cached_bm25_scale.py](file:///Users/hang/code/dc_agent/backend/tests/test_cached_bm25_scale.py)：万级金融规则打分 bit-exact 一致性、查询延迟与修改/确认缓存失效
-- [test_ast_generalization_and_llm_config.py](file:///Users/hang/code/dc_agent/backend/tests/test_ast_generalization_and_llm_config.py)：非 SAC 通用 SQL AST 泛化与密钥脱敏配置
-- [test_ai_full_pipeline.py](file:///Users/hang/code/dc_agent/backend/tests/test_ai_full_pipeline.py)：全四阶段 AI 流水线与 `plan_code_structure` 物理信息隔离红线
-- [test_dual_ingestion_and_synthesis.py](file:///Users/hang/code/dc_agent/backend/tests/test_dual_ingestion_and_synthesis.py)：双源解析、四大资产生成、CAS 乐观锁与 FastAPI 端到端
-- [test_multi_regime_and_bm25.py](file:///Users/hang/code/dc_agent/backend/tests/test_multi_regime_and_bm25.py)：多监管体系（1104/EAST/SAFE/PLUS/一表通）与双维分类矩阵
-- [test_business_copilot_and_disclosure.py](file:///Users/hang/code/dc_agent/backend/tests/test_business_copilot_and_disclosure.py) & [test_real_sac_corpus.py](file:///Users/hang/code/dc_agent/backend/tests/test_real_sac_corpus.py) & [test_stress_and_concurrency.py](file:///Users/hang/code/dc_agent/backend/tests/test_stress_and_concurrency.py)：7 大业务工具、`disclose` 强制披露、25 份真实 SAC 脚本语料与多线程并发 CAS 压测
+- [test_architecture_isolation.py](tests/test_architecture_isolation.py)：8 层目录、单向 DAG 依赖、`kernel` 零业务引用、API 路由防交叉导入
+- [test_project_scanner_and_dag.py](tests/test_project_scanner_and_dag.py)：Phase 0 备份/DDL/日志/ODS/孤立中间表跳过、30 份同构副本聚簇、血缘环路断环、`lite` 模式与 `upstream_context` 无表名透传
+- [test_batch_ingest_checkpoint_resume.py](tests/test_batch_ingest_checkpoint_resume.py)：逐脚本 Checkpoint、预算暂停与重启后 0 重复续跑、单脚本超限隔离、Zip Slip 恶意压缩包拦截、HTTP 402 余额暂停与批量 API 端到端
+- [test_rate_limiter_and_two_level_budget.py](tests/test_rate_limiter_and_two_level_budget.py)：RPM 令牌桶、跨线程 429 冷却与 `CancellationToken` 秒级唤醒、父子 `Bus` 预算级联回滚
+- [test_cached_bm25_scale.py](tests/test_cached_bm25_scale.py)：万级金融规则打分 bit-exact 一致性、查询延迟与修改/确认缓存失效
+- [test_ast_generalization_and_llm_config.py](tests/test_ast_generalization_and_llm_config.py)：非 SAC 通用 SQL AST 泛化与密钥脱敏配置
+- [test_ai_full_pipeline.py](tests/test_ai_full_pipeline.py)：全四阶段 AI 流水线与 `plan_code_structure` 物理信息隔离红线
+- [test_dual_ingestion_and_synthesis.py](tests/test_dual_ingestion_and_synthesis.py)：双源解析、四大资产生成、CAS 乐观锁与 FastAPI 端到端
+- [test_multi_regime_and_bm25.py](tests/test_multi_regime_and_bm25.py)：多监管体系（1104/EAST/SAFE/PLUS/一表通）与双维分类矩阵
+- [test_business_copilot_and_disclosure.py](tests/test_business_copilot_and_disclosure.py) & [test_real_sac_corpus.py](tests/test_real_sac_corpus.py) & [test_stress_and_concurrency.py](tests/test_stress_and_concurrency.py)：7 大业务工具、`disclose` 强制披露、25 份真实 SAC 脚本语料与多线程并发 CAS 压测

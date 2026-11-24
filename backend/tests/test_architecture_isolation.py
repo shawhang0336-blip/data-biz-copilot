@@ -1,4 +1,4 @@
-"""dc_agent 架构分层与 AST 单向依赖红线测试。"""
+"""Data Biz Copilot 架构分层与 AST 单向依赖红线测试。"""
 
 import ast
 from pathlib import Path

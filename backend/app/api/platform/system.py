@@ -41,7 +41,7 @@ class LlmConfigUpdateRequest(BaseModel):
 def health_check(session: Session = Depends(db_session)) -> Dict[str, Any]:
     return {
         "status": "ok",
-        "service": "dc-agent",
+        "service": "data-biz-copilot",
         "runs": session.query(RunModel).count(),
     }
 

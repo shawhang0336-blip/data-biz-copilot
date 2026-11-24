@@ -1,4 +1,4 @@
-"""dc_agent FastAPI 极简入口（Layer 7）。"""
+"""Data Biz Copilot FastAPI 极简入口（Layer 7）。"""
 
 from contextlib import asynccontextmanager
 import logging

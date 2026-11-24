@@ -99,7 +99,7 @@ export default function CopilotPage() {
         <div className="card">
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
             <div>
-              <h2 style={{ margin: '0 0 4px' }}>第三步：Data Copilot 业务逻辑问答台</h2>
+              <h2 style={{ margin: '0 0 4px' }}>第三步：Data Biz Copilot 业务逻辑问答台</h2>
               <p style={{ color: '#475569', fontSize: 13, margin: 0 }}>
                 代码细节严格隔离——以系统真实逻辑与制度规范为依据，直接告诉你“现在系统是怎么做的、业务上怎么理解”。
               </p>
@@ -136,7 +136,7 @@ export default function CopilotPage() {
         {messages.map((m, idx) => (
           <div key={idx} className="card" style={{ background: m.role === 'user' ? '#f8fafc' : '#fff' }}>
             <div style={{ fontSize: 12, color: '#64748b', marginBottom: 6 }}>
-              {m.role === 'user' ? `提问（${roleLens}视角）` : 'Data Copilot 纯业务解读'}
+              {m.role === 'user' ? `提问（${roleLens}视角）` : 'Data Biz Copilot 纯业务解读'}
             </div>
             {(m.disclosures || []).map((d, i) => (
               <div key={i} className="disclosure-box">{d.text}</div>
