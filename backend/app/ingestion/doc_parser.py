@@ -16,9 +16,13 @@ from openpyxl import load_workbook
 from app.infra.contracts import ExtractedClause
 from app.infra.errors import WorkflowError
 from app.infra.llm import call_llm_validated
+from app.infra.llm.guard import llm_execution_scope
 from app.infra.retrieval import infer_regulatory_regime
 from app.kernel.run import BudgetExceededError
-from app.policy.dc_bus import sanitize_business_text
+from app.kernel.scheduler import Outcome, Scheduler, Send
+from app.policy.dc_bus import default_bus, sanitize_business_text
+from app.policy.dc_channels import build_doc_parse_context
+from app.policy.dc_plan import DOC_PARSE_PLAN, unwrap_wave_error
 
 _NAV_NOISE_EXACT = {
     "术语表",
@@ -500,6 +504,213 @@ def _plan_document_structure_with_llm(
     return doc_plan, validated
 
 
+def _build_clause_batches(
+    doc_plan: Optional[Dict[str, Any]],
+    assignments: List[Dict[str, Any]],
+    clauses: List[ExtractedClause],
+    doc_tier: str,
+) -> Optional[Tuple[List[str], List[Dict[str, Any]]]]:
+    """按 `(business_domain, chunk_group)` 切分子批次；全部被忽略时返回 None。"""
+    active_items = [a for a in assignments if a["role"] != "IGNORE"]
+    if not active_items:
+        return None
+
+    grouped_order: List[Tuple[str, int]] = []
+    grouped_map: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+    for a in active_items:
+        key = (a["business_domain"], int(a["chunk_group"]))
+        if key not in grouped_map:
+            grouped_order.append(key)
+            grouped_map[key] = []
+        grouped_map[key].append(a)
+
+    canonical_domains = (
+        doc_plan["canonical_domains"]
+        if doc_plan is not None
+        else list(dict.fromkeys(c.business_domain for c in clauses))
+    )
+    batches: List[Dict[str, Any]] = []
+    batch_size = 6
+    for assigned_domain, chunk_group in grouped_order:
+        group_entries = grouped_map[(assigned_domain, chunk_group)]
+        for start in range(0, len(group_entries), batch_size):
+            batches.append(
+                {
+                    "batch_idx": len(batches),
+                    "assigned_domain": assigned_domain,
+                    "chunk_group": chunk_group,
+                    "sub_batch": group_entries[start : start + batch_size],
+                    "doc_tier": doc_tier,
+                }
+            )
+    return canonical_domains, batches
+
+
+def _refine_clause_sub_batch(
+    filename: str,
+    doc_tier: str,
+    clauses: List[ExtractedClause],
+    doc_plan: Optional[Dict[str, Any]],
+    canonical_domains: List[str],
+    assigned_domain: str,
+    chunk_group: int,
+    sub_batch: List[Dict[str, Any]],
+    *,
+    llm: Any,
+    bus: Any,
+) -> List[ExtractedClause]:
+    """对单个分片子批次执行受控 LLM 结构化条款提纯，并严格兜底。"""
+    refined: List[ExtractedClause] = []
+    payload = {
+        "filename": filename,
+        "doc_tier": doc_tier,
+        "canonical_domains": canonical_domains,
+        "document_plan": {
+            **(doc_plan or {"canonical_domains": canonical_domains}),
+            "assigned_domain": assigned_domain,
+            "assigned_roles": sorted({a["role"] for a in sub_batch}),
+            "chunk_group": chunk_group,
+        },
+        "sections": [
+            {
+                "section_index": a["section_index"],
+                "chapter": clauses[a["section_index"]].chapter,
+                "title": clauses[a["section_index"]].clause_title,
+                "draft_domain": a["business_domain"],
+                "assigned_role": a["role"],
+                "draft_kind": clauses[a["section_index"]].clause_kind,
+                "content": clauses[a["section_index"]].business_requirement[:1200],
+            }
+            for a in sub_batch
+        ],
+    }
+    try:
+        args, _trace = call_llm_validated(
+            llm,
+            "extract_regulatory_clauses",
+            (
+                "结合 document_plan 提供的全文结构定位与指定业务域，将本批监管条款提炼为结构化纯中文业务条款："
+                "判断哪些属于真实可执行或可对照的业务/监管要求(keep=true)，剔除空泛套话(keep=false)，"
+                "并把任何英文表名/字段名改写为纯业务中文名称。business_domain 必须复用 draft_domain 或 canonical_domains 之一。"
+            ),
+            payload,
+            backoff=(0.2, 0.5),
+            bus=bus,
+        )
+    except BudgetExceededError:
+        raise
+    except WorkflowError:
+        for a in sub_batch:
+            orig = clauses[a["section_index"]]
+            refined.append(
+                ExtractedClause(
+                    chapter=orig.chapter,
+                    business_domain=a["business_domain"],
+                    clause_title=orig.clause_title,
+                    clause_kind=orig.clause_kind,
+                    business_requirement=orig.business_requirement,
+                    audience=orig.audience,
+                    metrics_mentioned=orig.metrics_mentioned,
+                    source_locator={
+                        **orig.source_locator,
+                        "plan_stage": "PLAN_THEN_EXTRACT",
+                        "plan_applied": doc_plan is not None,
+                        "doc_plan_summary": (doc_plan or {}).get("document_summary", "")[:160],
+                        "assigned_role": a["role"],
+                        "chunk_group": chunk_group,
+                    },
+                )
+            )
+        return refined
+
+    items = args.get("clauses") if isinstance(args, dict) else None
+    if not isinstance(items, list) or not items:
+        return [clauses[a["section_index"]] for a in sub_batch]
+
+    by_idx: Dict[int, Dict[str, Any]] = {}
+    for x in items:
+        if isinstance(x, dict) and "section_index" in x:
+            try:
+                by_idx[int(x["section_index"])] = x
+            except (TypeError, ValueError):
+                pass
+
+    # 兼容 LLM 返回全局 section_index 或批内局部序号 0..k-1
+    batch_indices = {a["section_index"] for a in sub_batch}
+    matched_global = bool(set(by_idx.keys()) & batch_indices)
+    kept_in_batch = False
+
+    for pos, a in enumerate(sub_batch):
+        orig_idx = a["section_index"]
+        orig = clauses[orig_idx]
+        ai_item = by_idx.get(orig_idx) if matched_global else by_idx.get(pos)
+        locator_extra = {
+            "plan_stage": "PLAN_THEN_EXTRACT",
+            "plan_applied": doc_plan is not None,
+            "doc_plan_summary": (doc_plan or {}).get("document_summary", "")[:160],
+            "assigned_role": a["role"],
+            "chunk_group": chunk_group,
+        }
+        if ai_item is None:
+            refined.append(
+                ExtractedClause(
+                    chapter=orig.chapter,
+                    business_domain=a["business_domain"],
+                    clause_title=orig.clause_title,
+                    clause_kind=orig.clause_kind,
+                    business_requirement=orig.business_requirement,
+                    audience=orig.audience,
+                    metrics_mentioned=orig.metrics_mentioned,
+                    source_locator={**orig.source_locator, **locator_extra},
+                )
+            )
+            kept_in_batch = True
+            continue
+        if not ai_item.get("keep", True):
+            continue
+        kept_in_batch = True
+        resolved_domain = _resolve_consolidated_domain(
+            str(ai_item.get("business_domain") or ""),
+            a["business_domain"],
+            canonical_domains,
+        )
+        refined.append(
+            ExtractedClause(
+                chapter=orig.chapter,
+                business_domain=resolved_domain,
+                clause_title=str(ai_item.get("clause_title") or orig.clause_title).strip(),
+                clause_kind=str(ai_item.get("clause_kind") or orig.clause_kind),  # type: ignore[arg-type]
+                business_requirement=str(ai_item.get("business_requirement") or orig.business_requirement).strip(),
+                audience=str(ai_item.get("audience") or orig.audience).strip(),
+                metrics_mentioned=list(ai_item.get("metrics_mentioned") or orig.metrics_mentioned),
+                source_locator={**orig.source_locator, **locator_extra, "ai_refined": True},
+            )
+        )
+    if not kept_in_batch and doc_tier == "ACTIONABLE_SPEC":
+        for a in sub_batch:
+            orig = clauses[a["section_index"]]
+            refined.append(
+                ExtractedClause(
+                    chapter=orig.chapter,
+                    business_domain=a["business_domain"],
+                    clause_title=orig.clause_title,
+                    clause_kind=orig.clause_kind,
+                    business_requirement=orig.business_requirement,
+                    audience=orig.audience,
+                    metrics_mentioned=orig.metrics_mentioned,
+                    source_locator={
+                        **orig.source_locator,
+                        "plan_stage": "PLAN_THEN_EXTRACT",
+                        "plan_applied": doc_plan is not None,
+                        "doc_plan_summary": (doc_plan or {}).get("document_summary", "")[:160],
+                        "assigned_role": a["role"],
+                        "chunk_group": chunk_group,
+                    },
+                )
+            )
+    return refined
+
+
 def _refine_clauses_with_llm(
     filename: str,
     doc_tier: str,
@@ -519,192 +730,31 @@ def _refine_clauses_with_llm(
         llm=llm,
         bus=bus,
     )
-    active_items = [a for a in assignments if a["role"] != "IGNORE"]
-    if not active_items:
+    planned = _build_clause_batches(doc_plan, assignments, clauses, doc_tier)
+    if planned is None:
         return [] if doc_tier == "MACRO_POLICY" else clauses
-
-    # 按 (business_domain, chunk_group) 归并成批，维持原文顺序
-    grouped_order: List[Tuple[str, int]] = []
-    grouped_map: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
-    for a in active_items:
-        key = (a["business_domain"], int(a["chunk_group"]))
-        if key not in grouped_map:
-            grouped_order.append(key)
-            grouped_map[key] = []
-        grouped_map[key].append(a)
-
-    canonical_domains = (
-        doc_plan["canonical_domains"]
-        if doc_plan is not None
-        else list(dict.fromkeys(c.business_domain for c in clauses))
-    )
+    canonical_domains, batches = planned
     refined: List[ExtractedClause] = []
-    batch_size = 6
-
-    for assigned_domain, chunk_group in grouped_order:
-        group_entries = grouped_map[(assigned_domain, chunk_group)]
-        for start in range(0, len(group_entries), batch_size):
-            sub_batch = group_entries[start : start + batch_size]
-            payload = {
-                "filename": filename,
-                "doc_tier": doc_tier,
-                "canonical_domains": canonical_domains,
-                "document_plan": {
-                    **(doc_plan or {"canonical_domains": canonical_domains}),
-                    "assigned_domain": assigned_domain,
-                    "assigned_roles": sorted({a["role"] for a in sub_batch}),
-                    "chunk_group": chunk_group,
-                },
-                "sections": [
-                    {
-                        "section_index": a["section_index"],
-                        "chapter": clauses[a["section_index"]].chapter,
-                        "title": clauses[a["section_index"]].clause_title,
-                        "draft_domain": a["business_domain"],
-                        "assigned_role": a["role"],
-                        "draft_kind": clauses[a["section_index"]].clause_kind,
-                        "content": clauses[a["section_index"]].business_requirement[:1200],
-                    }
-                    for a in sub_batch
-                ],
-            }
-            try:
-                args, _trace = call_llm_validated(
-                    llm,
-                    "extract_regulatory_clauses",
-                    (
-                        "结合 document_plan 提供的全文结构定位与指定业务域，将本批监管条款提炼为结构化纯中文业务条款："
-                        "判断哪些属于真实可执行或可对照的业务/监管要求(keep=true)，剔除空泛套话(keep=false)，"
-                        "并把任何英文表名/字段名改写为纯业务中文名称。business_domain 必须复用 draft_domain 或 canonical_domains 之一。"
-                    ),
-                    payload,
-                    backoff=(0.2, 0.5),
-                    bus=bus,
-                )
-            except BudgetExceededError:
-                raise
-            except WorkflowError:
-                for a in sub_batch:
-                    orig = clauses[a["section_index"]]
-                    refined.append(
-                        ExtractedClause(
-                            chapter=orig.chapter,
-                            business_domain=a["business_domain"],
-                            clause_title=orig.clause_title,
-                            clause_kind=orig.clause_kind,
-                            business_requirement=orig.business_requirement,
-                            audience=orig.audience,
-                            metrics_mentioned=orig.metrics_mentioned,
-                            source_locator={
-                                **orig.source_locator,
-                                "plan_stage": "PLAN_THEN_EXTRACT",
-                                "plan_applied": doc_plan is not None,
-                                "doc_plan_summary": (doc_plan or {}).get("document_summary", "")[:160],
-                                "assigned_role": a["role"],
-                                "chunk_group": chunk_group,
-                            },
-                        )
-                    )
-                continue
-
-            items = args.get("clauses") if isinstance(args, dict) else None
-            if not isinstance(items, list) or not items:
-                for a in sub_batch:
-                    refined.append(clauses[a["section_index"]])
-                continue
-
-            by_idx: Dict[int, Dict[str, Any]] = {}
-            for x in items:
-                if isinstance(x, dict) and "section_index" in x:
-                    try:
-                        by_idx[int(x["section_index"])] = x
-                    except (TypeError, ValueError):
-                        pass
-
-            # 兼容 LLM 返回全局 section_index 或批内局部序号 0..k-1
-            batch_indices = {a["section_index"] for a in sub_batch}
-            matched_global = bool(set(by_idx.keys()) & batch_indices)
-            kept_in_batch = False
-
-            for pos, a in enumerate(sub_batch):
-                orig_idx = a["section_index"]
-                orig = clauses[orig_idx]
-                ai_item = by_idx.get(orig_idx) if matched_global else by_idx.get(pos)
-                locator_extra = {
-                    "plan_stage": "PLAN_THEN_EXTRACT",
-                    "plan_applied": doc_plan is not None,
-                    "doc_plan_summary": (doc_plan or {}).get("document_summary", "")[:160],
-                    "assigned_role": a["role"],
-                    "chunk_group": chunk_group,
-                }
-                if ai_item is None:
-                    refined.append(
-                        ExtractedClause(
-                            chapter=orig.chapter,
-                            business_domain=a["business_domain"],
-                            clause_title=orig.clause_title,
-                            clause_kind=orig.clause_kind,
-                            business_requirement=orig.business_requirement,
-                            audience=orig.audience,
-                            metrics_mentioned=orig.metrics_mentioned,
-                            source_locator={**orig.source_locator, **locator_extra},
-                        )
-                    )
-                    kept_in_batch = True
-                    continue
-                if not ai_item.get("keep", True):
-                    continue
-                kept_in_batch = True
-                resolved_domain = _resolve_consolidated_domain(
-                    str(ai_item.get("business_domain") or ""),
-                    a["business_domain"],
-                    canonical_domains,
-                )
-                refined.append(
-                    ExtractedClause(
-                        chapter=orig.chapter,
-                        business_domain=resolved_domain,
-                        clause_title=str(ai_item.get("clause_title") or orig.clause_title).strip(),
-                        clause_kind=str(ai_item.get("clause_kind") or orig.clause_kind),  # type: ignore[arg-type]
-                        business_requirement=str(ai_item.get("business_requirement") or orig.business_requirement).strip(),
-                        audience=str(ai_item.get("audience") or orig.audience).strip(),
-                        metrics_mentioned=list(ai_item.get("metrics_mentioned") or orig.metrics_mentioned),
-                        source_locator={**orig.source_locator, **locator_extra, "ai_refined": True},
-                    )
-                )
-            if not kept_in_batch and doc_tier == "ACTIONABLE_SPEC":
-                for a in sub_batch:
-                    orig = clauses[a["section_index"]]
-                    refined.append(
-                        ExtractedClause(
-                            chapter=orig.chapter,
-                            business_domain=a["business_domain"],
-                            clause_title=orig.clause_title,
-                            clause_kind=orig.clause_kind,
-                            business_requirement=orig.business_requirement,
-                            audience=orig.audience,
-                            metrics_mentioned=orig.metrics_mentioned,
-                            source_locator={
-                                **orig.source_locator,
-                                "plan_stage": "PLAN_THEN_EXTRACT",
-                                "plan_applied": doc_plan is not None,
-                                "doc_plan_summary": (doc_plan or {}).get("document_summary", "")[:160],
-                                "assigned_role": a["role"],
-                                "chunk_group": chunk_group,
-                            },
-                        )
-                    )
+    for item in batches:
+        refined.extend(
+            _refine_clause_sub_batch(
+                filename,
+                doc_tier,
+                clauses,
+                doc_plan,
+                canonical_domains,
+                item["assigned_domain"],
+                item["chunk_group"],
+                item["sub_batch"],
+                llm=llm,
+                bus=bus,
+            )
+        )
     return refined
 
 
-def parse_regulatory_document(
-    filename: str,
-    content: bytes,
-    *,
-    llm: Any = None,
-    bus: Any = None,
-) -> List[ExtractedClause]:
-    """将监管或业务制度文档确定性拆分为结构化业务条款，并在配置大模型时执行受控语义提炼。"""
+def _split_document_clauses(filename: str, content: bytes) -> Tuple[str, List[ExtractedClause]]:
+    """确定性拆分监管/业务制度文档为结构化条款草稿，并返回 `(doc_tier, clauses)`。"""
     doc_tier = _infer_doc_tier(filename)
     raw_text = _extract_raw_text(filename, content)
     meta, text = _split_frontmatter(raw_text)
@@ -802,6 +852,168 @@ def parse_regulatory_document(
                 },
             )
         )
-    if llm is not None and clauses:
-        return _refine_clauses_with_llm(filename, doc_tier, clauses, llm=llm, bus=bus)
-    return clauses
+    return doc_tier, clauses
+
+
+def parse_regulatory_document(
+    filename: str,
+    content: bytes,
+    *,
+    llm: Any = None,
+    bus: Any = None,
+) -> List[ExtractedClause]:
+    """将监管或业务制度文档经内层纯内存 `Scheduler(DOC_PARSE_PLAN)` 驱动四阶段 BSP 拆分为结构化业务条款。"""
+    llm_bus = bus
+    ctx = build_doc_parse_context(
+        filename,
+        content,
+        llm=llm,
+        bus=default_bus(),
+        concurrency=4,
+    )
+
+    def _run_with_llm_scope(fn):
+        if llm_bus is not None:
+            with llm_execution_scope(bus=llm_bus):
+                return fn()
+        return fn()
+
+    def _node_split_clauses(_inp: Any, _ctx: Any) -> Outcome:
+        doc_tier, clauses = _split_document_clauses(filename, content)
+        return Outcome(
+            when="always" if clauses else "empty",
+            shared={"doc_tier": doc_tier, "raw_clauses": clauses},
+            output={"doc_tier": doc_tier, "clauses": clauses},
+            events=[
+                (
+                    "DOC_CLAUSES_SPLIT",
+                    "split_clauses",
+                    {"filename": filename, "doc_tier": doc_tier, "clause_count": len(clauses)},
+                )
+            ],
+        )
+
+    def _node_plan_doc_structure(data: Dict[str, Any], _ctx: Any) -> Outcome:
+        clauses: List[ExtractedClause] = data["clauses"]
+        doc_tier: str = data["doc_tier"]
+        if llm is None or not clauses:
+            return Outcome(
+                when="direct",
+                output={"clauses": clauses},
+                events=[("DOC_STRUCTURE_PLANNED", "plan_doc_structure", {"fanout": 0, "doc_tier": doc_tier})],
+            )
+        doc_plan, assignments = _run_with_llm_scope(
+            lambda: _plan_document_structure_with_llm(
+                filename,
+                doc_tier,
+                clauses,
+                llm=llm,
+                bus=llm_bus,
+            )
+        )
+        planned = _build_clause_batches(doc_plan, assignments, clauses, doc_tier)
+        if planned is None:
+            fallback_clauses = [] if doc_tier == "MACRO_POLICY" else clauses
+            return Outcome(
+                when="direct",
+                shared={"doc_plan": doc_plan},
+                output={"clauses": fallback_clauses},
+                events=[("DOC_STRUCTURE_PLANNED", "plan_doc_structure", {"fanout": 0, "ignored_all": True})],
+            )
+        canonical_domains, batches = planned
+        sends = [
+            Send(
+                "extract_clause_worker",
+                {
+                    "batch_idx": batch["batch_idx"],
+                    "assigned_domain": batch["assigned_domain"],
+                    "chunk_group": batch["chunk_group"],
+                    "sub_batch": batch["sub_batch"],
+                    "doc_plan": doc_plan,
+                    "canonical_domains": canonical_domains,
+                    "doc_tier": doc_tier,
+                    "clauses": clauses,
+                },
+                label=f"batch-{batch['batch_idx']}:{str(batch['assigned_domain'])[:18]}",
+            )
+            for batch in batches
+        ]
+        return Outcome(
+            when="fanout",
+            shared={"doc_plan": doc_plan},
+            sends=sends,
+            events=[
+                (
+                    "DOC_STRUCTURE_PLANNED",
+                    "plan_doc_structure",
+                    {"fanout": len(sends), "doc_tier": doc_tier},
+                )
+            ],
+        )
+
+    def _node_extract_clause_worker(task_data: Dict[str, Any], _ctx: Any) -> Outcome:
+        batch_refined = _run_with_llm_scope(
+            lambda: _refine_clause_sub_batch(
+                filename,
+                task_data["doc_tier"],
+                task_data["clauses"],
+                task_data["doc_plan"],
+                task_data["canonical_domains"],
+                task_data["assigned_domain"],
+                task_data["chunk_group"],
+                task_data["sub_batch"],
+                llm=llm,
+                bus=llm_bus,
+            )
+        )
+        return Outcome(
+            shared={"batch_results": {task_data["batch_idx"]: batch_refined}},
+            output={"batch_idx": task_data["batch_idx"], "clauses": batch_refined},
+            events=[
+                (
+                    "DOC_BATCH_EXTRACTED",
+                    "extract_clause_worker",
+                    {
+                        "batch_idx": task_data["batch_idx"],
+                        "clause_count": len(batch_refined),
+                        "label": f"batch-{task_data['batch_idx']}",
+                    },
+                )
+            ],
+        )
+
+    def _node_consolidate_clauses(payload: Any, local_ctx: Any) -> Outcome:
+        batch_results = local_ctx.get("batch_results")
+        if isinstance(batch_results, dict) and batch_results:
+            final_clauses = [
+                c
+                for idx in sorted(batch_results.keys())
+                for c in batch_results[idx]
+            ]
+        elif isinstance(payload, dict) and "clauses" in payload:
+            final_clauses = list(payload["clauses"])
+        else:
+            final_clauses = list(local_ctx.get("raw_clauses") or [])
+        return Outcome(
+            shared={"final_clauses": final_clauses},
+            output=final_clauses,
+            events=[("DOC_PARSED", "consolidate_clauses", {"filename": filename, "clause_count": len(final_clauses)})],
+        )
+
+    sched = Scheduler(
+        DOC_PARSE_PLAN,
+        {
+            "split_clauses": _node_split_clauses,
+            "plan_doc_structure": _node_plan_doc_structure,
+            "extract_clause_worker": _node_extract_clause_worker,
+            "consolidate_clauses": _node_consolidate_clauses,
+        },
+    )
+    try:
+        sched.drive(ctx, max_workers=4)
+    except BaseException as exc:
+        root = unwrap_wave_error(exc)
+        if root is not exc:
+            raise root from exc
+        raise
+    return list(ctx.get("final_clauses") or [])

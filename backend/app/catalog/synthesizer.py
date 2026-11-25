@@ -1,6 +1,7 @@
 """双源接入落库与「代码 × 监管材料」纯业务资产融合合成引擎（资产层 Layer 4）。"""
 
 from concurrent.futures import ThreadPoolExecutor
+import copy
 import hashlib
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -35,8 +36,8 @@ from app.infra.llm import (
     llm_execution_scope,
     submit_with_context,
 )
-from app.kernel.event_log import append_event
 from app.kernel.run import create_run as kernel_create_run
+from app.kernel.scheduler import Outcome, Scheduler, Send
 from app.ingestion.builtin_pack import (
     BUILTIN_CODE_SOURCES,
     BUILTIN_REGULATORY_DOCS,
@@ -45,6 +46,8 @@ from app.ingestion.builtin_pack import (
 from app.ingestion.code_parser import parse_code_logic
 from app.ingestion.doc_parser import parse_regulatory_document
 from app.policy.dc_bus import build_run_bus, default_bus, detect_technical_jargon, sanitize_business_text
+from app.policy.dc_channels import build_synthesis_context
+from app.policy.dc_plan import ASSET_SYNTHESIS_PLAN, unwrap_wave_error
 
 
 def _ensure_business_clean(bus, tool_name: str, payload: Dict[str, Any], allowed_evidence_ids: List[str]) -> Dict[str, Any]:
@@ -1400,196 +1403,259 @@ def synthesize_business_assets(
     llm: Any = None,
     target_domains: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    """将底层代码实证与监管制度条款自动碰撞对齐，生成纯业务语言四大资产层并落哈希链账本。
+    """经外层有库 `Scheduler(ASSET_SYNTHESIS_PLAN)` 驱动双源融合：加载实证 -> 对齐域 -> 并发纯内存 AI 提纯 -> 单写落库发布。
 
     支持传 `target_domains` 仅增量重算变更域（保留其他域已有资产与人工确认状态）。
     """
     active_settings = get_effective_settings(session, settings or get_settings())
     active_llm = _resolve_optional_llm(session, active_settings, llm)
     budget = get_budget(session)
+    workers = max(1, min(8, int(budget.get("max_llm_concurrency", 4))))
     configure_llm_concurrency(int(budget.get("max_llm_concurrency", 4)))
-    bus = build_run_bus(budget)
+    llm_bus = build_run_bus(budget)
 
-    run: RunModel = kernel_create_run(session, "dc_asset_synthesis", initial_node="created", bus=bus)
-    clauses = session.query(RegulatoryClauseModel).all()
-    raw_evidences = session.query(LogicEvidenceModel).all()
-    # 默认隔离已被下游核心报送吸收的 Tier 2 中间加工实证，防止在业务版图中生成上百个中间垃圾域
-    evidences = [
-        ev
-        for ev in raw_evidences
-        if not (
-            isinstance(ev.internal_locator_json, dict)
-            and ev.internal_locator_json.get("tier") == "TIER_2_UPSTREAM"
-            and ev.internal_locator_json.get("absorbed_by_downstream") is True
-        )
-    ]
-
-    append_event(
+    run: RunModel = kernel_create_run(session, "dc_asset_synthesis", initial_node="created", bus=llm_bus)
+    target_set = {str(d).strip() for d in target_domains if str(d).strip()} if target_domains else set()
+    ctx = build_synthesis_context(
         session,
         run,
-        "SOURCES_PARSED",
-        "parse_sources",
-        {"clause_count": len(clauses), "evidence_count": len(evidences), "raw_evidence_count": len(raw_evidences)},
-        bus=bus,
+        settings=active_settings,
+        llm=active_llm,
+        bus=default_bus(),
+        concurrency=workers,
+        shared={"mode": "incremental" if target_set else "full"},
     )
 
-    doc_domains: List[str] = []
-    doc_clauses_by_domain: Dict[str, List[RegulatoryClauseModel]] = {}
-    for cl in clauses:
-        if cl.business_domain not in doc_clauses_by_domain:
-            doc_domains.append(cl.business_domain)
-            doc_clauses_by_domain[cl.business_domain] = []
-        doc_clauses_by_domain[cl.business_domain].append(cl)
-
-    doc_domain_regimes: Dict[str, str] = {}
-    for d in doc_domains:
-        clause_regimes = [
-            str((c.source_locator_json or {}).get("regime") or "").strip()
-            for c in doc_clauses_by_domain[d]
-            if (c.source_locator_json or {}).get("regime")
-        ]
-        if clause_regimes and clause_regimes[0] != "通用监管":
-            doc_domain_regimes[d] = clause_regimes[0]
-        else:
-            doc_domain_regimes[d] = infer_regulatory_regime(
-                d,
-                " ".join(c.clause_title for c in doc_clauses_by_domain[d][:3]),
+    def _node_parse_sources(_inp: Any, _ctx: Any) -> Outcome:
+        clauses = session.query(RegulatoryClauseModel).all()
+        raw_evidences = session.query(LogicEvidenceModel).all()
+        # 默认隔离已被下游核心报送吸收的 Tier 2 中间加工实证，防止在业务版图中生成上百个中间垃圾域
+        evidences = [
+            ev
+            for ev in raw_evidences
+            if not (
+                isinstance(ev.internal_locator_json, dict)
+                and ev.internal_locator_json.get("tier") == "TIER_2_UPSTREAM"
+                and ev.internal_locator_json.get("absorbed_by_downstream") is True
             )
+        ]
+        return Outcome(
+            shared={"clauses_loaded": len(clauses)},
+            output={"clauses": clauses, "evidences": evidences, "raw_evidence_count": len(raw_evidences)},
+            events=[
+                (
+                    "SOURCES_PARSED",
+                    "parse_sources",
+                    {
+                        "clause_count": len(clauses),
+                        "evidence_count": len(evidences),
+                        "raw_evidence_count": len(raw_evidences),
+                    },
+                )
+            ],
+        )
 
-    domains_order: List[str] = list(doc_domains)
-    domain_clauses: Dict[str, List[RegulatoryClauseModel]] = {
-        d: list(doc_clauses_by_domain[d]) for d in doc_domains
-    }
-    domain_evidences: Dict[str, List[LogicEvidenceModel]] = {d: [] for d in doc_domains}
+    def _node_align_evidence(data: Dict[str, Any], _ctx: Any) -> Outcome:
+        clauses: List[RegulatoryClauseModel] = data["clauses"]
+        evidences: List[LogicEvidenceModel] = data["evidences"]
 
-    for ev in evidences:
-        target_domain = _align_evidence_domain_to_clauses(ev, doc_domains, doc_domain_regimes)
-        if target_domain not in domains_order:
-            domains_order.append(target_domain)
-            domain_clauses[target_domain] = []
-            domain_evidences[target_domain] = []
-        domain_evidences[target_domain].append(ev)
+        doc_domains: List[str] = []
+        doc_clauses_by_domain: Dict[str, List[RegulatoryClauseModel]] = {}
+        for cl in clauses:
+            if cl.business_domain not in doc_clauses_by_domain:
+                doc_domains.append(cl.business_domain)
+                doc_clauses_by_domain[cl.business_domain] = []
+            doc_clauses_by_domain[cl.business_domain].append(cl)
 
-    target_set = {str(d).strip() for d in target_domains if str(d).strip()} if target_domains else set()
-    selected_domains = [d for d in domains_order if d in target_set] if target_set else list(domains_order)
+        doc_domain_regimes: Dict[str, str] = {}
+        for d in doc_domains:
+            clause_regimes = [
+                str((c.source_locator_json or {}).get("regime") or "").strip()
+                for c in doc_clauses_by_domain[d]
+                if (c.source_locator_json or {}).get("regime")
+            ]
+            if clause_regimes and clause_regimes[0] != "通用监管":
+                doc_domain_regimes[d] = clause_regimes[0]
+            else:
+                doc_domain_regimes[d] = infer_regulatory_regime(
+                    d,
+                    " ".join(c.clause_title for c in doc_clauses_by_domain[d][:3]),
+                )
 
-    append_event(
-        session,
-        run,
-        "EVIDENCE_ALIGNED",
-        "align_evidence",
-        {
+        domains_order: List[str] = list(doc_domains)
+        domain_clauses: Dict[str, List[RegulatoryClauseModel]] = {
+            d: list(doc_clauses_by_domain[d]) for d in doc_domains
+        }
+        domain_evidences: Dict[str, List[LogicEvidenceModel]] = {d: [] for d in doc_domains}
+
+        for ev in evidences:
+            target_domain = _align_evidence_domain_to_clauses(ev, doc_domains, doc_domain_regimes)
+            if target_domain not in domains_order:
+                domains_order.append(target_domain)
+                domain_clauses[target_domain] = []
+                domain_evidences[target_domain] = []
+            domain_evidences[target_domain].append(ev)
+
+        selected_domains = [d for d in domains_order if d in target_set] if target_set else list(domains_order)
+        drafts = [
+            _build_domain_draft(domain_name, domain_clauses[domain_name], domain_evidences[domain_name])
+            for domain_name in selected_domains
+        ]
+        aligned_meta = {
             "domains": selected_domains,
             "incremental": bool(target_set),
             "covered_domains": [d for d in selected_domains if domain_evidences[d]],
             "unrealized_domains": [d for d in selected_domains if not domain_evidences[d]],
+            "drafts": drafts,
+        }
+        aligned_payload = {k: v for k, v in aligned_meta.items() if k != "drafts"}
+        if active_llm is not None and drafts:
+            sends = [
+                Send(
+                    "refine_domain_worker",
+                    {
+                        "domain_idx": idx,
+                        "domain_name": selected_domains[idx],
+                        "draft": copy.deepcopy(d),
+                    },
+                    label=f"domain-{idx}:{str(d['capability']['name'])[:20]}",
+                )
+                for idx, d in enumerate(drafts)
+            ]
+            return Outcome(
+                when="fanout",
+                shared={"aligned_domains": aligned_meta},
+                sends=sends,
+                events=[("EVIDENCE_ALIGNED", "align_evidence", aligned_payload)],
+            )
+        return Outcome(
+            when="direct",
+            shared={"aligned_domains": aligned_meta},
+            output={"drafts": drafts, "ai_enriched_domains": 0},
+            events=[("EVIDENCE_ALIGNED", "align_evidence", aligned_payload)],
+        )
+
+    def _node_refine_domain_worker(task_data: Dict[str, Any], _ctx: Any) -> Outcome:
+        with llm_execution_scope(bus=llm_bus):
+            refined_draft, ok = _refine_domain_with_llm(task_data["draft"], llm=active_llm, bus=llm_bus)
+        idx_key = str(task_data["domain_idx"])
+        cap_name = str((refined_draft.get("capability") or {}).get("name") or task_data["domain_name"])
+        return Outcome(
+            shared={"refined_domains": {idx_key: {"draft": refined_draft, "ok": ok}}},
+            output={"domain_idx": task_data["domain_idx"], "ok": ok},
+            events=[
+                (
+                    "DOMAIN_REFINED",
+                    "refine_domain_worker",
+                    {"domain": cap_name, "ok": bool(ok), "label": cap_name[:24]},
+                )
+            ],
+        )
+
+    def _node_synthesize_assets(payload: Any, local_ctx: Any) -> Outcome:
+        aligned_meta = local_ctx.get("aligned_domains") or {}
+        selected_domains: List[str] = list(aligned_meta.get("domains") or [])
+        base_drafts: List[Dict[str, Any]] = list(aligned_meta.get("drafts") or [])
+        refined_map = local_ctx.get("refined_domains")
+        if isinstance(refined_map, dict) and refined_map:
+            drafts = [refined_map[str(i)]["draft"] for i in range(len(base_drafts))]
+            ai_enriched_domains = sum(1 for i in range(len(base_drafts)) if refined_map[str(i)]["ok"])
+        else:
+            drafts = base_drafts
+            ai_enriched_domains = 0
+
+        for draft in drafts:
+            cap_payload = draft["capability"]
+            cap_row = _upsert_capability(
+                session,
+                code=draft["cap_code"],
+                name=cap_payload["name"],
+                description=cap_payload["description"],
+                scope_summary=cap_payload["scope_summary"],
+                audience=cap_payload.get("audience", draft["audience"]),
+                coverage_status=draft["coverage_status"],
+                evidence_ids=draft["ev_ids"],
+                clause_ids=draft["cl_ids"],
+                rule_count=0,
+                caliber_count=0,
+                confirmed_count=0,
+                bus=llm_bus,
+            )
+            cap_rule_count = 0
+            cap_caliber_count = 0
+
+            for rule_draft in draft["rules"]:
+                _upsert_rule(
+                    session,
+                    capability_id=cap_row.id,
+                    bus=llm_bus,
+                    **rule_draft,
+                )
+                cap_rule_count += 1
+
+            for cal_draft in draft["calibers"]:
+                _upsert_caliber(
+                    session,
+                    capability_id=cap_row.id,
+                    bus=llm_bus,
+                    **cal_draft,
+                )
+                cap_caliber_count += 1
+
+            confirmed_rules = (
+                session.query(BusinessRuleAssetModel)
+                .filter(BusinessRuleAssetModel.capability_id == cap_row.id, BusinessRuleAssetModel.status == "CONFIRMED")
+                .count()
+            )
+            confirmed_cals = (
+                session.query(BusinessCaliberAssetModel)
+                .filter(BusinessCaliberAssetModel.capability_id == cap_row.id, BusinessCaliberAssetModel.status == "CONFIRMED")
+                .count()
+            )
+            cap_row.rule_count = cap_rule_count
+            cap_row.caliber_count = cap_caliber_count
+            cap_row.confirmed_count = confirmed_rules + confirmed_cals
+            session.flush()
+
+        cap_total = session.query(BusinessCapabilityModel).count()
+        rule_total = session.query(BusinessRuleAssetModel).count()
+        caliber_total = session.query(BusinessCaliberAssetModel).count()
+
+        summary = {
+            "run_id": run.id,
+            "capability_count": cap_total,
+            "rule_count": rule_total,
+            "caliber_count": caliber_total,
+            "incremental": bool(target_set),
+            "synthesized_domains": selected_domains,
+            "ai_enabled": active_llm is not None,
+            "llm_model": _resolve_llm_model_name(active_llm, active_settings),
+            "ai_enriched_domains": ai_enriched_domains,
+        }
+        return Outcome(
+            shared={"summary": summary},
+            output=summary,
+            events=[("ASSETS_SYNTHESIZED", "synthesize_assets", {"summary": summary})],
+        )
+
+    sched = Scheduler(
+        ASSET_SYNTHESIS_PLAN,
+        {
+            "parse_sources": _node_parse_sources,
+            "align_evidence": _node_align_evidence,
+            "refine_domain_worker": _node_refine_domain_worker,
+            "synthesize_assets": _node_synthesize_assets,
         },
-        bus=bus,
     )
-
-    drafts = [
-        _build_domain_draft(domain_name, domain_clauses[domain_name], domain_evidences[domain_name])
-        for domain_name in selected_domains
-    ]
-
-    ai_enriched_domains = 0
-    if active_llm is not None and drafts:
-        workers = max(1, min(8, int(budget.get("max_llm_concurrency", 4))))
-        with llm_execution_scope(bus=bus):
-            if len(drafts) == 1:
-                drafts[0], ok = _refine_domain_with_llm(drafts[0], llm=active_llm, bus=bus)
-                if ok:
-                    ai_enriched_domains = 1
-            else:
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = [
-                        (idx, submit_with_context(pool, _refine_domain_with_llm, d, llm=active_llm, bus=bus))
-                        for idx, d in enumerate(drafts)
-                    ]
-                    for idx, fut in futures:
-                        drafts[idx], ok = fut.result()
-                        if ok:
-                            ai_enriched_domains += 1
-
-    for draft in drafts:
-        cap_payload = draft["capability"]
-        cap_row = _upsert_capability(
-            session,
-            code=draft["cap_code"],
-            name=cap_payload["name"],
-            description=cap_payload["description"],
-            scope_summary=cap_payload["scope_summary"],
-            audience=cap_payload.get("audience", draft["audience"]),
-            coverage_status=draft["coverage_status"],
-            evidence_ids=draft["ev_ids"],
-            clause_ids=draft["cl_ids"],
-            rule_count=0,
-            caliber_count=0,
-            confirmed_count=0,
-            bus=bus,
-        )
-        cap_rule_count = 0
-        cap_caliber_count = 0
-
-        for rule_draft in draft["rules"]:
-            _upsert_rule(
-                session,
-                capability_id=cap_row.id,
-                bus=bus,
-                **rule_draft,
-            )
-            cap_rule_count += 1
-
-        for cal_draft in draft["calibers"]:
-            _upsert_caliber(
-                session,
-                capability_id=cap_row.id,
-                bus=bus,
-                **cal_draft,
-            )
-            cap_caliber_count += 1
-
-        confirmed_rules = (
-            session.query(BusinessRuleAssetModel)
-            .filter(BusinessRuleAssetModel.capability_id == cap_row.id, BusinessRuleAssetModel.status == "CONFIRMED")
-            .count()
-        )
-        confirmed_cals = (
-            session.query(BusinessCaliberAssetModel)
-            .filter(BusinessCaliberAssetModel.capability_id == cap_row.id, BusinessCaliberAssetModel.status == "CONFIRMED")
-            .count()
-        )
-        cap_row.rule_count = cap_rule_count
-        cap_row.caliber_count = cap_caliber_count
-        cap_row.confirmed_count = confirmed_rules + confirmed_cals
-        session.flush()
-
-    cap_total = session.query(BusinessCapabilityModel).count()
-    rule_total = session.query(BusinessRuleAssetModel).count()
-    caliber_total = session.query(BusinessCaliberAssetModel).count()
-
-    summary = {
-        "run_id": run.id,
-        "capability_count": cap_total,
-        "rule_count": rule_total,
-        "caliber_count": caliber_total,
-        "incremental": bool(target_set),
-        "synthesized_domains": selected_domains,
-        "ai_enabled": active_llm is not None,
-        "llm_model": _resolve_llm_model_name(active_llm, active_settings),
-        "ai_enriched_domains": ai_enriched_domains,
-    }
-    append_event(
-        session,
-        run,
-        "ASSETS_SYNTHESIZED",
-        "synthesize_assets",
-        {"summary": summary},
-        bus=bus,
-    )
-    session.commit()
+    try:
+        sched.drive(ctx, max_workers=workers)
+    except BaseException as exc:
+        root = unwrap_wave_error(exc)
+        if root is not exc:
+            raise root from exc
+        raise
     invalidate_bm25_caches()
-    return summary
+    return dict(ctx.get("summary") or {})
 
 
 def load_builtin_sample_pack(

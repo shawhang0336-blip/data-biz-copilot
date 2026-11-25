@@ -1,4 +1,4 @@
-"""dc_agent 策略层统一导出（Layer 2）：Bus 双门禁与预算构造器 + Run 状态折叠器（零全局副作用）。"""
+"""dc_agent 策略层统一导出（Layer 2）：Bus 双门禁与预算构造器 + 4 套 WorkflowPlan + Channel 契约（零全局副作用）。"""
 
 from .dc_bus import (
     build_run_bus,
@@ -9,17 +9,55 @@ from .dc_bus import (
     evidence_backing_adjudicator,
     sanitize_business_text,
 )
-from .dc_plan import fold, project, project_many
+from .dc_channels import (
+    BATCH_INGEST_CHANNELS,
+    CODE_PARSE_CHANNELS,
+    DOC_PARSE_CHANNELS,
+    SYNTHESIS_CHANNELS,
+    build_batch_ingest_context,
+    build_code_parse_context,
+    build_doc_parse_context,
+    build_synthesis_context,
+)
+from .dc_plan import (
+    ASSET_SYNTHESIS_PLAN,
+    BATCH_INGEST_PLAN,
+    CODE_PARSE_PLAN,
+    DOC_PARSE_PLAN,
+    WORKFLOW_PLANS,
+    _apply,
+    fold,
+    get_plan,
+    project,
+    project_many,
+    unwrap_wave_error,
+)
 
 __all__ = [
+    "ASSET_SYNTHESIS_PLAN",
+    "BATCH_INGEST_CHANNELS",
+    "BATCH_INGEST_PLAN",
+    "CODE_PARSE_CHANNELS",
+    "CODE_PARSE_PLAN",
+    "DOC_PARSE_CHANNELS",
+    "DOC_PARSE_PLAN",
+    "SYNTHESIS_CHANNELS",
+    "WORKFLOW_PLANS",
+    "_apply",
+    "build_batch_ingest_context",
+    "build_code_parse_context",
+    "build_doc_parse_context",
     "build_run_bus",
     "build_script_child_bus",
+    "build_synthesis_context",
     "de_jargon_adjudicator",
     "default_bus",
     "detect_technical_jargon",
     "evidence_backing_adjudicator",
     "fold",
+    "get_plan",
     "project",
     "project_many",
     "sanitize_business_text",
+    "unwrap_wave_error",
 ]

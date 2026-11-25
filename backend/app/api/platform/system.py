@@ -13,8 +13,8 @@ from app.api.common import db_session
 from app.infra.config import DEFAULT_BUDGET, get_budget, get_llm_config, get_settings
 from app.infra.db_tables import EventModel, RunModel, SystemSettingModel
 from app.kernel.bus import global_bus
-from app.kernel.event_log import verify_chain
-from app.policy.dc_plan import project
+from app.kernel.event_log import build_trace, verify_chain
+from app.policy.dc_plan import get_plan, project
 
 router = APIRouter(tags=["platform"])
 
@@ -76,12 +76,20 @@ def get_synthesis_run(run_id: str, session: Session = Depends(db_session)) -> Di
         .order_by(EventModel.seq.asc())
         .all()
     )
+    trace = build_trace(events, run_id=run.id, plan=get_plan(run.spec_id)).as_dict()
     return {
         "id": run.id,
+        "spec_id": run.spec_id,
         "status": state.status,
         "current_node": state.current_node,
         "result": state.result_json,
         "chain_valid": verify_chain(session, run),
+        "total_duration_ms": trace["total_duration_ms"],
+        "retry_count": trace["retry_count"],
+        "rejection_count": trace["rejection_count"],
+        "interrupt_count": trace["interrupt_count"],
+        "spans": trace["spans"],
+        "by_node": trace["by_node"],
         "events": [
             {"seq": e.seq, "kind": e.kind, "node": e.node, "payload": e.payload_json}
             for e in events

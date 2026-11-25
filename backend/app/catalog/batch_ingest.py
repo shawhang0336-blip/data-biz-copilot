@@ -63,8 +63,10 @@ from app.kernel.run import (
     recover_interrupted_runs,
     submit_run,
 )
-from app.policy.dc_bus import build_run_bus, build_script_child_bus, sanitize_business_text
-from app.policy.dc_plan import project as project_dc_plan
+from app.kernel.scheduler import Outcome, Scheduler, Send
+from app.policy.dc_bus import build_run_bus, build_script_child_bus, default_bus, sanitize_business_text
+from app.policy.dc_channels import build_batch_ingest_context
+from app.policy.dc_plan import BATCH_INGEST_PLAN, project as project_dc_plan, unwrap_wave_error
 
 CODE_EXTENSIONS = {"sql", "prc", "pck", "bdy", "ddl", "hql", "plsql", "pls"}
 DOC_EXTENSIONS = {"md", "txt", "docx", "pdf", "xlsx", "csv"}
@@ -296,117 +298,153 @@ def create_batch_ingestion_job(
     session.add(job)
     session.flush()
 
-    seen_digests = set()
-    staged_code_inputs: List[Tuple[str, str, str, str]] = []
-    staged_materials_by_id: Dict[str, SourceMaterialModel] = {}
-    reused_ids: List[str] = []
-
-    for f in files:
-        raw = f.get("content") or b""
-        raw_bytes = raw if isinstance(raw, bytes) else str(raw).encode("utf-8")
-        digest = hashlib.sha256(raw_bytes).hexdigest()
-        if digest in seen_digests:
-            continue
-        seen_digests.add(digest)
-
-        existing = session.query(SourceMaterialModel).filter(SourceMaterialModel.sha256 == digest).first()
-        if existing is not None:
-            if existing.status in TERMINAL_MATERIAL_STATUSES:
-                reused_ids.append(existing.id)
-                continue
-            existing.batch_job_id = job.id
-            if not existing.relative_path:
-                existing.relative_path = str(f.get("relative_path") or existing.title)
-            existing.status = "PENDING"
-            existing.error_message = ""
-            staged_materials_by_id[existing.id] = existing
-            if existing.material_kind == "CODE_LOGIC":
-                staged_code_inputs.append(
-                    (
-                        existing.id,
-                        existing.title,
-                        existing.relative_path or existing.title,
-                        raw_bytes.decode("utf-8", errors="replace"),
-                    )
-                )
-            continue
-
-        blob_uri = blob_store.put(raw_bytes)
-        mat_id = str(uuid.uuid4())
-        title = str(f.get("title") or "untitled")[:255]
-        rel_path = str(f.get("relative_path") or title)[:512]
-        mat_kind = str(f.get("material_kind") or "CODE_LOGIC")
-        file_type = str(f.get("file_type") or "sql")[:16]
-        row = SourceMaterialModel(
-            id=mat_id,
-            title=title,
-            material_kind=mat_kind,
-            file_type=file_type,
-            sha256=digest,
-            blob_uri=blob_uri,
-            status="PENDING",
-            summary="等待 Phase 0 静态预扫描分层" if mat_kind == "CODE_LOGIC" else "等待制度文档提取",
-            item_count=0,
-            batch_job_id=job.id,
-            relative_path=rel_path,
-            tier=TIER_1_CORE,
-        )
-        session.add(row)
-        staged_materials_by_id[mat_id] = row
-        if mat_kind == "CODE_LOGIC":
-            staged_code_inputs.append(
-                (mat_id, title, rel_path, raw_bytes.decode("utf-8", errors="replace"))
-            )
-
-    session.flush()
-
-    scan_result = scan_project_batch(
-        staged_code_inputs,
-        enable_template_dedup=enable_template_dedup,
-        max_workers=4,
-    )
-    topo_order_map: Dict[str, int] = {}
-    for prof in scan_result["profiles"]:
-        row = staged_materials_by_id.get(prof.material_id)
-        if row is None:
-            continue
-        row.tier = prof.tier
-        row.skip_reason = prof.skip_reason
-        row.ast_template_hash = prof.ast_template_hash
-        row.template_master_id = prof.template_master_id
-        row.target_tables_json = prof.target_tables
-        row.source_tables_json = prof.source_tables
-        row.status = "STATIC_INDEXED"
-        row.summary = _static_summary_for_profile(prof.tier, prof.skip_reason)
-        topo_order_map[prof.material_id] = prof.topo_order
-
-    for row in staged_materials_by_id.values():
-        if row.material_kind == "REGULATORY_DOC" and row.status == "PENDING":
-            row.status = "STATIC_INDEXED"
-
-    cfg = dict(job.config_json or {})
-    cfg["reused_material_ids"] = reused_ids
-    cfg["upstream_map"] = scan_result["upstream_map"]
-    cfg["topo_order"] = topo_order_map
-    cfg["skip_reasons"] = scan_result["summary"]["skip_reasons"]
-    job.config_json = cfg
-    _recount_job_tiers(session, job)
-    job.status = "READY_REVIEW"
-    job.current_phase = "STATIC_SCAN"
-    session.flush()
-
-    append_event(
+    ctx = build_batch_ingest_context(
         session,
         run,
-        "BATCH_SCANNED",
-        "static_scan",
+        settings=active_settings,
+        bus=default_bus(),
+        shared={"job_id": job.id},
+    )
+
+    def _node_static_scan(_inp: Any, _ctx: Any) -> Outcome:
+        seen_digests = set()
+        staged_code_inputs: List[Tuple[str, str, str, str]] = []
+        staged_materials_by_id: Dict[str, SourceMaterialModel] = {}
+        reused_ids: List[str] = []
+
+        for f in files:
+            raw = f.get("content") or b""
+            raw_bytes = raw if isinstance(raw, bytes) else str(raw).encode("utf-8")
+            digest = hashlib.sha256(raw_bytes).hexdigest()
+            if digest in seen_digests:
+                continue
+            seen_digests.add(digest)
+
+            existing = session.query(SourceMaterialModel).filter(SourceMaterialModel.sha256 == digest).first()
+            if existing is not None:
+                if existing.status in TERMINAL_MATERIAL_STATUSES:
+                    reused_ids.append(existing.id)
+                    continue
+                existing.batch_job_id = job.id
+                if not existing.relative_path:
+                    existing.relative_path = str(f.get("relative_path") or existing.title)
+                existing.status = "PENDING"
+                existing.error_message = ""
+                staged_materials_by_id[existing.id] = existing
+                if existing.material_kind == "CODE_LOGIC":
+                    staged_code_inputs.append(
+                        (
+                            existing.id,
+                            existing.title,
+                            existing.relative_path or existing.title,
+                            raw_bytes.decode("utf-8", errors="replace"),
+                        )
+                    )
+                continue
+
+            blob_uri = blob_store.put(raw_bytes)
+            mat_id = str(uuid.uuid4())
+            title = str(f.get("title") or "untitled")[:255]
+            rel_path = str(f.get("relative_path") or title)[:512]
+            mat_kind = str(f.get("material_kind") or "CODE_LOGIC")
+            file_type = str(f.get("file_type") or "sql")[:16]
+            row = SourceMaterialModel(
+                id=mat_id,
+                title=title,
+                material_kind=mat_kind,
+                file_type=file_type,
+                sha256=digest,
+                blob_uri=blob_uri,
+                status="PENDING",
+                summary="等待 Phase 0 静态预扫描分层" if mat_kind == "CODE_LOGIC" else "等待制度文档提取",
+                item_count=0,
+                batch_job_id=job.id,
+                relative_path=rel_path,
+                tier=TIER_1_CORE,
+            )
+            session.add(row)
+            staged_materials_by_id[mat_id] = row
+            if mat_kind == "CODE_LOGIC":
+                staged_code_inputs.append(
+                    (mat_id, title, rel_path, raw_bytes.decode("utf-8", errors="replace"))
+                )
+
+        session.flush()
+
+        scan_result = scan_project_batch(
+            staged_code_inputs,
+            enable_template_dedup=enable_template_dedup,
+            max_workers=4,
+        )
+        topo_order_map: Dict[str, int] = {}
+        for prof in scan_result["profiles"]:
+            row = staged_materials_by_id.get(prof.material_id)
+            if row is None:
+                continue
+            row.tier = prof.tier
+            row.skip_reason = prof.skip_reason
+            row.ast_template_hash = prof.ast_template_hash
+            row.template_master_id = prof.template_master_id
+            row.target_tables_json = prof.target_tables
+            row.source_tables_json = prof.source_tables
+            row.status = "STATIC_INDEXED"
+            row.summary = _static_summary_for_profile(prof.tier, prof.skip_reason)
+            topo_order_map[prof.material_id] = prof.topo_order
+
+        for row in staged_materials_by_id.values():
+            if row.material_kind == "REGULATORY_DOC" and row.status == "PENDING":
+                row.status = "STATIC_INDEXED"
+
+        cfg = dict(job.config_json or {})
+        cfg["reused_material_ids"] = reused_ids
+        cfg["upstream_map"] = scan_result["upstream_map"]
+        cfg["topo_order"] = topo_order_map
+        cfg["skip_reasons"] = scan_result["summary"]["skip_reasons"]
+        job.config_json = cfg
+        _recount_job_tiers(session, job)
+        job.status = "READY_REVIEW"
+        job.current_phase = "STATIC_SCAN"
+        session.flush()
+
+        return Outcome(
+            when="always",
+            shared={"job_id": job.id, "scan_summary": scan_result["summary"]},
+            output=scan_result["summary"],
+            events=[
+                (
+                    "BATCH_SCANNED",
+                    "static_scan",
+                    {
+                        "job_id": job.id,
+                        "summary": scan_result["summary"],
+                        "reused_count": len(reused_ids),
+                    },
+                )
+            ],
+        )
+
+    def _node_tier_review_gate(_inp: Any, _ctx: Any) -> Outcome:
+        return Outcome.park(
+            "TIER_REVIEW_REQUIRED",
+            "静态分层预扫描已完成，请确认分层优先级并启动批量解析。",
+            payload={
+                "job_id": job.id,
+                "total_files": int(job.total_files or 0),
+                "tier1_count": int(job.tier1_count or 0),
+                "tier2_count": int(job.tier2_count or 0),
+                "tier3_count": int(job.tier3_count or 0),
+            },
+            resume_node="tier_review_gate",
+        )
+
+    sched = Scheduler(
+        BATCH_INGEST_PLAN,
         {
-            "job_id": job.id,
-            "summary": scan_result["summary"],
-            "reused_count": len(reused_ids),
+            "static_scan": _node_static_scan,
+            "tier_review_gate": _node_tier_review_gate,
         },
     )
-    session.commit()
+    sched.drive(ctx)
     return get_batch_job_detail(session, job.id, page=1, page_size=50)
 
 
@@ -1002,35 +1040,108 @@ def _drive_batch_job(
         _recount_job_tiers(session, job)
         session.commit()
 
-    # Wave 0.5: 同批上传的制度文档先解析
-    pending_docs = [
-        m
-        for m in all_mats
-        if m.material_kind == "REGULATORY_DOC" and m.status not in TERMINAL_MATERIAL_STATUSES
-    ]
-    stop_state = _drive_wave(
-        session,
-        job,
-        run,
-        pending_docs,
-        execution_mode="full",
-        phase_name="DOC_PARSE",
-        blob_store=blob_store,
-        active_llm=active_llm,
-        job_bus=job_bus,
-        per_script_calls=per_script_calls * 2,
-        per_script_elapsed=per_script_elapsed,
-        workers=workers,
-        cancel_token=cancel_token,
-        upstream_map=upstream_map,
-        upstream_summaries=upstream_summaries,
-        has_tier1_downstream=has_tier1_downstream,
-        started_monotonic=started_monotonic,
-        affected_domains=affected_domains,
-    )
+    def _clone_ready_siblings() -> int:
+        clone_mats = [
+            m
+            for m in all_mats
+            if m.material_kind == "CODE_LOGIC"
+            and m.tier == TIER_3_SKIP_AI
+            and m.template_master_id
+            and m.status not in TERMINAL_MATERIAL_STATUSES
+        ]
+        if not clone_mats:
+            return 0
+        parsed_master_ids = {m.id for m in all_mats if m.status == "PARSED"}
+        ready_clones = [c for c in clone_mats if c.template_master_id in parsed_master_ids]
+        if ready_clones:
+            _clone_master_evidences_for_siblings(session, job, ready_clones)
+        return len(ready_clones)
 
-    # Wave 1: Tier 2 上游关键加工（严格按拓扑序 + lite 单次模式）
-    if stop_state == "OK":
+    def _handle_stop_state(stop_state: str, phase_name: str, processed_count: int) -> Outcome:
+        if stop_state == "CANCELLED":
+            _recount_job_tiers(session, job)
+            _sync_job_guard_metrics(job, job_bus, started_monotonic)
+            job.status = "CANCELLED"
+            job.current_phase = "CANCELLED"
+            job.error_summary = cancel_token.reason
+            session.commit()
+            raise RunCancelledError(cancel_token.reason)
+        if stop_state in {"PAUSED_BUDGET", "PAUSED_BILLING"}:
+            _clone_ready_siblings()
+            _recount_job_tiers(session, job)
+            _sync_job_guard_metrics(job, job_bus, started_monotonic)
+            job.status = "PAUSED_BUDGET"
+            job.current_phase = "PAUSED_BUDGET"
+            if stop_state == "PAUSED_BUDGET":
+                job.error_summary = "批任务达到执行预算上限已安全暂停（已解析脚本全部保留），调高预算后可一键断点续跑。"
+            elif not job.error_summary:
+                job.error_summary = "模型账户余额不足或鉴权失效，批任务已安全暂停（已解析脚本全部保留），处理后可一键断点续跑。"
+            snap = _job_to_dict(job)
+            return Outcome(
+                when="paused",
+                shared={"pause_reason": stop_state, "phase_stats": {phase_name: processed_count}},
+                output={"pause_reason": stop_state},
+                events=[("BATCH_PAUSED", "paused", snap)],
+            )
+        return Outcome(
+            when="always",
+            shared={"phase_stats": {phase_name: processed_count}},
+            output={"phase": phase_name, "count": processed_count},
+        )
+
+    def _node_tier_review_gate(_inp: Any, local_ctx: Any) -> Outcome:
+        if local_ctx.resume_value is not None:
+            return Outcome(when="always", output={"resumed_from": "tier_review_gate"})
+        return Outcome.park(
+            "TIER_REVIEW_REQUIRED",
+            "请确认分层优先级并启动解析。",
+            payload={"job_id": job.id},
+            resume_node="tier_review_gate",
+        )
+
+    def _node_budget_pause_gate(_inp: Any, local_ctx: Any) -> Outcome:
+        if local_ctx.resume_value is not None:
+            return Outcome(when="always", output={"resumed_from": "budget_pause_gate"})
+        return Outcome.park(
+            "BATCH_PAUSE_REQUIRED",
+            "批任务达到预算阈值或模型余额受限，已保留全部已完成检查点，调整预算后可断点续跑。",
+            payload={
+                "job_id": job.id,
+                "pause_reason": str(local_ctx.get("pause_reason") or "PAUSED_BUDGET"),
+                "completed_count": int(job.completed_count or 0),
+            },
+            resume_node="budget_pause_gate",
+        )
+
+    def _node_doc_wave(_inp: Any, _ctx: Any) -> Outcome:
+        pending_docs = [
+            m
+            for m in all_mats
+            if m.material_kind == "REGULATORY_DOC" and m.status not in TERMINAL_MATERIAL_STATUSES
+        ]
+        stop_state = _drive_wave(
+            session,
+            job,
+            run,
+            pending_docs,
+            execution_mode="full",
+            phase_name="DOC_PARSE",
+            blob_store=blob_store,
+            active_llm=active_llm,
+            job_bus=job_bus,
+            per_script_calls=per_script_calls * 2,
+            per_script_elapsed=per_script_elapsed,
+            workers=workers,
+            cancel_token=cancel_token,
+            upstream_map=upstream_map,
+            upstream_summaries=upstream_summaries,
+            has_tier1_downstream=has_tier1_downstream,
+            started_monotonic=started_monotonic,
+            affected_domains=affected_domains,
+        )
+        return _handle_stop_state(stop_state, "doc_wave", len(pending_docs))
+
+    def _node_tier2_wave(_inp: Any, _ctx: Any) -> Outcome:
         tier2_mats = sorted(
             [
                 m
@@ -1061,9 +1172,9 @@ def _drive_batch_job(
             started_monotonic=started_monotonic,
             affected_domains=affected_domains,
         )
+        return _handle_stop_state(stop_state, "tier2_wave", len(tier2_mats))
 
-    # Wave 2: Tier 1 核心报送终表（带 1-2 跳纯中文上游摘要执行完整 Plan-then-Extract）
-    if stop_state == "OK":
+    def _node_tier1_wave(_inp: Any, _ctx: Any) -> Outcome:
         tier1_mats = sorted(
             [
                 m
@@ -1094,9 +1205,9 @@ def _drive_batch_job(
             started_monotonic=started_monotonic,
             affected_domains=affected_domains,
         )
+        return _handle_stop_state(stop_state, "tier1_wave", len(tier1_mats))
 
-    # Wave 3: 同构模板克隆（只要 Master 已成功即可免费完成克隆，未成功的留待续跑）
-    if stop_state in {"OK", "PAUSED_BUDGET", "PAUSED_BILLING"}:
+    def _node_clone_wave(_inp: Any, _ctx: Any) -> Outcome:
         clone_mats = [
             m
             for m in all_mats
@@ -1105,59 +1216,103 @@ def _drive_batch_job(
             and m.template_master_id
             and m.status not in TERMINAL_MATERIAL_STATUSES
         ]
-        if stop_state == "OK":
-            _clone_master_evidences_for_siblings(session, job, clone_mats)
-        elif clone_mats:
-            parsed_master_ids = {
-                m.id
-                for m in all_mats
-                if m.status == "PARSED"
-            }
-            ready_clones = [c for c in clone_mats if c.template_master_id in parsed_master_ids]
-            _clone_master_evidences_for_siblings(session, job, ready_clones)
+        _clone_master_evidences_for_siblings(session, job, clone_mats)
+        _recount_job_tiers(session, job)
+        _sync_job_guard_metrics(job, job_bus, started_monotonic)
+        if cfg.get("auto_synthesize"):
+            job.current_phase = "SYNTHESIZING"
+            session.commit()
+            return Outcome(
+                when="synthesize",
+                shared={"phase_stats": {"clone_wave": len(clone_mats)}},
+                output={"cloned": len(clone_mats)},
+            )
+        return Outcome(
+            when="always",
+            shared={"phase_stats": {"clone_wave": len(clone_mats)}},
+            output={"cloned": len(clone_mats)},
+        )
 
-    _recount_job_tiers(session, job)
-    _sync_job_guard_metrics(job, job_bus, started_monotonic)
-
-    if stop_state == "CANCELLED":
-        job.status = "CANCELLED"
-        job.current_phase = "CANCELLED"
-        job.error_summary = cancel_token.reason
-        session.commit()
-        raise RunCancelledError(cancel_token.reason)
-
-    if stop_state in {"PAUSED_BUDGET", "PAUSED_BILLING"}:
-        job.status = "PAUSED_BUDGET"
-        job.current_phase = "PAUSED_BUDGET"
-        if stop_state == "PAUSED_BUDGET":
-            job.error_summary = "批任务达到执行预算上限已安全暂停（已解析脚本全部保留），调高预算后可一键断点续跑。"
-        elif not job.error_summary:
-            job.error_summary = "模型账户余额不足或鉴权失效，批任务已安全暂停（已解析脚本全部保留），处理后可一键断点续跑。"
-        append_event(session, run, "BATCH_PAUSED", "paused", _job_to_dict(job))
-        session.commit()
-        return _job_to_dict(job)
-
-    if cfg.get("auto_synthesize"):
-        job.current_phase = "SYNTHESIZING"
-        session.commit()
-        synthesize_business_assets(
+    def _node_auto_synthesize(_inp: Any, _ctx: Any) -> Outcome:
+        syn_summary = synthesize_business_assets(
             session,
             settings=active_settings,
             llm=active_llm,
             target_domains=sorted(affected_domains) if affected_domains else None,
         )
-
-    if job.failed_count > 0 and job.completed_count == 0 and job.skipped_count == 0:
-        job.status = "FAILED"
-        job.error_summary = "批任务中待解析脚本均失败，请查看失败详情或调整配置后重试。"
-    else:
-        job.status = "COMPLETED"
-        job.current_phase = "DONE"
-        job.error_summary = (
-            f"批任务完成，另有 {job.failed_count} 份脚本异常支持单独重试。" if job.failed_count > 0 else ""
+        return Outcome(
+            when="always",
+            shared={"synthesis_summary": syn_summary},
+            output=syn_summary,
         )
-    append_event(session, run, "BATCH_COMPLETED", "completed", _job_to_dict(job))
-    session.commit()
+
+    def _node_finalize_batch(_inp: Any, _ctx: Any) -> Outcome:
+        _recount_job_tiers(session, job)
+        _sync_job_guard_metrics(job, job_bus, started_monotonic)
+        if job.failed_count > 0 and job.completed_count == 0 and job.skipped_count == 0:
+            job.status = "FAILED"
+            job.error_summary = "批任务中待解析脚本均失败，请查看失败详情或调整配置后重试。"
+        else:
+            job.status = "COMPLETED"
+            job.current_phase = "DONE"
+            job.error_summary = (
+                f"批任务完成，另有 {job.failed_count} 份脚本异常支持单独重试。" if job.failed_count > 0 else ""
+            )
+        session.flush()
+        snap = _job_to_dict(job)
+        return Outcome(
+            output=snap,
+            events=[("BATCH_COMPLETED", "finalize_batch", snap)],
+        )
+
+    ctx = build_batch_ingest_context(
+        session,
+        run,
+        settings=active_settings,
+        llm=active_llm,
+        bus=default_bus(),
+        concurrency=workers,
+        cancellation=cancel_token,
+        shared={"job_id": job.id, "execution_mode": "full"},
+    )
+    sched = Scheduler(
+        BATCH_INGEST_PLAN,
+        {
+            "tier_review_gate": _node_tier_review_gate,
+            "budget_pause_gate": _node_budget_pause_gate,
+            "doc_wave": _node_doc_wave,
+            "tier2_wave": _node_tier2_wave,
+            "tier1_wave": _node_tier1_wave,
+            "clone_wave": _node_clone_wave,
+            "auto_synthesize": _node_auto_synthesize,
+            "finalize_batch": _node_finalize_batch,
+        },
+    )
+    try:
+        if (
+            ctx.state.pending_target in {"tier_review_gate", "budget_pause_gate"}
+            or ctx.state.status in {"WAITING_REVIEW", "WAITING_BUDGET"}
+        ):
+            target_gate = ctx.state.pending_target or (
+                "budget_pause_gate" if ctx.state.status == "WAITING_BUDGET" else "tier_review_gate"
+            )
+            sched.resume(
+                ctx,
+                resume_value={"action": "resume"},
+                resume_nodes=[target_gate],
+                answer_kind="BATCH_STARTED",
+                answer_payload={"job_id": job.id},
+            )
+        else:
+            ctx.record_event("BATCH_STARTED", "doc_wave", {"job_id": job.id})
+            ctx.flush()
+            ctx.refresh_state()
+            sched.drive(ctx, initial_wave=[Send("doc_wave", None)])
+    except BaseException as exc:
+        root = unwrap_wave_error(exc)
+        if root is not exc:
+            raise root from exc
+        raise
     return _job_to_dict(job)
 
 
@@ -1183,7 +1338,6 @@ def start_batch_job(
     job.status = "RUNNING"
     job.current_phase = "TIER2_PARSE" if int(job.tier2_count or 0) > 0 else "TIER1_PARSE"
     job.error_summary = ""
-    append_event(session, run, "BATCH_STARTED", "parse_batch", {"job_id": job.id})
     session.commit()
 
     if inline:
@@ -1228,7 +1382,7 @@ def start_batch_job(
         job.run_id,
         factory,
         _driver,
-        allowed_statuses=("RUNNING", "READY_REVIEW"),
+        allowed_statuses=("RUNNING", "READY_REVIEW", "WAITING_REVIEW", "PAUSED_BUDGET", "WAITING_BUDGET", "FAILED"),
         projector=project_dc_plan,
     )
     return _job_to_dict(job)
@@ -1244,7 +1398,7 @@ def cancel_batch_job(session: Session, job_id: str, *, reason: str = "操作员�
             cancel_run(
                 session,
                 run,
-                active_statuses=("RUNNING", "READY_REVIEW"),
+                active_statuses=("RUNNING", "READY_REVIEW", "WAITING_REVIEW", "PAUSED_BUDGET", "WAITING_BUDGET"),
                 reason=reason,
                 projector=project_dc_plan,
             )

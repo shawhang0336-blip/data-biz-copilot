@@ -95,13 +95,13 @@ data-biz-copilot/
 │   ├── app/
 │   │   ├── main.py                   # Layer 7: FastAPI 入口与生命周期管理
 │   │   ├── infra/                    # Layer 0: DB ORM、BlobStore、BM25 缓存、受控/流式 LLM 客户端
-│   │   ├── kernel/                   # Layer 1: ProdAgent 微内核（Bus / EventLog / Run / BudgetGuard）
-│   │   ├── policy/                   # Layer 2: Bus 去技术化门禁、实证白名单与状态机 Reducer
+│   │   ├── kernel/                   # Layer 1: ProdAgent 微内核（Bus / EventLog / Run / Plan / Scheduler / 内存态 RunContext）
+│   │   ├── policy/                   # Layer 2: Bus 双门禁、4 套静态 WorkflowPlan 拓扑、Channel 契约与事件折叠器
 │   │   ├── ingestion/                # Layer 3: Phase 0 扫描、AST/文档解析与通俗逻辑提取
 │   │   ├── catalog/                  # Layer 4: 批协调调度、双源合成、有序加工流程提炼与 CAS 编辑
 │   │   ├── copilot/                  # Layer 5: 7 大受控业务工具、强制披露与流式/兜底问答引擎
 │   │   └── api/                      # Layer 6: 4 域薄路由（platform / ingestion / catalog / copilot）
-│   └── tests/                        # 42 项离线全量测试与 AST 架构隔离守卫
+│   └── tests/                        # 45 项离线全量测试与 AST 架构隔离守卫
 ├── frontend/
 │   ├── src/
 │   │   ├── app/                      # App.jsx（路由装配）、AdminLayout.jsx（后台壳层）
@@ -123,7 +123,7 @@ data-biz-copilot/
 
 | 分组 | 方法与路径 | 说明 |
 | :--- | :--- | :--- |
-| **系统与运行观测** | `GET /api/health`、`GET /api/events/stream`、`GET /api/runs/{run_id}` | 健康检查、SSE 实时进度事件流、Run 账本与哈希链校验 |
+| **系统与运行观测** | `GET /api/health`、`GET /api/events/stream`、`GET /api/runs/{run_id}` | 健康检查、SSE 实时进度事件流、Run 账本、节点耗时 `spans` 与哈希链校验 |
 | **模型与预算治理** | `GET/PUT /api/settings/llm-config`、`GET/PUT /api/settings/execution-budget` | 模型配置持久化（密钥脱敏）、并发数/RPM/单脚本调用上限/批总预算 |
 | **双源接入与千级批处理** | `GET /api/sources`、`POST /api/sources/upload`、`POST /api/sources/load-sample`、`POST /api/sources/load-sac-real` | 单文件接入与演示/真实 SAC 语料一键载入 |
 | **大批量工程控制台** | `POST /api/sources/batch-upload`、`POST /api/sources/import-dir` | 多文件/ZIP 安全解压或本地代码仓目录扫描，返回 Phase 0 三层预览 |
@@ -163,7 +163,7 @@ npm run dev
 ### 4. 运行离线全量测试与架构红线检查（0 外部模型调用）
 
 ```bash
-# 后端全量测试（42 项：8 层单向 DAG 隔离 + Phase 0 分流 + 断点续跑 + 限流级联 + 万级 BM25 + 有序加工流程 + SSE 流式问答 + 真实 SAC 语料 + 高并发 CAS）
+# 后端全量测试（45 项：8 层单向 DAG 隔离 + 双层 Scheduler/Plan/Channel + Phase 0 分流 + 断点续跑 + 限流级联 + 万级 BM25 + 有序加工流程 + SSE 流式问答 + 真实 SAC 语料 + 高并发 CAS）
 cd backend
 ../../data-rule-studio/.venv/bin/pytest -v -W error::sqlalchemy.exc.SAWarning
 

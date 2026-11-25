@@ -23,7 +23,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 from .bus import global_bus
-from .event_log import append_event
 from .interrupt import Interrupt
 from .plan import WorkflowPlan
 from .run import (
@@ -249,7 +248,7 @@ def execute_wave(
                 raise
     else:
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [executor.submit(_guarded_worker, item) for item in items]
+            futures = [executor.submit(contextvars.copy_context().run, _guarded_worker, item) for item in items]
             ordered: List[R] = []
             failures: List[Tuple[str, BaseException]] = []
             priority_exc: Optional[BaseException] = None
@@ -503,8 +502,8 @@ class Scheduler:
             }
             if answer_payload:
                 payload.update(answer_payload)
-            append_event(ctx.session, ctx.run, answer_kind, event_node, payload, bus=ctx.bus)
-            ctx.session.flush()
+            ctx.record_event(answer_kind, event_node, payload)
+            ctx.flush()
             ctx.refresh_state()
 
         initial_wave = [Send(name, None) for name in targets] if targets else None
@@ -638,15 +637,15 @@ class Scheduler:
                             ctx.bus.drain_rejections() if hasattr(ctx.bus, "drain_rejections") else []
                         )
                         for rej in partial_rejections:
-                            append_event(ctx.session, ctx.run, "BUS_REJECTED", wave[-1].node, rej, bus=ctx.bus)
+                            ctx.record_event("BUS_REJECTED", wave[-1].node, rej)
                         for task, outcome, retry_events, *_ in partial_outcomes:
                             for kind, ev_node, payload in [*retry_events, *outcome.events]:
-                                append_event(ctx.session, ctx.run, kind, ev_node, payload, bus=ctx.bus)
+                                ctx.record_event(kind, ev_node, payload)
                             for key, value in outcome.shared.items():
                                 ctx.put(key, value)
-                        ctx.session.flush()
+                        ctx.flush()
                         ctx.refresh_state()
-                        ctx.session.commit()
+                        ctx.commit()
                     raise
 
             # ── BSP 屏障：先原子检查同波次通道并发写冲突，再按确定性顺序落账与归并 Channel ──
@@ -657,7 +656,7 @@ class Scheduler:
             bus_rejections = ctx.bus.drain_rejections() if hasattr(ctx.bus, "drain_rejections") else []
             barrier_node = wave[-1].node
             for rej in bus_rejections:
-                append_event(ctx.session, ctx.run, "BUS_REJECTED", barrier_node, rej, bus=ctx.bus)
+                ctx.record_event("BUS_REJECTED", barrier_node, rej)
 
             interrupts_hit: List[Interrupt] = []
             goto_outcome: Optional[Tuple[str, Outcome]] = None
@@ -666,7 +665,7 @@ class Scheduler:
             for task, outcome, retry_events, *_ in wave_outcomes:
                 ctx.current_node = task.node
                 for kind, ev_node, payload in [*retry_events, *outcome.events]:
-                    append_event(ctx.session, ctx.run, kind, ev_node, payload, bus=ctx.bus)
+                    ctx.record_event(kind, ev_node, payload)
                 if outcome.interrupt is not None:
                     intr = outcome.interrupt
                     if not intr.node:
@@ -679,14 +678,7 @@ class Scheduler:
                             identity=intr.identity,
                         )
                     interrupts_hit.append(intr)
-                    append_event(
-                        ctx.session,
-                        ctx.run,
-                        intr.kind,
-                        intr.node,
-                        intr.to_payload(),
-                        bus=ctx.bus,
-                    )
+                    ctx.record_event(intr.kind, intr.node, intr.to_payload())
                 for key, value in outcome.shared.items():
                     ctx.put(key, value)
                 if outcome.sends:
@@ -697,7 +689,7 @@ class Scheduler:
                 if outcome.goto and goto_outcome is None:
                     goto_outcome = (task.node, outcome)
 
-            ctx.session.flush()
+            ctx.flush()
             ctx.refresh_state()
 
             for task, outcome, _, attempts, duration_ms, call_id, idempotency_key in wave_outcomes:
@@ -739,7 +731,7 @@ class Scheduler:
 
             # 1) 一等 Interrupt：先提交事件真相，再广播 run.interrupted 并彻底放手
             if interrupts_hit:
-                ctx.session.commit()
+                ctx.commit()
                 if hasattr(ctx.bus, "fire"):
                     ctx.bus.fire(
                         "run.interrupted",
@@ -762,7 +754,7 @@ class Scheduler:
 
             # 2) 终态优先止步：先提交真相再广播终态事件，且绝不被残留 Send/Goto 复活
             if ctx.state.status in {"COMPLETED", "FAILED"}:
-                ctx.session.commit()
+                ctx.commit()
                 if hasattr(ctx.bus, "fire"):
                     topic = "run.completed" if ctx.state.status == "COMPLETED" else "run.failed"
                     ctx.bus.fire(topic, {"run_id": ctx.run.id, "node": ctx.state.current_node, "status": ctx.state.status})
@@ -779,8 +771,8 @@ class Scheduler:
                 if out.goto not in self._node_names:
                     raise ValueError(f"goto 目标不在 Plan 中：{out.goto}")
                 goto_payload = {"target": out.goto, "reason": "scheduler goto", **out.control}
-                append_event(ctx.session, ctx.run, "GO_REDIRECT", from_node, goto_payload, bus=ctx.bus)
-                ctx.session.flush()
+                ctx.record_event("GO_REDIRECT", from_node, goto_payload)
+                ctx.flush()
                 ctx.refresh_state()
                 if hasattr(ctx.bus, "fire"):
                     ctx.bus.fire("node.redirect", {"run_id": ctx.run.id, "from": from_node, **goto_payload})
@@ -793,7 +785,7 @@ class Scheduler:
 
             # 波后取消 / 预算熔断：先提交已完成波次的检查点再抛出异常
             if ctx.is_cancelled:
-                ctx.session.commit()
+                ctx.commit()
                 ctx.check_cancelled()
             ctx.check_budget()
         else:
@@ -815,10 +807,10 @@ class Scheduler:
                 )
                 runnable = [task.node for task in remaining_wave if task.node in self.bodies]
                 if runnable:
-                    ctx.session.commit()
+                    ctx.commit()
                     raise MaxWavesExceededError(max_steps, cursor, runnable)
 
-        ctx.session.commit()
+        ctx.commit()
         if hasattr(ctx.bus, "fire") and ctx.state.status.startswith("WAITING_"):
             ctx.bus.fire("run.interrupted", {"run_id": ctx.run.id, "node": ctx.state.current_node, "status": ctx.state.status})
         return executed

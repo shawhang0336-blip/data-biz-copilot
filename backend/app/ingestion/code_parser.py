@@ -8,19 +8,28 @@
 - 原始物理表名、字段名与脚本行号严格封存在 `internal_locator` 中，绝不越层泄漏。
 """
 
+import copy
 import hashlib
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.infra.contracts import ExtractedLogicEvidence
+from app.infra.llm.guard import llm_execution_scope
 from app.infra.retrieval import infer_regulatory_regime
+from app.kernel.scheduler import Outcome, Scheduler, Send
 from app.ingestion.ast_extractor import (
+    _GENERIC_CODE_DOMAINS,
+    _compute_upstream_step_map,
+    _extract_group_with_llm,
+    _plan_code_structure_with_llm,
     enrich_script_evidences_with_llm,
     extract_sql_ast_skeleton,
-    plan_and_extract_script_evidences,
     synthesize_generic_business_semantics,
     translate_evidence_with_llm,
 )
+from app.policy.dc_bus import default_bus, detect_technical_jargon, sanitize_business_text
+from app.policy.dc_channels import build_code_parse_context
+from app.policy.dc_plan import CODE_PARSE_PLAN, unwrap_wave_error
 
 
 def _unwrap_execute_immediate(sql_text: str) -> str:
@@ -655,21 +664,20 @@ def _parse_schema_ddl_by_domain(filename: str, text: str) -> List[ExtractedLogic
     return evidences
 
 
-def parse_code_logic(
-    filename: str,
-    content: bytes,
-    *,
-    llm: Any = None,
-    bus: Any = None,
-    execution_mode: str = "full",
-    upstream_context: Optional[List[Dict[str, Any]]] = None,
-) -> List[ExtractedLogicEvidence]:
-    """把 SQL / 存储过程代码切块并结合 sqlglot AST 静默提炼为纯业务语义的底层实证清单。"""
-    text = content.decode("utf-8", errors="replace")
+def _extract_code_skeleton_state(filename: str, text: str) -> Dict[str, Any]:
+    """将代码文本切分并提取 AST 骨架与确定性业务草稿。"""
     if filename.upper() == "SAC_TABLE_SCHEMAS.SQL" or (
         text.upper().count("CREATE TABLE") >= 10 and text.upper().count("CREATE OR REPLACE") == 0
     ):
-        return _parse_schema_ddl_by_domain(filename, text)
+        return {
+            "ddl_only": True,
+            "evidences": _parse_schema_ddl_by_domain(filename, text),
+            "banner": "",
+            "step_sql_contexts": [],
+            "comments_pool": [],
+            "any_sac": False,
+            "single_generic_info": None,
+        }
 
     banner = _extract_procedure_banner(text)
     script_regime = infer_regulatory_regime(filename, banner, text[:2000])
@@ -750,42 +758,191 @@ def parse_code_logic(
         evidences.append(ev)
         step_sql_contexts.append(dict(skeleton.get("logic_details") or {}))
 
-    if execution_mode != "static_only" and llm is not None and bus is not None and evidences:
+    return {
+        "ddl_only": False,
+        "evidences": evidences,
+        "banner": banner,
+        "step_sql_contexts": step_sql_contexts,
+        "comments_pool": comments_pool,
+        "any_sac": any_sac,
+        "single_generic_info": single_generic_info,
+    }
+
+
+def parse_code_logic(
+    filename: str,
+    content: bytes,
+    *,
+    llm: Any = None,
+    bus: Any = None,
+    execution_mode: str = "full",
+    upstream_context: Optional[List[Dict[str, Any]]] = None,
+) -> List[ExtractedLogicEvidence]:
+    """把 SQL / 存储过程代码经内层纯内存 `Scheduler(CODE_PARSE_PLAN)` 驱动四阶段 BSP 解析为纯业务实证清单。"""
+    text = content.decode("utf-8", errors="replace")
+    llm_bus = bus
+    ctx = build_code_parse_context(
+        filename,
+        text,
+        execution_mode=execution_mode,
+        upstream_context=upstream_context,
+        llm=llm,
+        bus=default_bus(),
+        concurrency=4,
+    )
+
+    def _run_with_llm_scope(fn):
+        if llm_bus is not None:
+            with llm_execution_scope(bus=llm_bus):
+                return fn()
+        return fn()
+
+    def _node_extract_skeleton(_inp: Any, _ctx: Any) -> Outcome:
+        state = _extract_code_skeleton_state(filename, text)
+        evs = state["evidences"]
+        is_ddl_or_empty = bool(state["ddl_only"] or not evs)
+        return Outcome(
+            when="ddl_only" if is_ddl_or_empty else "always",
+            shared={"chunk_count": len(evs), "evidences": evs},
+            output=state,
+            events=[
+                (
+                    "CODE_SKELETON_EXTRACTED",
+                    "extract_skeleton",
+                    {"filename": filename, "chunk_count": len(evs), "ddl_only": bool(state["ddl_only"])},
+                )
+            ],
+        )
+
+    def _node_survey_and_plan(state: Dict[str, Any], _ctx: Any) -> Outcome:
+        evidences: List[ExtractedLogicEvidence] = state["evidences"]
+        banner: str = state["banner"]
+        step_sql_contexts: List[Dict[str, Any]] = state["step_sql_contexts"]
+        comments_pool: List[str] = state["comments_pool"]
+        any_sac: bool = bool(state["any_sac"])
+        single_generic_info = state["single_generic_info"]
+
+        if execution_mode == "static_only" or llm is None or llm_bus is None or not evidences:
+            return Outcome(
+                when="direct",
+                output={"evidences": evidences},
+                events=[("CODE_STRUCTURE_PLANNED", "survey_and_plan", {"mode": execution_mode, "fanout": 0})],
+            )
+
         if execution_mode == "lite":
-            enrich_script_evidences_with_llm(
-                filename,
-                banner,
-                evidences,
-                comments_pool,
-                llm=llm,
-                bus=bus,
-                step_sql_contexts=step_sql_contexts,
-                is_sac_script=any_sac,
-                upstream_context=upstream_context,
-                lite_mode=True,
+            _run_with_llm_scope(
+                lambda: enrich_script_evidences_with_llm(
+                    filename,
+                    banner,
+                    evidences,
+                    comments_pool,
+                    llm=llm,
+                    bus=llm_bus,
+                    step_sql_contexts=step_sql_contexts,
+                    is_sac_script=any_sac,
+                    upstream_context=upstream_context,
+                    lite_mode=True,
+                )
             )
-        elif len(evidences) >= 2:
-            evidences = plan_and_extract_script_evidences(
-                filename,
-                banner,
-                evidences,
-                comments_pool,
-                is_sac_script=any_sac,
-                llm=llm,
-                bus=bus,
-                step_sql_contexts=step_sql_contexts,
-                upstream_context=upstream_context,
+            return Outcome(
+                when="direct",
+                output={"evidences": evidences},
+                events=[("CODE_STRUCTURE_PLANNED", "survey_and_plan", {"mode": "lite", "fanout": 0})],
             )
-        elif not any_sac and single_generic_info is not None:
+
+        if len(evidences) >= 2:
+            clean_comments = [
+                sanitize_business_text(c)
+                for c in dict.fromkeys(comments_pool)
+                if c and not detect_technical_jargon(sanitize_business_text(c))
+            ][:10]
+            upstream_map = _compute_upstream_step_map(evidences)
+            code_plan, groups = _run_with_llm_scope(
+                lambda: _plan_code_structure_with_llm(
+                    filename,
+                    banner,
+                    evidences,
+                    comments_pool,
+                    is_sac_script=any_sac,
+                    llm=llm,
+                    bus=llm_bus,
+                )
+            )
+            step_to_stage = (code_plan or {}).get("step_to_stage") or {}
+            if not step_to_stage:
+                step_to_stage = {idx: g["stage_title"] for g in groups for idx in g["step_indices"]}
+
+            sends: List[Send] = []
+            for order_idx, g in enumerate(groups):
+                if g["stage_role"] == "IGNORE":
+                    continue
+                group_indices = list(g["step_indices"])
+                group_set = set(group_indices)
+                upstream_stages = list(
+                    dict.fromkeys(
+                        step_to_stage[u]
+                        for i in group_indices
+                        for u in upstream_map.get(i, [])
+                        if u not in group_set and u in step_to_stage
+                    )
+                )
+                group_evs = [copy.deepcopy(evidences[i]) for i in group_indices]
+                group_sql_contexts = [
+                    step_sql_contexts[i] for i in group_indices if 0 <= i < len(step_sql_contexts)
+                ]
+                for ev in group_evs:
+                    if not any_sac or ev.business_domain_hint in _GENERIC_CODE_DOMAINS:
+                        ev.business_domain_hint = g["business_domain"]
+                sends.append(
+                    Send(
+                        "translate_stage_worker",
+                        {
+                            "order_idx": order_idx,
+                            "banner": banner,
+                            "group_indices": group_indices,
+                            "group_evs": group_evs,
+                            "clean_comments": clean_comments,
+                            "domain": g["business_domain"],
+                            "code_plan": code_plan,
+                            "stage_meta": {**g, "upstream_stages": upstream_stages},
+                            "group_sql_contexts": group_sql_contexts,
+                            "is_sac_script": any_sac,
+                        },
+                        label=f"stage-{order_idx}:{str(g['stage_title'])[:24]}",
+                    )
+                )
+            if not sends:
+                return Outcome(
+                    when="direct",
+                    shared={"code_plan": code_plan},
+                    output={"evidences": []},
+                    events=[("CODE_STRUCTURE_PLANNED", "survey_and_plan", {"mode": execution_mode, "fanout": 0})],
+                )
+            return Outcome(
+                when="fanout",
+                shared={"code_plan": code_plan},
+                sends=sends,
+                events=[
+                    (
+                        "CODE_STRUCTURE_PLANNED",
+                        "survey_and_plan",
+                        {"mode": execution_mode, "fanout": len(sends), "stages": len(groups)},
+                    )
+                ],
+            )
+
+        if not any_sac and single_generic_info is not None:
             sk, cm, gen = single_generic_info
-            translated = translate_evidence_with_llm(
-                sk,
-                cm,
-                gen,
-                llm=llm,
-                bus=bus,
-                sql_context=step_sql_contexts[0],
-                upstream_context=upstream_context,
+            translated = _run_with_llm_scope(
+                lambda: translate_evidence_with_llm(
+                    sk,
+                    cm,
+                    gen,
+                    llm=llm,
+                    bus=llm_bus,
+                    sql_context=step_sql_contexts[0],
+                    upstream_context=upstream_context,
+                )
             )
             ev0 = evidences[0]
             ev0.business_domain_hint = translated["business_domain_hint"]
@@ -799,16 +956,101 @@ def parse_code_logic(
             ev0.dedup_grain_hint = translated["dedup_grain_hint"]
             ev0.internal_locator["plan_stage"] = "SINGLE_STEP"
             ev0.internal_locator["ai_refined"] = True
-        else:
-            enrich_script_evidences_with_llm(
+            return Outcome(
+                when="direct",
+                output={"evidences": evidences},
+                events=[("CODE_STRUCTURE_PLANNED", "survey_and_plan", {"mode": "single_generic", "fanout": 0})],
+            )
+
+        _run_with_llm_scope(
+            lambda: enrich_script_evidences_with_llm(
                 filename,
                 banner,
                 evidences,
                 comments_pool,
                 llm=llm,
-                bus=bus,
+                bus=llm_bus,
                 step_sql_contexts=step_sql_contexts,
                 is_sac_script=any_sac,
                 upstream_context=upstream_context,
             )
-    return evidences
+        )
+        return Outcome(
+            when="direct",
+            output={"evidences": evidences},
+            events=[("CODE_STRUCTURE_PLANNED", "survey_and_plan", {"mode": "single_sac", "fanout": 0})],
+        )
+
+    def _node_translate_stage_worker(task_data: Dict[str, Any], _ctx: Any) -> Outcome:
+        group_indices: List[int] = task_data["group_indices"]
+        group_evs: List[ExtractedLogicEvidence] = task_data["group_evs"]
+        _run_with_llm_scope(
+            lambda: _extract_group_with_llm(
+                task_data["banner"],
+                group_evs,
+                task_data["clean_comments"],
+                domain=task_data["domain"],
+                code_plan=task_data["code_plan"],
+                stage_meta=task_data["stage_meta"],
+                llm=llm,
+                bus=llm_bus,
+                group_sql_contexts=task_data["group_sql_contexts"],
+                is_sac_script=task_data["is_sac_script"],
+                upstream_context=upstream_context,
+            )
+        )
+        stage_pairs = list(zip(group_indices, group_evs))
+        return Outcome(
+            shared={
+                "stage_results": {task_data["order_idx"]: stage_pairs},
+                "translated_count": len(group_indices),
+            },
+            output={"order_idx": task_data["order_idx"], "pairs": stage_pairs},
+            events=[
+                (
+                    "CODE_STAGE_TRANSLATED",
+                    "translate_stage_worker",
+                    {
+                        "stage_title": task_data["stage_meta"]["stage_title"],
+                        "step_count": len(group_indices),
+                        "label": task_data["stage_meta"]["stage_title"],
+                    },
+                )
+            ],
+        )
+
+    def _node_validate_and_finalize(payload: Any, local_ctx: Any) -> Outcome:
+        stage_results = local_ctx.get("stage_results")
+        if isinstance(stage_results, dict) and stage_results:
+            by_step: Dict[int, ExtractedLogicEvidence] = {}
+            for _order_idx, pairs in stage_results.items():
+                for step_idx, ev in pairs:
+                    by_step[int(step_idx)] = ev
+            final_evs = [by_step[i] for i in sorted(by_step.keys())]
+        elif isinstance(payload, dict) and "evidences" in payload:
+            final_evs = list(payload["evidences"])
+        else:
+            final_evs = list(local_ctx.get("evidences") or [])
+        return Outcome(
+            shared={"final_evidences": final_evs},
+            output=final_evs,
+            events=[("CODE_PARSED", "validate_and_finalize", {"filename": filename, "evidence_count": len(final_evs)})],
+        )
+
+    sched = Scheduler(
+        CODE_PARSE_PLAN,
+        {
+            "extract_skeleton": _node_extract_skeleton,
+            "survey_and_plan": _node_survey_and_plan,
+            "translate_stage_worker": _node_translate_stage_worker,
+            "validate_and_finalize": _node_validate_and_finalize,
+        },
+    )
+    try:
+        sched.drive(ctx, max_workers=4)
+    except BaseException as exc:
+        root = unwrap_wave_error(exc)
+        if root is not exc:
+            raise root from exc
+        raise
+    return list(ctx.get("final_evidences") or [])
