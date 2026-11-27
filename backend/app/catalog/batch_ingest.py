@@ -69,7 +69,7 @@ from app.policy.dc_channels import build_batch_ingest_context
 from app.policy.dc_plan import BATCH_INGEST_PLAN, project as project_dc_plan, unwrap_wave_error
 
 CODE_EXTENSIONS = {"sql", "prc", "pck", "bdy", "ddl", "hql", "plsql", "pls"}
-DOC_EXTENSIONS = {"md", "txt", "docx", "pdf", "xlsx", "csv"}
+DOC_EXTENSIONS = {"md", "txt", "docx", "doc", "pdf", "xlsx", "xls", "csv"}
 IGNORED_DIR_NAMES = {".git", "__MACOSX", "node_modules", "__pycache__", ".venv", "venv", ".idea", ".vscode"}
 TERMINAL_MATERIAL_STATUSES = {"PARSED", "SKIPPED_AI"}
 

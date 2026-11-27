@@ -20,7 +20,7 @@
 | **Layer 3** | `app/ingestion/` | 双源接入与静默解析层：`project_scanner.py`（Phase 0 零模型扫描、归一化 AST 模板指纹聚簇、跨脚本读写表 DAG 与三层分流）、`code_parser.py`（SQL/PLSQL/动态 SQL 切块，支持 `full` / `lite` / `static_only`）、`ast_extractor.py`（`sqlglot` AST 逻辑细节抽取、Plan-then-Extract、脱敏 `upstream_context` 注入）、`doc_parser.py`（PDF/DOCX/XLSX/MD 双阶段制度条款提炼）、`builtin_pack.py` |
 | **Layer 4** | `app/catalog/` | 业务资产合成与批协调层：`batch_ingest.py`（ZIP 安全解压/目录扫描、四波次异步流式调度、主线程逐脚本 SQLite Checkpoint、断点续跑与重启自愈）、`synthesizer.py`（克隆折叠/结构去重/Tier 2 隔离、跨源域对齐、双维分批提炼、`target_domains` 增量合成）、`views.py`（纯业务视图与缓存版本号签名）、`mutations.py`（CAS 乐观锁修改与人工确认 + 缓存失效） |
 | **Layer 5** | `app/copilot/` | 智能问答层：`business_tools.py`（7 个受控纯业务工具 + 跨业务域均衡轮转）、`disclosure.py`（结构化披露器）、`answer_engine.py`（`plan_copilot_tools` → 工具召回 → `compose_business_answer` → 门禁校验与会话持久化） |
-| **Layer 6** | `app/api/` | 极薄路由层（严禁跨子域互导）：`platform/system.py`、`ingestion/sources.py`、`catalog/assets.py`、`copilot/chat.py` |
+| **Layer 6** | `app/api/` | 极薄路由层（严禁跨子域互导）：`platform/system.py`（+ `audit_service.py` 全链路 SHA-256 审计与双门禁统计）、`ingestion/sources.py`、`catalog/assets.py`（含 `/revisions` 与 `/rule-studio-export`）、`copilot/chat.py` |
 | **Layer 7** | `app/main.py` | FastAPI 应用装配、CORS 与 `lifespan`（启动自动调用 `init_db()` 与 `recover_stale_batch_jobs()`） |
 
 ---
@@ -79,13 +79,13 @@
 ## 6. 前端四域工作台约束（`frontend/src/`）
 
 由 [frontend_audit.test.mjs](../frontend/tests/frontend_audit.test.mjs) 守护：
-1. `src/features/` 严格保持 4 个目录对称：`ingestion/`（含 [SourcesPage.jsx](../frontend/src/features/ingestion/SourcesPage.jsx) 与 [BatchJobPanel.jsx](../frontend/src/features/ingestion/BatchJobPanel.jsx)）、`catalog/`、`copilot/`、`platform/`；
-2. 全部 HTTP 请求严格收敛于 `src/api/`（`api/client.js`、`ingestion.js`、`catalog.js`、`copilot.js`、`platform.js`），组件内严禁出现直接 `fetch(`；
+1. `src/` 收敛为 7 个职责正交目录（`api / app / components / context / features / styles / utils`），`src/features/` 严格保持 4 个目录对称：`ingestion/`（含 [SourcesPage.jsx](../frontend/src/features/ingestion/SourcesPage.jsx) 与 [BatchJobPanel.jsx](../frontend/src/features/ingestion/BatchJobPanel.jsx)）、`catalog/`（含 [AssetsPage.jsx](../frontend/src/features/catalog/AssetsPage.jsx) 与 [VersionsPage.jsx](../frontend/src/features/catalog/VersionsPage.jsx)）、`copilot/`、`platform/`（含 [AuditCenterPage.jsx](../frontend/src/features/platform/AuditCenterPage.jsx) 与 [SettingsPage.jsx](../frontend/src/features/platform/SettingsPage.jsx)）；
+2. 全部 HTTP 请求严格收敛于 `src/api/`（`api/client.js`、`ingestion.js`、`catalog.js`、`copilot.js`、`platform.js`），组件内严禁出现直接 `fetch(`，且下层 `api/components/context/utils` 严禁反向导入 `features/` 或 `app/`；
 3. `src/utils/labels.js` 中的所有界面映射标签严禁包含任何 SQL/表名/技术实现黑话。
 
 ---
 
-## 7. 自动化测试矩阵（`backend/tests/` 共 45 项）
+## 7. 自动化测试矩阵（`backend/tests/` 共 48 项）
 
 - [test_architecture_isolation.py](tests/test_architecture_isolation.py)：8 层目录、单向 DAG 依赖、`kernel` 零业务引用、`policy` 零全局副作用与 4 套 `WorkflowPlan` 静态拓扑校验、API 路由防交叉导入
 - [test_dual_layer_scheduler_plans.py](tests/test_dual_layer_scheduler_plans.py)：内层纯内存 `RunContext`（`MemoryRun`/`MemoryEvent`）与 `AmbiguousWriteError` 并发写门禁、`CODE_PARSE_PLAN`/`DOC_PARSE_PLAN` 内层调度、外层 `BATCH_INGEST_PLAN` 挂起恢复与 `ASSET_SYNTHESIS_PLAN` 闭环 + `/api/runs/{run_id}` 耗时 `spans` 观测

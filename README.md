@@ -16,10 +16,12 @@
 - **逐字流式 Markdown 解答**：支持上游大模型逐 token 实时输出，AI 结合问题性质自主判断是否展开通俗加工步骤，支持 Markdown 分支对照表、基于已有条件的通俗举例、分歧与未落地提醒以及延伸追问列表。
 - **右侧参考依据抽屉**：点击回答下方编号依据标签，右侧滑出展示系统运行实证数、按真实执行先后顺序分组的「加工流程一 / 二」（含阶段角色及纳入、剔除、分支、计算、去重细节）以及对应制度原文条款。
 
-### 2. 后台：平台管理（`/admin/*`）
-深色左侧导航栏搭配浅色表格化管理工作区，右上角与侧边栏底部均支持一键返回前台业务问答：
-- **知识材料（`/admin/sources`）**：顶部 4 格统计条与可折叠三模式导入区（即时上传 / ZIP 与文件夹批量工程 / 服务端本地目录扫描），集成大批量分流与断点续跑控制台，以及带搜索和分类筛选的分页材料表。
-- **业务资产（`/admin/assets`）**：统一统计条与 4 个下划线标签页（业务版图、处理规则、指标口径、制度对照），支持监管体系与金融十大主题双维筛选、分页数据表、右侧详情与加工步骤抽屉及人工释义编辑弹窗。
+### 2. 后台：银行治理管理台（`/admin/*`）
+深色左侧导航栏搭配浅/深色可切换工作区，顶栏集成后端在线健康探测胶囊、深浅外观切换及一键返回前台业务问答：
+- **知识材料（`/admin/sources`）**：顶部 4 格统计条与可折叠三模式导入区（即时上传 / ZIP 与文件夹批量工程 / 服务端本地目录扫描），支持 `PDF / DOCX / DOC / XLSX / XLS / Markdown / TXT` 制度文档与多方言 SQL 脚本，集成大批量分流与断点续跑控制台。
+- **业务资产（`/admin/assets`）**：顶部统一接入 **商业银行两级监管切换条（一级监管机构 `NFRA / PBOC / SAFE / OTHER` → 二级监管报表 `一表通 / EAST / 1104 / PLUS / 人行统计 / SAFE`）**，与金融十大主题双维交叉筛选，提供 4 个标签页（业务版图、处理规则、指标口径、制度对照）、分页数据表、右侧实证加工步骤抽屉及人工释义编辑弹窗。
+- **变更与对账（`/admin/versions`）**：聚合 `asset_revisions` 呈现人工释义修订前后 Diff 与业务确认记录，集中跟进 `DIVERGENT`（口径分歧）与 `UNREALIZED`（尚未系统包含）项并支持一键 CAS 确权，同时支持导出 **整改评审报告（`.md`）** 与标准监管编码映射的 **Data Rule Studio 整改交接包（`.json`）**。
+- **审计中心（`/admin/audit`）**：独立全链路合规审计台，实时重算全部批摄入与资产合成账本的 SHA-256 哈希链，提供 4 视图核查工作台（逐条哈希链防篡改验签、波次与节点耗时瀑布、去技术化防泄露 + 实证白名单双门禁拦截清单、端到端加密指纹及 `.json` 审计证据包导出）。
 - **系统配置（`/admin/settings`）**：大模型服务端点与运行模式配置，以及并发频率限制与任务额度保护设置。
 
 ---
@@ -100,20 +102,22 @@ data-biz-copilot/
 │   │   ├── ingestion/                # Layer 3: Phase 0 扫描、AST/文档解析与通俗逻辑提取
 │   │   ├── catalog/                  # Layer 4: 批协调调度、双源合成、有序加工流程提炼与 CAS 编辑
 │   │   ├── copilot/                  # Layer 5: 7 大受控业务工具、强制披露与流式/兜底问答引擎
-│   │   └── api/                      # Layer 6: 4 域薄路由（platform / ingestion / catalog / copilot）
-│   └── tests/                        # 45 项离线全量测试与 AST 架构隔离守卫
+│   │   └── api/                      # Layer 6: 4 域薄路由（platform 含 audit_service / ingestion / catalog / copilot）
+│   └── tests/                        # 48 项离线全量测试与 AST 架构隔离守卫
 ├── frontend/
 │   ├── src/
-│   │   ├── app/                      # App.jsx（路由装配）、AdminLayout.jsx（后台壳层）
+│   │   ├── app/                      # App.jsx（ThemeProvider + React.lazy 路由装配）、AdminLayout.jsx（5 项治理侧边栏 + 健康胶囊/主题切换）
 │   │   ├── api/                      # 统一 API 客户端与流式 SSE 封装（client / copilot / catalog / ingestion / platform）
+│   │   ├── components/               # 通用 UI 底座（SelectDropdown / CopyButton / BackendHealthPill）
+│   │   ├── context/                  # 全局状态（ThemeContext 浅/深色外观持久化）
 │   │   ├── features/
 │   │   │   ├── copilot/              # 前台业务问答台（CopilotPage.jsx）与参考依据抽屉（EvidenceDrawer.jsx）
 │   │   │   ├── ingestion/            # 知识材料导入与批任务控制台（SourcesPage.jsx / BatchJobPanel.jsx）
-│   │   │   ├── catalog/              # 业务资产台账与详情抽屉（AssetsPage.jsx）
-│   │   │   └── platform/             # 模型与运行预算配置（SettingsPage.jsx）
-│   │   ├── styles/index.css          # 全站视觉体系与响应式布局
-│   │   └── utils/                    # 业务文案词表（labels.js）、Markdown 表格渲染（markdown.jsx）、内联图标（icons.jsx）
-│   └── tests/frontend_audit.test.mjs # 4 项前端目录对称、fetch 隔离与纯业务词表审计测试
+│   │   │   ├── catalog/              # 业务资产台账（AssetsPage.jsx）与变更对账整改中心（VersionsPage.jsx）
+│   │   │   └── platform/             # 全链路合规审计中心（AuditCenterPage.jsx）与系统配置（SettingsPage.jsx）
+│   │   ├── styles/index.css          # 全站浅/深色视觉体系、银行两级监管切换栏与治理工作台样式
+│   │   └── utils/                    # 银行监管字典（bankingTaxonomy.js）、UTC 时间解析（dateTime.js）、业务词表（labels.js）、Markdown 表格渲染（markdown.jsx）与图标（icons.jsx）
+│   └── tests/frontend_audit.test.mjs # 5 项前端目录对称、单向层依赖、fetch 隔离、银行分类字典与纯业务词表审计测试
 └── README.md
 ```
 
@@ -123,12 +127,12 @@ data-biz-copilot/
 
 | 分组 | 方法与路径 | 说明 |
 | :--- | :--- | :--- |
-| **系统与运行观测** | `GET /api/health`、`GET /api/events/stream`、`GET /api/runs/{run_id}` | 健康检查、SSE 实时进度事件流、Run 账本、节点耗时 `spans` 与哈希链校验 |
+| **系统与全链路审计** | `GET /api/health`、`GET /api/events/stream`、`GET /api/runs/audit-overview`、`GET /api/runs/{run_id}/audit-detail`、`GET /api/runs/{run_id}` | 健康检查、SSE 实时进度流、全量 SHA-256 哈希链实时验签、双门禁拦截明细、波次耗时瀑布与合规指纹档案 |
 | **模型与预算治理** | `GET/PUT /api/settings/llm-config`、`GET/PUT /api/settings/execution-budget` | 模型配置持久化（密钥脱敏）、并发数/RPM/单脚本调用上限/批总预算 |
 | **双源接入与千级批处理** | `GET /api/sources`、`POST /api/sources/upload`、`POST /api/sources/load-sample`、`POST /api/sources/load-sac-real` | 单文件接入与演示/真实 SAC 语料一键载入 |
 | **大批量工程控制台** | `POST /api/sources/batch-upload`、`POST /api/sources/import-dir` | 多文件/ZIP 安全解压或本地代码仓目录扫描，返回 Phase 0 三层预览 |
 | **批任务控制与调级** | `GET /api/sources/jobs`、`GET /api/sources/jobs/{job_id}`、`PATCH /api/sources/jobs/{job_id}/materials/{material_id}/tier`、`POST /api/sources/jobs/{job_id}/{start\|cancel\|resume}` | 分页查看三层明细、手工覆盖分层、启动/中止/断点续跑/仅重试失败项 |
-| **资产合成与治理** | `POST /api/sources/synthesize`、`GET /api/assets/panorama`、`GET /api/assets/{capabilities\|rules\|calibers\|reconcile}`、`PATCH/POST /api/assets/{rules\|calibers}/{id}/confirm`、`GET /api/assets/backing/{asset_code}` | 支持全量或 `target_domains` 增量合成、双维过滤、CAS 乐观锁人工确认，以及按执行顺序返回的 `processing_steps` 与条款依据 |
+| **资产合成、变更与跨产品交接** | `POST /api/sources/synthesize`、`GET /api/assets/panorama`、`GET /api/assets/{capabilities\|rules\|calibers\|reconcile\|revisions}`、`GET /api/assets/rule-studio-export`、`PATCH/POST /api/assets/{rules\|calibers}/{id}/confirm`、`GET /api/assets/backing/{asset_code}` | 支持全量或增量合成、商业银行一级机构/二级报表/十大主题立体过滤、修订动态流、CAS 乐观锁人工确认及 Rule Studio 整改条款交接导出 |
 | **智能问答 Copilot** | `GET /api/copilot/tools`、`POST /api/copilot/ask`、`POST /api/copilot/ask/stream`、`GET /api/copilot/sessions`、`GET /api/copilot/sessions/{session_id}` | 7 个受控业务工具、同步与 SSE 实时思考/流式问答、多轮会话列表与核验追溯 |
 
 ---
@@ -163,7 +167,7 @@ npm run dev
 ### 4. 运行离线全量测试与架构红线检查（0 外部模型调用）
 
 ```bash
-# 后端全量测试（45 项：8 层单向 DAG 隔离 + 双层 Scheduler/Plan/Channel + Phase 0 分流 + 断点续跑 + 限流级联 + 万级 BM25 + 有序加工流程 + SSE 流式问答 + 真实 SAC 语料 + 高并发 CAS）
+# 后端全量测试（48 项：8 层单向 DAG 隔离 + 双层 Scheduler/Plan/Channel + 全链路防篡改审计中心 + 变更流与 Rule Studio 交接 + Phase 0 分流 + 断点续跑 + 限流级联 + 万级 BM25 + 有序加工流程 + SSE 流式问答 + 真实 SAC 语料 + 高并发 CAS）
 cd backend
 ../../data-rule-studio/.venv/bin/pytest -v -W error::sqlalchemy.exc.SAWarning
 

@@ -2,14 +2,15 @@
 
 import json
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.api.common import db_session
+from app.api.platform.audit_service import build_audit_overview, build_audit_run_detail
 from app.infra.config import DEFAULT_BUDGET, get_budget, get_llm_config, get_settings
 from app.infra.db_tables import EventModel, RunModel, SystemSettingModel
 from app.kernel.bus import global_bus
@@ -62,6 +63,23 @@ async def stream_events(request: Request):
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(_generator(), media_type="text/event-stream")
+
+
+@router.get("/runs/audit-overview")
+def audit_overview(
+    run_kind: Optional[str] = Query(default="ALL"),
+    limit: int = Query(default=100, ge=1, le=500),
+    session: Session = Depends(db_session),
+) -> Dict[str, Any]:
+    return build_audit_overview(session, run_kind=run_kind, limit=limit)
+
+
+@router.get("/runs/{run_id}/audit-detail")
+def audit_run_detail(run_id: str, session: Session = Depends(db_session)) -> Dict[str, Any]:
+    run = session.get(RunModel, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return build_audit_run_detail(session, run)
 
 
 @router.get("/runs/{run_id}")

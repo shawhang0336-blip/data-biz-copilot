@@ -14,8 +14,10 @@ from app.catalog.mutations import (
     update_business_rule,
 )
 from app.catalog.views import (
+    export_rule_studio_handoff,
     get_asset_backing_detail,
     get_asset_panorama,
+    list_asset_revisions,
     list_business_calibers,
     list_business_rules,
     list_capabilities,
@@ -45,8 +47,12 @@ def panorama(session: Session = Depends(db_session)) -> Dict[str, Any]:
 
 
 @router.get("/capabilities")
-def capabilities(session: Session = Depends(db_session)) -> List[Dict[str, Any]]:
-    return list_capabilities(session)
+def capabilities(
+    agency: Optional[str] = None,
+    regime: Optional[str] = None,
+    session: Session = Depends(db_session),
+) -> List[Dict[str, Any]]:
+    return list_capabilities(session, agency=agency, regime=regime)
 
 
 @router.get("/rules")
@@ -54,6 +60,7 @@ def rules(
     capability_id: Optional[str] = None,
     rule_category: Optional[str] = None,
     reconcile_status: Optional[str] = None,
+    agency: Optional[str] = None,
     regime: Optional[str] = None,
     sub_domain: Optional[str] = None,
     subject_theme: Optional[str] = None,
@@ -64,6 +71,7 @@ def rules(
         capability_id=capability_id,
         rule_category=rule_category,
         reconcile_status=reconcile_status,
+        agency=agency,
         regime=regime,
         sub_domain=sub_domain,
         subject_theme=subject_theme,
@@ -110,6 +118,7 @@ def confirm_rule(rule_id: str, req: AssetConfirmRequest, session: Session = Depe
 def calibers(
     capability_id: Optional[str] = None,
     reconcile_status: Optional[str] = None,
+    agency: Optional[str] = None,
     regime: Optional[str] = None,
     sub_domain: Optional[str] = None,
     subject_theme: Optional[str] = None,
@@ -119,6 +128,7 @@ def calibers(
         session,
         capability_id=capability_id,
         reconcile_status=reconcile_status,
+        agency=agency,
         regime=regime,
         sub_domain=sub_domain,
         subject_theme=subject_theme,
@@ -162,8 +172,44 @@ def confirm_caliber(caliber_id: str, req: AssetConfirmRequest, session: Session 
 
 
 @router.get("/reconcile")
-def reconcile(session: Session = Depends(db_session)) -> Dict[str, Any]:
-    return list_reconcile_ledger(session)
+def reconcile(
+    agency: Optional[str] = None,
+    regime: Optional[str] = None,
+    session: Session = Depends(db_session),
+) -> Dict[str, Any]:
+    return list_reconcile_ledger(session, agency=agency, regime=regime)
+
+
+@router.get("/revisions")
+def revisions(
+    asset_kind: Optional[str] = None,
+    revision_kind: Optional[str] = None,
+    agency: Optional[str] = None,
+    regime: Optional[str] = None,
+    human_only: bool = False,
+    limit: int = 120,
+    session: Session = Depends(db_session),
+) -> Dict[str, Any]:
+    return list_asset_revisions(
+        session,
+        asset_kind=asset_kind,
+        revision_kind=revision_kind,
+        agency=agency,
+        regime=regime,
+        human_only=human_only,
+        limit=max(1, min(limit, 500)),
+    )
+
+
+@router.get("/rule-studio-export")
+def rule_studio_export(
+    agency: Optional[str] = None,
+    regime: Optional[str] = None,
+    status: Optional[str] = None,
+    session: Session = Depends(db_session),
+) -> Dict[str, Any]:
+    statuses = tuple(s.strip().upper() for s in status.split(",") if s.strip()) if status else ("UNREALIZED", "DIVERGENT")
+    return export_rule_studio_handoff(session, agency=agency, regime=regime, statuses=statuses)
 
 
 @router.get("/backing/{asset_code}")

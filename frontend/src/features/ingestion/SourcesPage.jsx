@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { useOutletContext } from 'react-router-dom'
+import { useNavigate, useOutletContext } from 'react-router-dom'
 import {
   batchUploadSources,
   importDirectorySources,
@@ -37,6 +37,7 @@ function formatDateShort(iso) {
 }
 
 export default function SourcesPage({ onSynthesized }) {
+  const navigate = useNavigate()
   const outletContext = useOutletContext() || {}
   const { refreshStats } = outletContext
 
@@ -241,6 +242,9 @@ export default function SourcesPage({ onSynthesized }) {
           <button type="button" className="btn" disabled={busy} onClick={handleLoadSample}>
             载入演示样例
           </button>
+          <button type="button" className="btn" onClick={() => navigate('/admin/audit')}>
+            审计中心 →
+          </button>
           <button type="button" className="btn btn-primary" disabled={busy} onClick={handleSynthesize}>
             <RefreshIcon size={14} />
             <span>{busy ? '处理中…' : '同步更新知识库'}</span>
@@ -339,7 +343,7 @@ export default function SourcesPage({ onSynthesized }) {
                     点击选择文件上传（支持多选）
                   </span>
                   <span style={{ fontSize: 12, color: '#64748b' }}>
-                    支持 PDF / DOCX / XLSX / Markdown / TXT 制度文档及 SQL 逻辑脚本
+                    支持 PDF / DOCX / DOC / XLSX / XLS / Markdown / TXT 制度文档及 SQL 逻辑脚本
                   </span>
                 </label>
               </div>
@@ -351,7 +355,7 @@ export default function SourcesPage({ onSynthesized }) {
                   <input
                     type="file"
                     multiple
-                    accept=".zip,.sql,.prc,.pck,.bdy,.ddl,.hql,.md,.txt,.docx,.pdf,.xlsx,.csv"
+                    accept=".zip,.sql,.prc,.pck,.bdy,.ddl,.hql,.md,.txt,.docx,.doc,.pdf,.xlsx,.xls,.csv"
                     className="sr-only"
                     onChange={handleBatchFiles}
                     disabled={busy}

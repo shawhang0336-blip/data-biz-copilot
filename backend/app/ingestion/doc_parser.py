@@ -274,6 +274,37 @@ def _extract_raw_text(filename: str, content: bytes) -> str:
                 raise ValueError(f"PDF 文本提取失败：{exc.stderr or exc}") from exc
         cleaned_lines = [re.sub(r"[ \t]{3,}", "  ", ln.rstrip()) for ln in proc.stdout.splitlines()]
         return "\n".join(cleaned_lines)
+    if lower.endswith(".doc"):
+        with tempfile.NamedTemporaryFile(suffix=".doc") as tmp:
+            tmp.write(content)
+            tmp.flush()
+            text_out = ""
+            try:
+                proc = subprocess.run(
+                    ["textutil", "-convert", "txt", "-stdout", tmp.name],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=True,
+                )
+                text_out = proc.stdout or ""
+            except Exception:
+                with tempfile.TemporaryDirectory() as out_dir:
+                    try:
+                        subprocess.run(
+                            ["soffice", "--headless", "--convert-to", "txt:Text", "--outdir", out_dir, tmp.name],
+                            capture_output=True,
+                            text=True,
+                            timeout=60,
+                            check=True,
+                        )
+                        from pathlib import Path
+                        txt_files = list(Path(out_dir).glob("*.txt"))
+                        if txt_files:
+                            text_out = txt_files[0].read_text(encoding="utf-8", errors="ignore")
+                    except Exception as exc:
+                        raise ValueError("解析旧版 .doc 制度文件需要 macOS textutil 或 LibreOffice") from exc
+            return text_out
     if lower.endswith(".docx"):
         doc = Document(io.BytesIO(content))
         parts: List[str] = []
@@ -292,6 +323,30 @@ def _extract_raw_text(filename: str, content: bytes) -> str:
                 if len(cells) >= 2:
                     parts.append(f"## {cells[0]}\n{'；'.join(cells[1:])}")
         return "\n".join(parts)
+    if lower.endswith(".xls"):
+        try:
+            import xlrd  # type: ignore
+        except ImportError as exc:
+            raise ValueError("解析旧版 .xls 制度表格需要安装 xlrd") from exc
+        book = xlrd.open_workbook(file_contents=content)
+        lines: List[str] = []
+        for sheet in book.sheets():
+            lines.append(f"# {sheet.name}")
+            if sheet.nrows == 0:
+                continue
+            headers = [str(sheet.cell_value(0, c) or "").strip() for c in range(sheet.ncols)]
+            for r in range(1, sheet.nrows):
+                cells = [str(sheet.cell_value(r, c) or "").strip() for c in range(sheet.ncols)]
+                if not any(cells):
+                    continue
+                title = cells[0] or sheet.name
+                details = "；".join(
+                    f"{headers[i]}：{cells[i]}"
+                    for i in range(len(cells))
+                    if i < len(headers) and headers[i] and cells[i]
+                )
+                lines.append(f"## {title}\n{details or '；'.join(c for c in cells if c)}")
+        return "\n".join(lines)
     if lower.endswith(".xlsx"):
         wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
         lines: List[str] = []

@@ -1,11 +1,12 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { useOutletContext } from 'react-router-dom'
+import { useNavigate, useOutletContext } from 'react-router-dom'
 import {
   editCaliber,
   editRule,
   getAssetBacking,
   getPanorama,
 } from '../../api/catalog.js'
+import { BANK_AGENCIES, agencyForRegime, agencyMeta, matchesAgencyOrRegime } from '../../utils/bankingTaxonomy.js'
 import { AlertIcon, CheckCircleIcon, CloseIcon, FilterIcon, SearchIcon } from '../../utils/icons.jsx'
 import {
   COVERAGE_LABELS,
@@ -28,6 +29,7 @@ const DOT_TONE_CLASS = {
 }
 
 export default function AssetsPage() {
+  const navigate = useNavigate()
   const outletContext = useOutletContext() || {}
   const { refreshStats } = outletContext
 
@@ -35,6 +37,7 @@ export default function AssetsPage() {
   const [tab, setTab] = useState('capabilities')
   const [capViewMode, setCapViewMode] = useState('vertical')
   const [search, setSearch] = useState('')
+  const [agencyFilter, setAgencyFilter] = useState('ALL')
   const [regimeFilter, setRegimeFilter] = useState('')
   const [capFilter, setCapFilter] = useState('')
   const [subDomainFilter, setSubDomainFilter] = useState('')
@@ -66,7 +69,7 @@ export default function AssetsPage() {
 
   useEffect(() => {
     setPage(1)
-  }, [tab, search, regimeFilter, capFilter, subDomainFilter, themeFilter, catFilter, recFilter])
+  }, [tab, search, agencyFilter, regimeFilter, capFilter, subDomainFilter, themeFilter, catFilter, recFilter])
 
   useEffect(() => {
     if (!editing && !drawerItem) return undefined
@@ -185,15 +188,14 @@ export default function AssetsPage() {
   }, [data])
 
   const visibleCapabilities = useMemo(() => {
-    if (!regimeFilter) return capabilities
-    return capabilities.filter((c) => c.regime === regimeFilter)
-  }, [capabilities, regimeFilter])
+    return capabilities.filter((c) => matchesAgencyOrRegime(c.regime, { agency: agencyFilter, regime: regimeFilter }))
+  }, [capabilities, agencyFilter, regimeFilter])
 
   const qLower = search.trim().toLowerCase()
 
   const filteredRules = useMemo(() => {
     return (data?.rules || []).filter((r) => {
-      if (regimeFilter && r.regime !== regimeFilter) return false
+      if (!matchesAgencyOrRegime(r.regime, { agency: agencyFilter, regime: regimeFilter })) return false
       if (capFilter && r.capability_name !== capFilter) return false
       if (subDomainFilter && r.sub_domain !== subDomainFilter) return false
       if (themeFilter && r.subject_theme !== themeFilter) return false
@@ -205,11 +207,11 @@ export default function AssetsPage() {
       }
       return true
     })
-  }, [data, regimeFilter, capFilter, subDomainFilter, themeFilter, catFilter, recFilter, qLower])
+  }, [data, agencyFilter, regimeFilter, capFilter, subDomainFilter, themeFilter, catFilter, recFilter, qLower])
 
   const filteredCalibers = useMemo(() => {
     return (data?.calibers || []).filter((c) => {
-      if (regimeFilter && c.regime !== regimeFilter) return false
+      if (!matchesAgencyOrRegime(c.regime, { agency: agencyFilter, regime: regimeFilter })) return false
       if (capFilter && c.capability_name !== capFilter) return false
       if (subDomainFilter && c.sub_domain !== subDomainFilter) return false
       if (themeFilter && c.subject_theme !== themeFilter) return false
@@ -220,14 +222,14 @@ export default function AssetsPage() {
       }
       return true
     })
-  }, [data, regimeFilter, capFilter, subDomainFilter, themeFilter, recFilter, qLower])
+  }, [data, agencyFilter, regimeFilter, capFilter, subDomainFilter, themeFilter, recFilter, qLower])
 
   const reconcileAll = data?.reconcile?.items || []
   const reconcileSummary = data?.reconcile?.summary || {}
 
   const filteredReconcile = useMemo(() => {
     return reconcileAll.filter((item) => {
-      if (regimeFilter && item.regime !== regimeFilter) return false
+      if (!matchesAgencyOrRegime(item.regime, { agency: agencyFilter, regime: regimeFilter })) return false
       if (capFilter && item.capability_name !== capFilter) return false
       if (subDomainFilter && item.sub_domain !== subDomainFilter) return false
       if (themeFilter && item.subject_theme !== themeFilter) return false
@@ -238,12 +240,13 @@ export default function AssetsPage() {
       }
       return true
     })
-  }, [reconcileAll, regimeFilter, capFilter, subDomainFilter, themeFilter, recFilter, qLower])
+  }, [reconcileAll, agencyFilter, regimeFilter, capFilter, subDomainFilter, themeFilter, recFilter, qLower])
 
   const stats = data?.stats || {}
-  const hasAnyFilter = Boolean(search || regimeFilter || capFilter || subDomainFilter || themeFilter || catFilter || recFilter)
+  const hasAnyFilter = Boolean(search || agencyFilter !== 'ALL' || regimeFilter || capFilter || subDomainFilter || themeFilter || catFilter || recFilter)
   const clearAllFilters = () => {
     setSearch('')
+    setAgencyFilter('ALL')
     setRegimeFilter('')
     setCapFilter('')
     setSubDomainFilter('')
@@ -251,6 +254,22 @@ export default function AssetsPage() {
     setCatFilter('')
     setRecFilter('')
   }
+
+  const agencyCounts = useMemo(() => {
+    const counts = { ALL: capabilities.length }
+    for (const c of capabilities) {
+      const ag = agencyForRegime(c.regime)
+      counts[ag] = (counts[ag] || 0) + 1
+    }
+    return counts
+  }, [capabilities])
+
+  const regimesInActiveAgency = useMemo(() => {
+    if (agencyFilter === 'ALL') return regimeOptions
+    const allowed = BANK_AGENCIES.find((a) => a.code === agencyFilter)?.regimes || []
+    const present = regimeOptions.filter((r) => allowed.includes(r))
+    return present.length > 0 ? present : allowed
+  }, [agencyFilter, regimeOptions])
 
   const activeRows = tab === 'rules' ? filteredRules : tab === 'calibers' ? filteredCalibers : filteredReconcile
   const totalPages = Math.max(1, Math.ceil(activeRows.length / PAGE_SIZE))
@@ -263,10 +282,64 @@ export default function AssetsPage() {
         <div>
           <h1 className="page-title">业务资产</h1>
           <p className="page-subtitle">
-            按监管体系、一级业务域与金融十大主题统一查阅、核对与补充业务规则与指标口径。
+            按商业银行监管机构、监管报表、一级业务域与金融十大主题统一查阅、核对与补充业务规则与指标口径。
           </p>
         </div>
+        <div className="page-header-actions">
+          <button type="button" className="btn btn-sm" onClick={() => navigate('/admin/versions')}>
+            变更与对账整改 →
+          </button>
+        </div>
       </div>
+
+      {/* 商业银行两级监管机构 -> 监管报表筛选条 */}
+      <section className="dbc-taxonomy-bar" style={{ marginBottom: 14 }} aria-label="按商业银行监管机构与报表筛选">
+        <div className="dbc-tax-row">
+          <span className="dbc-tax-label">监管机构</span>
+          <div className="dbc-tax-pills">
+            <button
+              type="button"
+              className={`dbc-agency-pill ${agencyFilter === 'ALL' ? 'active' : ''}`}
+              onClick={() => { setAgencyFilter('ALL'); setRegimeFilter('') }}
+            >
+              全部机构 <span>{agencyCounts.ALL || 0}</span>
+            </button>
+            {BANK_AGENCIES.map((ag) => (
+              <button
+                key={ag.code}
+                type="button"
+                className={`dbc-agency-pill ${agencyFilter === ag.code ? 'active' : ''}`}
+                title={ag.hint}
+                onClick={() => { setAgencyFilter(ag.code); setRegimeFilter('') }}
+              >
+                {ag.label} <span>{agencyCounts[ag.code] || 0}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="dbc-tax-row">
+          <span className="dbc-tax-label">监管报表</span>
+          <div className="dbc-tax-pills">
+            <button
+              type="button"
+              className={`dbc-regime-pill ${regimeFilter === '' ? 'active' : ''}`}
+              onClick={() => setRegimeFilter('')}
+            >
+              {agencyFilter === 'ALL' ? '全部体系' : `${agencyMeta(agencyFilter).shortLabel}全部体系`}
+            </button>
+            {regimesInActiveAgency.map((reg) => (
+              <button
+                key={reg}
+                type="button"
+                className={`dbc-regime-pill ${regimeFilter === reg ? 'active' : ''}`}
+                onClick={() => setRegimeFilter(reg)}
+              >
+                {reg}
+              </button>
+            ))}
+          </div>
+        </div>
+      </section>
 
       <div className="stat-strip">
         <div className="stat-cell">

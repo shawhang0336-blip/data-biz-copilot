@@ -18,7 +18,13 @@ from app.infra.db_tables import (
     RegulatoryClauseModel,
     SourceMaterialModel,
 )
-from app.infra.retrieval import infer_regulatory_regime, invalidate_bm25_caches
+from app.infra.retrieval import (
+    agency_for_regime,
+    infer_regulatory_regime,
+    invalidate_bm25_caches,
+    matches_agency_or_regime,
+    rule_studio_regulator_code,
+)
 from app.infra.taxonomy import (
     FINANCIAL_SUBJECT_THEMES,
     infer_financial_theme,
@@ -86,6 +92,7 @@ def _rule_to_dict(
         "capability_id": row.capability_id,
         "capability_name": capability_name,
         "regime": regime,
+        "agency": agency_for_regime(regime),
         "sub_domain": sub_domain,
         "subject_theme": subject_theme,
         "code": row.code,
@@ -130,6 +137,7 @@ def _caliber_to_dict(
         "capability_id": row.capability_id,
         "capability_name": capability_name,
         "regime": regime,
+        "agency": agency_for_regime(regime),
         "sub_domain": sub_domain,
         "subject_theme": subject_theme,
         "code": row.code,
@@ -238,7 +246,12 @@ def _compute_business_lineage(session: Session) -> Dict[str, Dict[str, List[str]
     return {"upstream": upstream, "downstream": downstream}
 
 
-def list_capabilities(session: Session) -> List[Dict[str, Any]]:
+def list_capabilities(
+    session: Session,
+    *,
+    agency: Optional[str] = None,
+    regime: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     rows = session.query(BusinessCapabilityModel).order_by(BusinessCapabilityModel.name.asc()).all()
     lineage = _compute_business_lineage(session)
     regimes = _compute_capability_regimes(session, rows)
@@ -308,8 +321,11 @@ def list_capabilities(session: Session) -> List[Dict[str, Any]]:
                 "downstream_businesses": lineage["downstream"].get(r.name, []),
                 "status": r.status,
                 "current_version": r.current_version,
+                "agency": agency_for_regime(regimes.get(r.id, "通用监管")),
             }
         )
+    if agency or regime:
+        out = [x for x in out if matches_agency_or_regime(x.get("regime"), agency=agency, regime=regime)]
     return out
 
 
@@ -319,6 +335,7 @@ def list_business_rules(
     capability_id: Optional[str] = None,
     rule_category: Optional[str] = None,
     reconcile_status: Optional[str] = None,
+    agency: Optional[str] = None,
     regime: Optional[str] = None,
     sub_domain: Optional[str] = None,
     subject_theme: Optional[str] = None,
@@ -336,8 +353,8 @@ def list_business_rules(
     rows = q.order_by(BusinessRuleAssetModel.code.asc()).all()
     items = [_rule_to_dict(r, caps.get(r.capability_id, ""), regimes.get(r.capability_id, "通用监管")) for r in rows]
     norm_theme = normalize_financial_theme(subject_theme or "") if subject_theme else ""
-    if regime:
-        items = [x for x in items if x["regime"] == regime]
+    if agency or regime:
+        items = [x for x in items if matches_agency_or_regime(x["regime"], agency=agency, regime=regime)]
     if sub_domain:
         items = [x for x in items if x["sub_domain"] == sub_domain]
     if subject_theme:
@@ -351,6 +368,7 @@ def list_business_calibers(
     *,
     capability_id: Optional[str] = None,
     reconcile_status: Optional[str] = None,
+    agency: Optional[str] = None,
     regime: Optional[str] = None,
     sub_domain: Optional[str] = None,
     subject_theme: Optional[str] = None,
@@ -366,8 +384,8 @@ def list_business_calibers(
     rows = q.order_by(BusinessCaliberAssetModel.code.asc()).all()
     items = [_caliber_to_dict(r, caps.get(r.capability_id, ""), regimes.get(r.capability_id, "通用监管")) for r in rows]
     norm_theme = normalize_financial_theme(subject_theme or "") if subject_theme else ""
-    if regime:
-        items = [x for x in items if x["regime"] == regime]
+    if agency or regime:
+        items = [x for x in items if matches_agency_or_regime(x["regime"], agency=agency, regime=regime)]
     if sub_domain:
         items = [x for x in items if x["sub_domain"] == sub_domain]
     if subject_theme:
@@ -376,9 +394,14 @@ def list_business_calibers(
     return items
 
 
-def list_reconcile_ledger(session: Session) -> Dict[str, Any]:
-    rules = list_business_rules(session)
-    calibers = list_business_calibers(session)
+def list_reconcile_ledger(
+    session: Session,
+    *,
+    agency: Optional[str] = None,
+    regime: Optional[str] = None,
+) -> Dict[str, Any]:
+    rules = list_business_rules(session, agency=agency, regime=regime)
+    calibers = list_business_calibers(session, agency=agency, regime=regime)
     summary = {"VERIFIED": 0, "CONSISTENT": 0, "DIVERGENT": 0, "UNREALIZED": 0}
     for item in rules + calibers:
         st = item["reconcile_status"]
@@ -393,10 +416,12 @@ def list_reconcile_ledger(session: Session) -> Dict[str, Any]:
                 "name": c["metric_name"],
                 "capability_name": c["capability_name"],
                 "regime": c.get("regime", "通用监管"),
+                "agency": c.get("agency", agency_for_regime(c.get("regime"))),
                 "sub_domain": c.get("sub_domain", ""),
                 "subject_theme": c.get("subject_theme", ""),
                 "reconcile_status": c["reconcile_status"],
                 "status": c["status"],
+                "current_version": c["current_version"],
                 "summary": c["conflict_notes"] or c["formula_summary"],
                 "logic_backing_count": c["logic_backing_count"],
                 "clause_backing_count": c["clause_backing_count"],
@@ -411,10 +436,12 @@ def list_reconcile_ledger(session: Session) -> Dict[str, Any]:
                 "name": r["title"],
                 "capability_name": r["capability_name"],
                 "regime": r.get("regime", "通用监管"),
+                "agency": r.get("agency", agency_for_regime(r.get("regime"))),
                 "sub_domain": r.get("sub_domain", ""),
                 "subject_theme": r.get("subject_theme", ""),
                 "reconcile_status": r["reconcile_status"],
                 "status": r["status"],
+                "current_version": r["current_version"],
                 "summary": r["business_action"],
                 "logic_backing_count": r["logic_backing_count"],
                 "clause_backing_count": r["clause_backing_count"],
@@ -718,3 +745,188 @@ def get_asset_backing_detail(session: Session, asset_code: str) -> Dict[str, Any
             "conflict_notes": cal.conflict_notes,
         }
     raise KeyError("Business asset not found")
+
+
+_HUMAN_REVISION_KINDS = frozenset({"WORDING_EDIT", "CONFIRM", "HUMAN_EDIT", "MANUAL_EDIT"})
+
+
+def list_asset_revisions(
+    session: Session,
+    *,
+    asset_kind: Optional[str] = None,
+    revision_kind: Optional[str] = None,
+    agency: Optional[str] = None,
+    regime: Optional[str] = None,
+    human_only: bool = False,
+    limit: int = 120,
+) -> Dict[str, Any]:
+    """跨业务资产的修订与人工确权动态时间线（严守纯业务去技术化边界）。"""
+    cap_rows = session.query(BusinessCapabilityModel).all()
+    cap_names = {c.id: c.name for c in cap_rows}
+    cap_regimes = _compute_capability_regimes(session, cap_rows)
+
+    rules_by_id = {r.id: r for r in session.query(BusinessRuleAssetModel).all()}
+    cals_by_id = {c.id: c for c in session.query(BusinessCaliberAssetModel).all()}
+    caps_by_id = {c.id: c for c in cap_rows}
+
+    query = session.query(AssetRevisionModel).order_by(AssetRevisionModel.created_at.desc())
+    if asset_kind and asset_kind.strip().upper() not in ("", "ALL"):
+        query = query.filter(AssetRevisionModel.asset_kind == asset_kind.strip().upper())
+
+    rows = query.limit(max(limit * 4, 500)).all()
+    target_rev_kind = (revision_kind or "").strip().upper()
+
+    summary = {
+        "total": 0,
+        "wording_edits": 0,
+        "confirmations": 0,
+        "other_events": 0,
+        "assets_touched": 0,
+    }
+    touched_assets = set()
+    items: List[Dict[str, Any]] = []
+
+    for rev in rows:
+        meta_code = ""
+        meta_title = ""
+        meta_cap = ""
+        meta_regime = "通用监管"
+        meta_sub_domain = ""
+        meta_theme = ""
+        meta_reconcile = ""
+        meta_version = 1
+        meta_status = ""
+
+        if rev.asset_kind == "RULE" and rev.asset_id in rules_by_id:
+            r = rules_by_id[rev.asset_id]
+            meta_code = r.code
+            meta_title = r.title
+            meta_cap = cap_names.get(r.capability_id, "")
+            meta_regime = cap_regimes.get(r.capability_id, "通用监管")
+            meta_sub_domain = r.sub_domain or ""
+            meta_theme = r.subject_theme or ""
+            meta_reconcile = r.reconcile_status
+            meta_version = r.current_version
+            meta_status = r.status
+        elif rev.asset_kind == "CALIBER" and rev.asset_id in cals_by_id:
+            c = cals_by_id[rev.asset_id]
+            meta_code = c.code
+            meta_title = c.metric_name
+            meta_cap = cap_names.get(c.capability_id, "")
+            meta_regime = cap_regimes.get(c.capability_id, "通用监管")
+            meta_sub_domain = c.sub_domain or ""
+            meta_theme = c.subject_theme or ""
+            meta_reconcile = c.reconcile_status
+            meta_version = c.current_version
+            meta_status = c.status
+        elif rev.asset_id in caps_by_id:
+            cap = caps_by_id[rev.asset_id]
+            meta_code = cap.code
+            meta_title = cap.name
+            meta_cap = cap.name
+            meta_regime = cap_regimes.get(cap.id, "通用监管")
+            meta_version = cap.current_version
+            meta_status = cap.status
+
+        if not matches_agency_or_regime(meta_regime, agency=agency, regime=regime):
+            continue
+
+        summary["total"] += 1
+        touched_assets.add((rev.asset_kind, rev.asset_id))
+        if rev.revision_kind in ("WORDING_EDIT", "HUMAN_EDIT", "MANUAL_EDIT"):
+            summary["wording_edits"] += 1
+        elif rev.revision_kind == "CONFIRM":
+            summary["confirmations"] += 1
+        else:
+            summary["other_events"] += 1
+
+        if human_only and rev.revision_kind not in _HUMAN_REVISION_KINDS:
+            continue
+        if target_rev_kind and target_rev_kind != "ALL" and rev.revision_kind != target_rev_kind:
+            continue
+
+        if len(items) < limit:
+            items.append(
+                {
+                    "id": rev.id,
+                    "asset_kind": rev.asset_kind,
+                    "asset_id": rev.asset_id,
+                    "asset_code": meta_code or rev.asset_id[:8],
+                    "asset_title": meta_title or "已归档业务资产",
+                    "capability_name": meta_cap,
+                    "regime": meta_regime,
+                    "agency": agency_for_regime(meta_regime),
+                    "sub_domain": meta_sub_domain,
+                    "subject_theme": meta_theme,
+                    "reconcile_status": meta_reconcile,
+                    "current_version": meta_version,
+                    "asset_status": meta_status,
+                    "revision_kind": rev.revision_kind,
+                    "editor": rev.editor,
+                    "reason": rev.reason,
+                    "old_value": rev.old_value_json,
+                    "new_value": rev.new_value_json,
+                    "created_at": rev.created_at.isoformat() if rev.created_at else None,
+                }
+            )
+
+    summary["assets_touched"] = len(touched_assets)
+    return {"summary": summary, "revisions": items}
+
+
+def export_rule_studio_handoff(
+    session: Session,
+    *,
+    agency: Optional[str] = None,
+    regime: Optional[str] = None,
+    statuses: Tuple[str, ...] = ("UNREALIZED", "DIVERGENT"),
+) -> Dict[str, Any]:
+    """生成标准化整改条款交接包，将未落地（UNREALIZED）与口径分歧（DIVERGENT）项映射至 data-rule-studio 监管编码。"""
+    ledger = list_reconcile_ledger(session, agency=agency, regime=regime)
+    allowed = {s.upper() for s in statuses}
+    clauses_by_id = {c.id: c for c in session.query(RegulatoryClauseModel).all()}
+    rules_by_id = {r.id: r for r in session.query(BusinessRuleAssetModel).all()}
+    cals_by_id = {c.id: c for c in session.query(BusinessCaliberAssetModel).all()}
+
+    handoff_items: List[Dict[str, Any]] = []
+    for item in ledger["items"]:
+        if item["reconcile_status"] not in allowed:
+            continue
+        clause_ids: List[str] = []
+        if item["asset_kind"] == "RULE" and item["id"] in rules_by_id:
+            clause_ids = list(rules_by_id[item["id"]].clause_ids_json or [])
+        elif item["asset_kind"] == "CALIBER" and item["id"] in cals_by_id:
+            clause_ids = list(cals_by_id[item["id"]].clause_ids_json or [])
+        clauses = [
+            {
+                "chapter": clauses_by_id[cid].chapter,
+                "clause_title": clauses_by_id[cid].clause_title,
+                "requirement": clauses_by_id[cid].business_requirement,
+            }
+            for cid in clause_ids
+            if cid in clauses_by_id
+        ]
+        handoff_items.append(
+            {
+                "asset_kind": item["asset_kind"],
+                "asset_code": item["code"],
+                "title": item["name"],
+                "capability_name": item["capability_name"],
+                "agency": item["agency"],
+                "regime": item["regime"],
+                "rule_studio_regulator": rule_studio_regulator_code(item["regime"]),
+                "subject_theme": item["subject_theme"],
+                "reconcile_status": item["reconcile_status"],
+                "business_summary": item["summary"],
+                "regulatory_clauses": clauses,
+            }
+        )
+
+    return {
+        "schema": "data-agent.rule-studio-handoff.v1",
+        "source_service": "data-biz-copilot",
+        "target_service": "data-rule-studio",
+        "filter": {"agency": agency or "ALL", "regime": regime or "ALL", "statuses": sorted(allowed)},
+        "total_items": len(handoff_items),
+        "items": handoff_items,
+    }

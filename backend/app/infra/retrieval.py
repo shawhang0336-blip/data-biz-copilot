@@ -82,6 +82,60 @@ def infer_regulatory_regime(*texts: str) -> str:
     return "通用监管"
 
 
+# 商业银行一级监管机构 -> 二级监管报表体系映射（与 data-rule-studio 保持产品家族统一口径）
+BANK_AGENCY_TO_REGIMES: Dict[str, Tuple[str, ...]] = {
+    "NFRA": ("一表通", "EAST", "1104", "PLUS"),
+    "PBOC": ("人行统计",),
+    "SAFE": ("SAFE",),
+    "OTHER": ("通用监管",),
+}
+
+REGIME_TO_RULE_STUDIO_CODE: Dict[str, str] = {
+    "一表通": "YBT",
+    "EAST": "EAST",
+    "1104": "1104",
+    "PLUS": "NFRA_SPECIAL",
+    "人行统计": "PBOC_STAT",
+    "SAFE": "SAFE_BIZ",
+    "通用监管": "OTHER",
+}
+
+
+def agency_for_regime(regime: Optional[str]) -> str:
+    """将业务资产归属的监管报送体系归口到商业银行一级监管机构编码（NFRA / PBOC / SAFE / OTHER）。"""
+    clean = str(regime or "").strip()
+    if not clean:
+        return "OTHER"
+    upper = clean.upper()
+    if upper in ("NFRA", "PBOC", "SAFE", "OTHER"):
+        return upper
+    for agency, regimes in BANK_AGENCY_TO_REGIMES.items():
+        if clean in regimes or upper in {r.upper() for r in regimes}:
+            return agency
+    return "OTHER"
+
+
+def matches_agency_or_regime(
+    item_regime: Optional[str],
+    *,
+    agency: Optional[str] = None,
+    regime: Optional[str] = None,
+) -> bool:
+    """同时支持按一级监管机构（NFRA/PBOC/SAFE/OTHER）与二级监管报表（1104/EAST/SAFE/一表通等）过滤。"""
+    if agency and agency.strip().upper() not in ("", "ALL"):
+        if agency_for_regime(item_regime) != agency.strip().upper():
+            return False
+    if regime and regime.strip().upper() not in ("", "ALL"):
+        if str(item_regime or "通用监管").strip() != regime.strip():
+            return False
+    return True
+
+
+def rule_studio_regulator_code(regime: Optional[str]) -> str:
+    """映射为 data-rule-studio 标准监管报表编码，支撑跨产品未落地条款交接。"""
+    return REGIME_TO_RULE_STUDIO_CODE.get(str(regime or "").strip(), "OTHER")
+
+
 def _strip_filler(text: str) -> str:
     cleaned = text
     for w in _STOP_WORDS:
